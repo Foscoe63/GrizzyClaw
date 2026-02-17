@@ -2,6 +2,8 @@
 
 import asyncio
 import logging
+import tempfile
+from pathlib import Path
 from typing import Optional
 
 from telegram import Update
@@ -64,6 +66,12 @@ class TelegramChannel(Channel):
             self.application.add_handler(CommandHandler("memory", self.cmd_memory))
             self.application.add_handler(
                 MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message)
+            )
+            self.application.add_handler(
+                MessageHandler(
+                    filters.VOICE | filters.AUDIO,
+                    self.handle_voice_or_audio,
+                )
             )
 
             # Start bot
@@ -321,4 +329,66 @@ class TelegramChannel(Channel):
             )
             await update.message.reply_text(
                 f"❌ Sorry, I encountered an error.{hint}\n\nPlease try again."
+            )
+
+    async def handle_voice_or_audio(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle voice messages and audio files: download, transcribe, process."""
+        if not update.message:
+            return
+
+        voice = update.message.voice
+        audio = update.message.audio
+        file_obj = voice.file_id if voice else (audio.file_id if audio else None)
+        if not file_obj:
+            return
+
+        user = ChannelUser(
+            id=str(update.effective_user.id),
+            username=update.effective_user.username,
+            first_name=update.effective_user.first_name,
+            last_name=update.effective_user.last_name,
+        )
+
+        user_id = user.id
+        chat_id = str(update.message.chat_id)
+
+        if not self.agent:
+            await update.message.reply_text("❌ Agent not initialized")
+            return
+
+        await self.send_typing_indicator(chat_id)
+
+        tmp_path: Optional[Path] = None
+        try:
+            tg_file = await context.bot.get_file(file_obj)
+            suffix = ".ogg" if voice else ".mp3"
+            fd, tmp = tempfile.mkstemp(suffix=suffix)
+            try:
+                import os
+                os.close(fd)
+                tmp_path = Path(tmp)
+                await tg_file.download_to_drive(str(tmp_path))
+
+                response_text = ""
+                async for chunk in self.agent.process_message(
+                    user_id, "", audio_path=str(tmp_path)
+                ):
+                    response_text += chunk
+
+                if response_text:
+                    await update.message.reply_text(response_text)
+                else:
+                    await update.message.reply_text(
+                        "🤔 I couldn't transcribe or process that audio. Please try again."
+                    )
+            finally:
+                if tmp_path and tmp_path.exists():
+                    try:
+                        tmp_path.unlink()
+                    except OSError:
+                        pass
+        except Exception as e:
+            logger.error(f"Error processing voice/audio: {e}", exc_info=True)
+            await update.message.reply_text(
+                f"❌ Sorry, I couldn't process that audio. Please try again."
             )

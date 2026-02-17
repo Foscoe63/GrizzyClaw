@@ -8,6 +8,7 @@ from grizzyclaw.memory.sqlite_store import SQLiteMemoryStore
 from grizzyclaw.automation import CronScheduler, PLAYWRIGHT_AVAILABLE
 from grizzyclaw.mcp_client import call_mcp_tool, discover_tools
 from grizzyclaw.utils.vision import build_vision_content
+from grizzyclaw.media.transcribe import transcribe_audio
 from grizzyclaw.safety.content_filter import ContentFilter
 from pathlib import Path
 import ast
@@ -28,6 +29,62 @@ _CONTEXT_PRIORITY_MARKERS = (
     "MEMORY_SAVE",
     "\u2692",  # 🔧
 )
+
+
+def _correct_search_query(query: str) -> str:
+    """Fix common typos in search queries (e.g. pecs->specs for tech context)."""
+    if not query or len(query) < 3:
+        return query
+    q = query.lower()
+    # "pecs" often meant "specs" (specifications) when asking about tech/products
+    tech_indicators = (
+        "mac", "iphone", "ipad", "studio", "ultra", "pro", "max", "mini",
+        "specifications", "specs", "product", "release", "upcoming", "cpu",
+        "gpu", "ram", "storage", "chip", "processor", "apple", "computer",
+    )
+    if "pecs" in q and any(ind in q for ind in tech_indicators):
+        query = re.sub(r"\bpecs\b", "specs", query, flags=re.IGNORECASE)
+    return query
+
+
+def _simplify_search_query(query: str) -> str:
+    """Simplify queries to improve DuckDuckGo results (avoids bot detection, over-specificity)."""
+    if not query or len(query) <= 10:
+        return query
+    # Remove filler words that add length but not search value
+    filler = (
+        r"\b(the|latest|upcoming|on|for|what|are|going|to|be|and|see|if|you|can|get|"
+        r"information|about|look|search|internet|web)\b"
+    )
+    simplified = re.sub(filler, " ", query, flags=re.IGNORECASE)
+    simplified = re.sub(r"\s+", " ", simplified).strip()
+    # Prefer shorter if we got something reasonable
+    if simplified and len(simplified) < len(query) and len(simplified) >= 10:
+        return simplified
+    return query
+
+
+def _simplify_search_query_retry(query: str) -> str:
+    """More aggressive simplification for retry when first search returns no results."""
+    simplified = _simplify_search_query(query)
+    if len(simplified) <= 30:
+        return simplified
+    # For retry: try product name first (e.g. "Mac Studio M5 Ultra") - often works better
+    words = simplified.split()
+    # Prioritize product-like terms (contain numbers, or known product words)
+    product_words = []
+    for w in words:
+        if any(c.isdigit() for c in w) or w in ("Mac", "Studio", "Ultra", "Pro", "Max", "iPhone", "iPad"):
+            product_words.append(w)
+        elif product_words and not w.lower() in ("the", "and", "for"):
+            product_words.append(w)  # Continue product phrase
+    if product_words:
+        retry = " ".join(product_words)
+        if len(retry) >= 10:
+            return retry
+    # Fallback: just take first 4-5 significant words
+    significant = [w for w in words if len(w) > 2 and w.lower() not in ("the", "for", "and", "are")]
+    return " ".join(significant[:5]) if significant else simplified
 
 
 def _message_has_priority_content(msg: Dict[str, Any]) -> bool:
@@ -251,7 +308,31 @@ class AgentCore:
         message: str,
         context: Optional[Dict[str, Any]] = None,
         images: Optional[List[str]] = None,
+        audio_path: Optional[str] = None,
+        audio_base64: Optional[str] = None,
     ) -> AsyncIterator[str]:
+        # Transcribe audio if provided
+        if audio_path or audio_base64:
+            loop = asyncio.get_event_loop()
+            provider = getattr(
+                self.settings, "transcription_provider", "openai"
+            )
+            if audio_path:
+                source = audio_path
+            else:
+                source = f"data:audio/mpeg;base64,{audio_base64}"
+            transcript = await loop.run_in_executor(
+                None,
+                lambda: transcribe_audio(
+                    source,
+                    provider=provider,
+                    openai_api_key=self.settings.openai_api_key,
+                ),
+            )
+            if transcript:
+                message = f"{message}\n\n[Audio transcript]: {transcript}".strip() if message else f"[Audio transcript]: {transcript}"
+            elif not message:
+                message = "(Could not transcribe audio)"
         # Get or create session
         if user_id not in self.sessions:
             self.sessions[user_id] = []
@@ -474,15 +555,30 @@ When you receive tool results in a follow-up message, use them to continue your 
                 # Proactive search fallback: empty response + user wants search
                 if wants_search and not tool_call_matches and len(response_text.strip()) < 50 and iteration == 0:
                     query = msg_lower
-                    for phrase in ("look on the internet for", "search the internet for", "search for", "look for", "find information on", "find information about", "search the web for", "look up", "information on", "information about"):
+                    for phrase in (
+                        "look on the internet for", "search the internet for",
+                        "search the internet and see if you can get",
+                        "search the internet and see if", "search the internet and",
+                        "search for", "look for", "find information on",
+                        "find information about", "search the web for",
+                        "look up", "information on", "information about",
+                    ):
                         if phrase in query:
                             query = query.split(phrase, 1)[-1].strip()
                             break
                     if not query or len(query) < 2:
                         query = message.strip()[:100]
+                    query = _correct_search_query(query)
+                    query = _simplify_search_query(query)
                     if mcp_file.exists():
                         try:
                             tool_result = await call_mcp_tool(mcp_file, "ddg-search", "search", {"query": query})
+                            # Retry with shorter query if DuckDuckGo returned no results (bot detection / over-specific)
+                            no_results = "no results" in (tool_result or "").lower() or "bot detection" in (tool_result or "").lower()
+                            if no_results and len(query) > 25:
+                                alt_query = _simplify_search_query_retry(query)
+                                if alt_query != query:
+                                    tool_result = await call_mcp_tool(mcp_file, "ddg-search", "search", {"query": alt_query})
                             result_display = f"Let me search for that.\n\n**🔧 ddg-search.search**\n{tool_result}\n"
                             if content_filter:
                                 result_display, _ = content_filter.filter(result_display)
@@ -521,9 +617,22 @@ When you receive tool results in a follow-up message, use them to continue your 
                             continue
                         mcp_name = tool_call.get("mcp", "unknown")
                         tool_name = tool_call.get("tool", "unknown")
-                        args = tool_call.get("arguments", {}) or {}
+                        args = dict(tool_call.get("arguments", {}) or {})
+
+                        # Correct and simplify search queries for better DuckDuckGo results
+                        if mcp_name == "ddg-search" and tool_name == "search" and "query" in args:
+                            q = _correct_search_query(str(args["query"]))
+                            args["query"] = _simplify_search_query(q)
 
                         tool_result = await call_mcp_tool(mcp_file, mcp_name, tool_name, args)
+                        # Retry with shorter query if DuckDuckGo returned no results
+                        if (mcp_name == "ddg-search" and tool_name == "search" and "query" in args and
+                            args["query"] and len(args["query"]) > 25):
+                            no_results = "no results" in (tool_result or "").lower() or "bot detection" in (tool_result or "").lower()
+                            if no_results:
+                                alt = _simplify_search_query_retry(args["query"])
+                                if alt != args["query"]:
+                                    tool_result = await call_mcp_tool(mcp_file, mcp_name, tool_name, {"query": alt})
                         result_display = f"\n\n**🔧 {mcp_name}.{tool_name}**\n{tool_result}\n"
                         if content_filter:
                             result_display, _ = content_filter.filter(result_display)

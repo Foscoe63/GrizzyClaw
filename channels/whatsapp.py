@@ -5,6 +5,8 @@ Install with: pip install whatsapp-web.py
 """
 
 import logging
+import tempfile
+from pathlib import Path
 from typing import Optional
 import asyncio
 
@@ -206,7 +208,7 @@ class WhatsAppChannel(Channel):
         await self.emit("disconnected", reason=reason)
 
     async def _on_message(self, msg):
-        """Handle incoming message"""
+        """Handle incoming message (text or voice/audio)"""
         # Skip if message is from self
         if msg.from_me:
             return
@@ -219,12 +221,39 @@ class WhatsAppChannel(Channel):
             display_name=contact.name if contact else msg.from_id
         )
 
+        content = msg.body or ""
+        audio_path = None
+
+        # Handle voice/audio messages (ptt = push-to-talk, audio = audio file)
+        if getattr(msg, "has_media", False) or getattr(msg, "type", None) in ("ptt", "audio"):
+            try:
+                media = await msg.download_media() if hasattr(msg, "download_media") else None
+                if media and getattr(media, "data", None):
+                    import base64
+                    import os
+                    raw = base64.b64decode(media.data) if isinstance(media.data, str) else media.data
+                    fd, tmp = tempfile.mkstemp(suffix=".ogg")
+                    try:
+                        os.write(fd, raw)
+                        os.close(fd)
+                        audio_path = tmp
+                        content = ""  # Will use transcript
+                    except Exception:
+                        try:
+                            os.close(fd)
+                        except OSError:
+                            pass
+                        Path(tmp).unlink(missing_ok=True)
+                        raise
+            except Exception as e:
+                logger.debug(f"WhatsApp voice/audio download failed: {e}")
+
         # Create message object
         message = ChannelMessage(
             message_id=msg.id,
             user=user,
-            content=msg.body or "",
-            message_type=MessageType.TEXT,
+            content=content or "(audio)",
+            message_type=MessageType.AUDIO if audio_path else MessageType.TEXT,
             channel_id="whatsapp",
             chat_id=msg.chat_id
         )
@@ -241,11 +270,17 @@ class WhatsAppChannel(Channel):
         # Send typing indicator
         await self.send_typing_indicator(msg.chat_id)
 
-        # Process message
+        # Process message (with audio if voice)
         response_text = ""
         try:
-            async for chunk in self.agent.process_message(user.id, message.content):
-                response_text += chunk
+            if audio_path:
+                async for chunk in self.agent.process_message(
+                    user.id, content or "", audio_path=audio_path
+                ):
+                    response_text += chunk
+            else:
+                async for chunk in self.agent.process_message(user.id, content):
+                    response_text += chunk
 
             if response_text:
                 await msg.reply(response_text)
@@ -255,3 +290,9 @@ class WhatsAppChannel(Channel):
         except Exception as e:
             logger.error(f"Error processing WhatsApp message: {e}", exc_info=True)
             await msg.reply("❌ Sorry, I encountered an error. Please try again.")
+        finally:
+            if audio_path:
+                try:
+                    Path(audio_path).unlink(missing_ok=True)
+                except OSError:
+                    pass

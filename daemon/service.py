@@ -15,6 +15,7 @@ from grizzyclaw.gateway.server import GatewayServer
 from grizzyclaw.gateway.http_server import HTTPServer
 from grizzyclaw.daemon.ipc import IPCServer
 from grizzyclaw.automation.webhooks import WebhookServer
+from grizzyclaw.gateway.events import Event
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +95,7 @@ class DaemonService:
 
             # Start Gateway server (WebSocket control plane)
             self.gateway = GatewayServer(self.settings)
+            self.gateway.register_agent(self.agent)
             gateway_task = asyncio.create_task(self.gateway.start())
             self._tasks.append(gateway_task)
             logger.info("Gateway server started")
@@ -123,14 +125,28 @@ class DaemonService:
     async def _run_event_loop(self):
         """Main event loop for daemon"""
         logger.info("Entering daemon event loop...")
+        prune_interval = 3600  # 1 hour
+        last_prune = 0.0
+        import time
 
         try:
             while self.running:
                 # Process any pending tasks
                 await asyncio.sleep(1)
 
-                # Channel monitoring, webhook processing, scheduled tasks
-                # are handled by their respective servers (gateway, webhook_server)
+                # Media lifecycle: prune old assets periodically
+                now = time.time()
+                if now - last_prune >= prune_interval:
+                    try:
+                        from grizzyclaw.media.lifecycle import prune_media
+                        retention = getattr(
+                            self.settings, "media_retention_days", 7
+                        )
+                        max_mb = getattr(self.settings, "media_max_size_mb", 0)
+                        prune_media(retention_days=retention, max_size_mb=max_mb)
+                        last_prune = now
+                    except Exception as e:
+                        logger.debug(f"Media prune skipped: {e}")
 
         except Exception as e:
             logger.error(f"Error in event loop: {e}", exc_info=True)
@@ -187,6 +203,10 @@ class DaemonService:
         self.ipc_server.register_handler("status", self._handle_status)
         self.ipc_server.register_handler("reload", self._handle_reload)
         self.ipc_server.register_handler("stats", self._handle_stats)
+        self.ipc_server.register_handler("sessions_list", self._handle_sessions_list)
+        self.ipc_server.register_handler("sessions_history", self._handle_sessions_history)
+        self.ipc_server.register_handler("sessions_send", self._handle_sessions_send)
+        self.ipc_server.register_handler("stop", self._handle_stop)
 
     def _register_webhook_handlers(self):
         """Register webhook handlers for external triggers."""
@@ -209,6 +229,15 @@ class DaemonService:
         self.webhook_server.register("/trigger", handle_trigger, metadata={"description": "Send message to agent"})
         self.webhook_server.register("/github", self._handle_github_webhook, metadata={"description": "GitHub webhooks"})
         self.webhook_server.register("/slack", self._handle_slack_webhook, metadata={"description": "Slack events"})
+        from grizzyclaw.automation.pubsub import verify_pubsub_push
+        gmail_audience = getattr(self.settings, "gmail_pubsub_audience", None)
+        self.webhook_server.register(
+            "/gmail",
+            self._handle_gmail_pubsub,
+            verify=verify_pubsub_push(gmail_audience or ""),
+            metadata={"description": "Gmail Pub/Sub push"},
+        )
+        self.webhook_server.register("/media", self._handle_media_webhook, metadata={"description": "Media upload; transcribe and forward to agent"})
 
     async def _handle_github_webhook(self, data: dict):
         """Handle GitHub webhook (push, issues, etc.). Event type is in X-GitHub-Event header (not in body)."""
@@ -221,6 +250,40 @@ class DaemonService:
                 chunks.append(c)
             return {"status": "ok", "summary": "".join(chunks)[:200]}
         return {"status": "ok"}
+
+    async def _handle_media_webhook(self, data: dict):
+        """Handle media upload: transcribe audio and forward to agent."""
+        audio_b64 = data.get("audio_base64") or data.get("audio")
+        if not audio_b64:
+            return {"status": "error", "error": "audio_base64 or audio required"}
+        user_id = data.get("user_id", "webhook")
+        try:
+            response_chunks = []
+            async for chunk in self.agent.process_message(
+                user_id, "", audio_base64=audio_b64
+            ):
+                response_chunks.append(chunk)
+            return {"status": "ok", "response": "".join(response_chunks)[:500]}
+        except Exception as e:
+            logger.error(f"Media webhook error: {e}", exc_info=True)
+            return {"status": "error", "error": str(e)}
+
+    async def _handle_gmail_pubsub(self, data: dict):
+        """Handle Gmail Pub/Sub push notifications."""
+        try:
+            from grizzyclaw.automation.pubsub import handle_gmail_push
+            creds = getattr(self.settings, "gmail_credentials_json", None)
+            async def agent_cb(uid, msg):
+                async for c in self.agent.process_message(uid, msg):
+                    yield c
+            return await handle_gmail_push(
+                data, agent_cb,
+                credentials_path=creds,
+                secret_key=getattr(self.settings, "secret_key", None),
+            )
+        except Exception as e:
+            logger.error(f"Gmail Pub/Sub error: {e}", exc_info=True)
+            return {"status": "error", "error": str(e)}
 
     async def _handle_slack_webhook(self, data: dict):
         """Handle Slack events (e.g. slash command, event callback)."""
@@ -252,6 +315,75 @@ class DaemonService:
         if self.gateway:
             return self.gateway.stats
         return {}
+
+    async def _handle_sessions_list(self, user_id: Optional[str] = None) -> dict:
+        """Handle sessions_list command. Returns list of sessions, optionally filtered by user_id."""
+        if not self.gateway:
+            return {"sessions": []}
+        sessions = self.gateway.session_manager.list_sessions()
+        if user_id:
+            sessions = [s for s in sessions if s.get("user_id") == user_id]
+        return {"sessions": sessions}
+
+    async def _handle_sessions_history(
+        self, session_id: Optional[str] = None, limit: Optional[int] = None
+    ) -> dict:
+        """Handle sessions_history command. Returns message history for a session."""
+        if not session_id:
+            return {"history": [], "error": "session_id required"}
+        if not self.gateway:
+            return {"history": [], "error": "Gateway not available"}
+        session = self.gateway.session_manager.get_session(session_id)
+        if not session:
+            return {"history": [], "error": f"Session {session_id} not found"}
+        history = session.get_history(limit=limit)
+        return {"history": history}
+
+    async def _handle_sessions_send(
+        self,
+        session_id: str,
+        message: str,
+        from_agent_id: Optional[str] = None,
+    ) -> dict:
+        """Handle sessions_send command. Routes message to session; agent processes and responds."""
+        if not self.gateway or not self.agent:
+            return {"status": "error", "error": "Gateway or agent not available"}
+        session = self.gateway.session_manager.get_session(session_id)
+        if not session:
+            session = self.gateway.session_manager.create_session(
+                session_id, from_agent_id or "ipc_agent"
+            )
+        user_id = session.user_id
+        self.gateway.session_manager.record_message(
+            session_id, "user", message,
+            metadata={"from_agent_id": from_agent_id} if from_agent_id else None,
+        )
+        try:
+            response_chunks = []
+            async for chunk in self.agent.process_message(user_id, message):
+                response_chunks.append(chunk)
+            response_text = "".join(response_chunks)
+            self.gateway.session_manager.record_message(session_id, "assistant", response_text)
+            await self.gateway.event_bus.emit(
+                Event(
+                    type="message_sent",
+                    data={
+                        "session_id": session_id,
+                        "user_id": user_id,
+                        "message": response_text,
+                    },
+                )
+            )
+            return {"status": "ok", "response": response_text}
+        except Exception as e:
+            logger.error(f"sessions_send error: {e}", exc_info=True)
+            return {"status": "error", "error": str(e)}
+
+    async def _handle_stop(self) -> dict:
+        """Handle stop command: gracefully shut down the daemon."""
+        logger.info("Received stop command via IPC")
+        self.running = False
+        return {"status": "ok"}
 
 
 def main():

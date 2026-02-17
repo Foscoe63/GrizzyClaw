@@ -2,9 +2,12 @@
 
 import logging
 import time
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, TYPE_CHECKING
 from dataclasses import dataclass, field
 from datetime import datetime
+
+if TYPE_CHECKING:
+    from .session_store import SessionStore
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +34,8 @@ class Message:
 class Session:
     """Conversation session
 
-    Tracks messages, user info, and session state
+    Tracks messages, user info, and session state.
+    session_type: "main" (1:1) or "group"
     """
     session_id: str
     user_id: str
@@ -40,6 +44,8 @@ class Session:
     messages: List[Message] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
     is_active: bool = True
+    session_type: str = "main"  # "main" (1:1) or "group"
+    participants: List[str] = field(default_factory=list)  # For group sessions
 
     def add_message(self, role: str, content: str, metadata: Optional[Dict] = None):
         """Add a message to the session
@@ -109,22 +115,35 @@ class Session:
             "last_activity": self.last_activity,
             "message_count": len(self.messages),
             "is_active": self.is_active,
-            "metadata": self.metadata
+            "metadata": self.metadata,
+            "session_type": self.session_type,
+            "participants": self.participants,
         }
 
 
 class SessionManager:
-    """Manage all active sessions"""
+    """Manage all active sessions (optionally persisted to SQLite)"""
 
-    def __init__(self):
+    def __init__(self, session_store: Optional["SessionStore"] = None):
         self.sessions: Dict[str, Session] = {}
+        self._store = session_store
+        if self._store:
+            self._load_sessions()
 
-    def create_session(self, session_id: str, user_id: str) -> Session:
+    def create_session(
+        self,
+        session_id: str,
+        user_id: str,
+        session_type: str = "main",
+        participants: Optional[List[str]] = None,
+    ) -> Session:
         """Create a new session
 
         Args:
             session_id: Unique session ID
-            user_id: User identifier
+            user_id: User identifier (primary user for main, creator for group)
+            session_type: "main" (1:1) or "group"
+            participants: For group sessions, list of user_ids
 
         Returns:
             New session instance
@@ -133,10 +152,25 @@ class SessionManager:
             logger.warning(f"Session {session_id} already exists")
             return self.sessions[session_id]
 
-        session = Session(session_id=session_id, user_id=user_id)
+        session = Session(
+            session_id=session_id,
+            user_id=user_id,
+            session_type=session_type,
+            participants=participants or ([user_id] if session_type == "group" else []),
+        )
         self.sessions[session_id] = session
 
-        logger.info(f"Created session: {session_id} for user: {user_id}")
+        if self._store:
+            self._store.save_session(
+                session_id=session_id,
+                user_id=user_id,
+                session_type=session_type,
+                participants=session.participants,
+                created_at=session.created_at,
+                last_activity=session.last_activity,
+            )
+
+        logger.info(f"Created session: {session_id} for user: {user_id} (type={session_type})")
         return session
 
     def get_session(self, session_id: str) -> Optional[Session]:
@@ -161,9 +195,68 @@ class SessionManager:
             Session instance
         """
         session = self.get_session(session_id)
+        if session is None and self._store:
+            stored = self._store.get_session(session_id)
+            if stored:
+                session = self._hydrate_session(stored)
+                self.sessions[session_id] = session
         if session is None:
             session = self.create_session(session_id, user_id)
         return session
+
+    def _load_sessions(self):
+        """Load sessions from store into memory (on startup)."""
+        if not self._store:
+            return
+        for row in self._store.list_sessions():
+            sid = row["session_id"]
+            stored = self._store.get_session(sid)
+            if stored:
+                session = self._hydrate_session(stored)
+                self.sessions[sid] = session
+
+    def _hydrate_session(self, row: Dict[str, Any]) -> Session:
+        """Build Session from stored row."""
+        session_id = row["session_id"]
+        messages = self._store.get_messages(session_id) if self._store else []
+        session = Session(
+            session_id=session_id,
+            user_id=row["user_id"],
+            created_at=row.get("created_at", time.time()),
+            last_activity=row.get("last_activity", time.time()),
+            messages=[
+                Message(
+                    role=m["role"],
+                    content=m["content"],
+                    timestamp=m["timestamp"],
+                    metadata=m.get("metadata", {}),
+                )
+                for m in messages
+            ],
+            metadata=row.get("metadata", {}),
+            is_active=row.get("is_active", True),
+            session_type=row.get("session_type", "main"),
+            participants=row.get("participants", []),
+        )
+        return session
+
+    def record_message(
+        self,
+        session_id: str,
+        role: str,
+        content: str,
+        metadata: Optional[Dict] = None,
+    ):
+        """Add message to session and persist to store."""
+        session = self.get_session(session_id)
+        if session:
+            session.add_message(role, content, metadata)
+            if self._store:
+                self._store.add_message(
+                    session_id, role, content,
+                    timestamp=session.messages[-1].timestamp,
+                    metadata=metadata,
+                )
 
     def delete_session(self, session_id: str) -> bool:
         """Delete a session

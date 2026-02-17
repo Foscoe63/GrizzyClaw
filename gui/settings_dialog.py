@@ -1,4 +1,6 @@
 import re
+import subprocess
+import sys
 from pathlib import Path
 import asyncio
 
@@ -1850,6 +1852,406 @@ class SecurityTab(SettingsTab):
         }
 
 
+class IntegrationsTab(SettingsTab):
+    """Media, transcription, Gmail Pub/Sub, gateway auth, and message queue settings."""
+
+    def __init__(self, settings, parent=None):
+        super().__init__(parent)
+        self.settings = settings
+        self.setup_ui()
+
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+
+        container = QWidget()
+        container_layout = QVBoxLayout(container)
+        container_layout.setContentsMargins(40, 24, 40, 24)
+        container_layout.setSpacing(24)
+
+        # Gateway & Queue
+        gateway_group = QGroupBox("Gateway & Message Queue")
+        gateway_group.setStyleSheet(self.get_group_style())
+        gateway_form = QFormLayout(gateway_group)
+        gateway_form.setSpacing(12)
+
+        self.gateway_auth_token = QLineEdit(
+            getattr(self.settings, "gateway_auth_token", None) or ""
+        )
+        self.gateway_auth_token.setEchoMode(QLineEdit.EchoMode.Password)
+        self.gateway_auth_token.setPlaceholderText("Optional Bearer token for sessions_send")
+        self.gateway_auth_token.setFixedHeight(32)
+        gateway_form.addRow("Gateway Auth Token:", self.gateway_auth_token)
+
+        self.gateway_rate_limit = QSpinBox()
+        self.gateway_rate_limit.setRange(10, 1000)
+        self.gateway_rate_limit.setValue(
+            getattr(self.settings, "gateway_rate_limit_requests", 60)
+        )
+        self.gateway_rate_limit.setFixedHeight(32)
+        gateway_form.addRow("Rate limit (req/window):", self.gateway_rate_limit)
+
+        self.gateway_rate_window = QSpinBox()
+        self.gateway_rate_window.setRange(10, 3600)
+        self.gateway_rate_window.setValue(
+            getattr(self.settings, "gateway_rate_limit_window", 60)
+        )
+        self.gateway_rate_window.setFixedHeight(32)
+        gateway_form.addRow("Rate window (seconds):", self.gateway_rate_window)
+
+        self.queue_enabled = QCheckBox("Enable message queue (serialize per session)")
+        self.queue_enabled.setChecked(getattr(self.settings, "queue_enabled", False))
+        gateway_form.addRow("", self.queue_enabled)
+
+        self.queue_max_per_session = QSpinBox()
+        self.queue_max_per_session.setRange(1, 1000)
+        self.queue_max_per_session.setValue(
+            getattr(self.settings, "queue_max_per_session", 50)
+        )
+        self.queue_max_per_session.setFixedHeight(32)
+        gateway_form.addRow("Queue max per session:", self.queue_max_per_session)
+
+        container_layout.addWidget(gateway_group)
+
+        # Media & Transcription
+        media_group = QGroupBox("Media & Transcription")
+        media_group.setStyleSheet(self.get_group_style())
+        media_form = QFormLayout(media_group)
+        media_form.setSpacing(12)
+
+        self.transcription_provider = QComboBox()
+        self.transcription_provider.addItems(["openai", "local"])
+        self.transcription_provider.setCurrentText(
+            getattr(self.settings, "transcription_provider", "openai")
+        )
+        self.transcription_provider.setFixedHeight(32)
+        media_form.addRow("Transcription Provider:", self.transcription_provider)
+
+        self.media_retention_days = QSpinBox()
+        self.media_retention_days.setRange(1, 365)
+        self.media_retention_days.setValue(
+            getattr(self.settings, "media_retention_days", 7)
+        )
+        self.media_retention_days.setFixedHeight(32)
+        media_form.addRow("Media Retention (days):", self.media_retention_days)
+
+        self.media_max_size_mb = QSpinBox()
+        self.media_max_size_mb.setRange(0, 10000)
+        self.media_max_size_mb.setSpecialValueText("No limit")
+        self.media_max_size_mb.setValue(
+            getattr(self.settings, "media_max_size_mb", 0)
+        )
+        self.media_max_size_mb.setFixedHeight(32)
+        media_form.addRow("Media max size (MB, 0=unlimited):", self.media_max_size_mb)
+
+        media_hint = QLabel("openai = Whisper API; local = openai-whisper package")
+        media_hint.setStyleSheet("font-size: 12px; color: #8E8E93;")
+        media_form.addRow("", media_hint)
+
+        container_layout.addWidget(media_group)
+
+        # Gmail Pub/Sub
+        gmail_group = QGroupBox("Gmail Pub/Sub")
+        gmail_group.setStyleSheet(self.get_group_style())
+        gmail_form = QFormLayout(gmail_group)
+        gmail_form.setSpacing(12)
+
+        creds_row = QHBoxLayout()
+        self.gmail_credentials_json = QLineEdit(
+            getattr(self.settings, "gmail_credentials_json", None) or ""
+        )
+        self.gmail_credentials_json.setPlaceholderText("Path to OAuth token JSON")
+        self.gmail_credentials_json.setFixedHeight(32)
+        creds_row.addWidget(self.gmail_credentials_json)
+
+        browse_btn = QPushButton("Browse...")
+        browse_btn.setFixedHeight(32)
+        browse_btn.clicked.connect(self._browse_gmail_credentials)
+        creds_row.addWidget(browse_btn)
+        gmail_form.addRow("Credentials JSON:", creds_row)
+
+        self.gmail_pubsub_topic = QLineEdit(
+            getattr(self.settings, "gmail_pubsub_topic", None) or ""
+        )
+        self.gmail_pubsub_topic.setPlaceholderText("e.g. projects/my-project/topics/gmail")
+        self.gmail_pubsub_topic.setFixedHeight(32)
+        gmail_form.addRow("Pub/Sub Topic:", self.gmail_pubsub_topic)
+
+        self.gmail_pubsub_audience = QLineEdit(
+            getattr(self.settings, "gmail_pubsub_audience", None) or ""
+        )
+        self.gmail_pubsub_audience.setPlaceholderText("https://your-host/gmail (for JWT verification)")
+        self.gmail_pubsub_audience.setFixedHeight(32)
+        gmail_form.addRow("Audience URL:", self.gmail_pubsub_audience)
+
+        gmail_hint = QLabel("Leave empty to disable Gmail integration")
+        gmail_hint.setStyleSheet("font-size: 12px; color: #8E8E93;")
+        gmail_form.addRow("", gmail_hint)
+
+        encrypt_btn = QPushButton("Encrypt credentials file")
+        encrypt_btn.setFixedHeight(32)
+        encrypt_btn.clicked.connect(self._encrypt_gmail_credentials)
+        gmail_form.addRow("", encrypt_btn)
+
+        container_layout.addWidget(gmail_group)
+        container_layout.addStretch()
+
+        scroll.setWidget(container)
+        layout.addWidget(scroll)
+
+    def _browse_gmail_credentials(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Gmail OAuth Credentials",
+            "",
+            "JSON (*.json);;All files (*)",
+        )
+        if path:
+            self.gmail_credentials_json.setText(path)
+
+    def _encrypt_gmail_credentials(self):
+        """Encrypt plain JSON credentials and save to .enc file."""
+        path = self.gmail_credentials_json.text().strip()
+        if not path:
+            QMessageBox.warning(
+                self, "No path",
+                "Enter path to plain JSON credentials first, then click Encrypt.",
+            )
+            return
+        from pathlib import Path
+        p = Path(path).expanduser()
+        if not p.exists():
+            QMessageBox.warning(self, "File not found", f"File not found: {path}")
+            return
+        secret = getattr(self.settings, "secret_key", None)
+        if not secret:
+            QMessageBox.warning(
+                self, "Secret key required",
+                "Set a secret key in the Security tab first.",
+            )
+            return
+        try:
+            import json
+            from grizzyclaw.automation.gmail_creds import save_gmail_credentials_encrypted
+            data = json.loads(p.read_text(encoding="utf-8"))
+            enc_path = str(Path.home() / ".grizzyclaw" / "gmail_credentials.enc")
+            if save_gmail_credentials_encrypted(data, enc_path, secret):
+                self.gmail_credentials_json.setText(enc_path)
+                QMessageBox.information(
+                    self, "Encrypted",
+                    f"Credentials saved encrypted to:\n{enc_path}",
+                )
+            else:
+                QMessageBox.warning(self, "Error", "Failed to encrypt credentials.")
+        except Exception as e:
+            QMessageBox.warning(self, "Error", str(e))
+
+    def get_group_style(self):
+        dialog = self.window()
+        if isinstance(dialog, SettingsDialog) and dialog.is_dark:
+            return """
+                QGroupBox {
+                    font-weight: 600;
+                    font-size: 13px;
+                    border: 1px solid #3A3A3C;
+                    border-radius: 6px;
+                    margin-top: 8px;
+                    margin-bottom: 8px;
+                    padding: 8px 16px 16px 16px;
+                    background: #2C2C2E;
+                }
+                QGroupBox::title {
+                    subcontrol-origin: padding;
+                    left: 0px;
+                    top: 0px;
+                    padding-bottom: 4px;
+                    color: #FFFFFF;
+                }
+            """
+        return """
+            QGroupBox {
+                font-weight: 600;
+                font-size: 13px;
+                border: 1px solid #E5E5EA;
+                border-radius: 6px;
+                margin-top: 8px;
+                margin-bottom: 8px;
+                padding: 8px 16px 16px 16px;
+                background: #FAFAFA;
+            }
+            QGroupBox::title {
+                subcontrol-origin: padding;
+                left: 0px;
+                top: 0px;
+                padding-bottom: 4px;
+                color: #1C1C1E;
+            }
+        """
+
+    def get_settings(self):
+        return {
+            "gateway_auth_token": self.gateway_auth_token.text().strip() or None,
+            "gateway_rate_limit_requests": self.gateway_rate_limit.value(),
+            "gateway_rate_limit_window": self.gateway_rate_window.value(),
+            "queue_enabled": self.queue_enabled.isChecked(),
+            "queue_max_per_session": self.queue_max_per_session.value(),
+            "transcription_provider": self.transcription_provider.currentText(),
+            "media_retention_days": self.media_retention_days.value(),
+            "media_max_size_mb": self.media_max_size_mb.value(),
+            "gmail_credentials_json": self.gmail_credentials_json.text().strip() or None,
+            "gmail_pubsub_topic": self.gmail_pubsub_topic.text().strip() or None,
+            "gmail_pubsub_audience": self.gmail_pubsub_audience.text().strip() or None,
+        }
+
+
+class DaemonTab(SettingsTab):
+    """Daemon control: start, stop, status."""
+
+    def __init__(self, settings, parent=None):
+        super().__init__(parent)
+        self.settings = settings
+        self.setup_ui()
+
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(40, 30, 40, 30)
+        layout.setSpacing(20)
+
+        daemon_group = QGroupBox("Background Daemon")
+        daemon_group.setStyleSheet(self.get_group_style())
+        form = QFormLayout(daemon_group)
+        form.setSpacing(12)
+
+        self.daemon_status_label = QLabel("Checking...")
+        self.daemon_status_label.setStyleSheet("font-weight: 500;")
+        form.addRow("Status:", self.daemon_status_label)
+
+        btn_row = QHBoxLayout()
+        self.daemon_start_btn = QPushButton("Start Daemon")
+        self.daemon_start_btn.setFixedHeight(32)
+        self.daemon_start_btn.clicked.connect(self._on_start_daemon)
+        btn_row.addWidget(self.daemon_start_btn)
+
+        self.daemon_stop_btn = QPushButton("Stop Daemon")
+        self.daemon_stop_btn.setFixedHeight(32)
+        self.daemon_stop_btn.clicked.connect(self._on_stop_daemon)
+        btn_row.addWidget(self.daemon_stop_btn)
+        btn_row.addStretch()
+        form.addRow("", btn_row)
+
+        hint = QLabel(
+            "The daemon runs 24/7 in the background with Gateway, webhooks, and IPC. "
+            "WebChat: http://127.0.0.1:18789/chat"
+        )
+        hint.setStyleSheet("font-size: 12px; color: #8E8E93;")
+        hint.setWordWrap(True)
+        form.addRow("", hint)
+
+        layout.addWidget(daemon_group)
+
+        self._refresh_status()
+        self._status_timer = QTimer(self)
+        self._status_timer.timeout.connect(self._refresh_status)
+        self._status_timer.start(3000)
+
+    def get_group_style(self):
+        dialog = self.window()
+        if isinstance(dialog, SettingsDialog) and getattr(dialog, "is_dark", False):
+            return """
+                QGroupBox {
+                    font-weight: 600;
+                    border: 1px solid #3A3A3C;
+                    border-radius: 8px;
+                    margin-top: 12px;
+                    padding-top: 12px;
+                }
+                QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 4px; }
+            """
+        return """
+            QGroupBox {
+                font-weight: 600;
+                border: 1px solid #E5E5EA;
+                border-radius: 8px;
+                margin-top: 12px;
+                padding-top: 12px;
+            }
+            QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 4px; }
+        """
+
+    def _refresh_status(self):
+        try:
+            from grizzyclaw.daemon.ipc import IPCClient
+            client = IPCClient()
+            running = client.is_daemon_running()
+        except Exception:
+            running = False
+        if running:
+            self.daemon_status_label.setText("Running")
+            self.daemon_status_label.setStyleSheet("font-weight: 500; color: #34C759;")
+            self.daemon_start_btn.setEnabled(False)
+            self.daemon_stop_btn.setEnabled(True)
+        else:
+            self.daemon_status_label.setText("Stopped")
+            self.daemon_status_label.setStyleSheet("font-weight: 500; color: #8E8E93;")
+            self.daemon_start_btn.setEnabled(True)
+            self.daemon_stop_btn.setEnabled(False)
+
+    def _on_start_daemon(self):
+        try:
+            subprocess.Popen(
+                [sys.executable, "-m", "grizzyclaw", "daemon", "run"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            self.daemon_status_label.setText("Starting...")
+            QTimer.singleShot(2500, self._refresh_status)
+        except Exception as e:
+            QMessageBox.warning(self, "Start Daemon", f"Failed to start: {e}")
+
+    def _on_stop_daemon(self):
+        self.daemon_stop_btn.setEnabled(False)
+        self._stop_worker = DaemonStopWorker()
+        self._stop_worker.finished.connect(self._on_stop_finished)
+        self._stop_worker.start()
+
+    def _on_stop_finished(self, success: bool, message: str):
+        self._refresh_status()
+        if not success:
+            QMessageBox.warning(self, "Stop Daemon", message)
+
+    def get_settings(self):
+        return {}
+
+
+class DaemonStopWorker(QThread):
+    """Worker to send IPC stop command."""
+    finished = pyqtSignal(bool, str)
+
+    def run(self):
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                from grizzyclaw.daemon.ipc import IPCClient
+                client = IPCClient()
+                result = loop.run_until_complete(client.send_command("stop"))
+                if result.get("status") == "success":
+                    self.finished.emit(True, "")
+                else:
+                    self.finished.emit(False, result.get("error", "Unknown error"))
+            finally:
+                loop.close()
+        except Exception as e:
+            self.finished.emit(False, str(e))
+
+
 class AppearanceTab(SettingsTab):
     def __init__(self, settings, parent=None):
         super().__init__(parent)
@@ -2095,6 +2497,8 @@ class SettingsDialog(QDialog):
         self.prompts_tab = PromptsTab(self.settings)
         self.skills_tab = SkillsTab(self.settings)
         self.security_tab = SecurityTab(self.settings)
+        self.integrations_tab = IntegrationsTab(self.settings)
+        self.daemon_tab = DaemonTab(self.settings)
         self.appearance_tab = AppearanceTab(self.settings)
         
         self.tabs.addTab(self.general_tab, "General")
@@ -2104,6 +2508,8 @@ class SettingsDialog(QDialog):
         self.tabs.addTab(self.prompts_tab, "Prompts & Rules")
         self.tabs.addTab(self.skills_tab, "Skills & MCP")
         self.tabs.addTab(self.security_tab, "Security")
+        self.tabs.addTab(self.integrations_tab, "Integrations")
+        self.tabs.addTab(self.daemon_tab, "Daemon")
         self.tabs.addTab(self.appearance_tab, "Appearance")
         
         layout.addWidget(self.tabs, 1)
@@ -2149,6 +2555,8 @@ class SettingsDialog(QDialog):
         new_settings.update(self.prompts_tab.get_settings())
         new_settings.update(self.skills_tab.get_settings())
         new_settings.update(self.security_tab.get_settings())
+        new_settings.update(self.integrations_tab.get_settings())
+        new_settings.update(self.daemon_tab.get_settings())
         new_settings.update(self.appearance_tab.get_settings())
         
         for key, value in new_settings.items():
@@ -2403,8 +2811,9 @@ class SettingsDialog(QDialog):
     
     def update_group_styles(self):
         """Update all group box styles when theme changes"""
-        for tab in [self.general_tab, self.llm_tab, self.telegram_tab, 
-                    self.security_tab, self.appearance_tab]:
+        for tab in [self.general_tab, self.llm_tab, self.telegram_tab,
+                    self.security_tab, self.integrations_tab, self.daemon_tab,
+                    self.appearance_tab]:
             if hasattr(tab, 'get_group_style'):
                 # Find all group boxes in the tab
                 for child in tab.findChildren(QGroupBox):

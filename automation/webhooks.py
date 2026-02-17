@@ -17,6 +17,7 @@ class Webhook:
     path: str
     handler: Callable
     secret: Optional[str] = None
+    verify: Optional[Callable] = None  # Optional: verify(request) -> bool for custom auth (e.g. Pub/Sub JWT)
     metadata: Dict = None
 
     def __post_init__(self):
@@ -53,6 +54,7 @@ class WebhookServer:
         path: str,
         handler: Callable,
         secret: Optional[str] = None,
+        verify: Optional[Callable] = None,
         metadata: Optional[Dict] = None
     ):
         """Register a webhook
@@ -61,6 +63,7 @@ class WebhookServer:
             path: Webhook path (e.g., "/github", "/slack")
             handler: Async function to handle webhook
             secret: Optional secret for signature verification
+            verify: Optional async callable(request) -> bool for custom auth (e.g. Pub/Sub JWT)
             metadata: Additional metadata
         """
         # Normalize path
@@ -71,6 +74,7 @@ class WebhookServer:
             path=path,
             handler=handler,
             secret=secret,
+            verify=verify,
             metadata=metadata or {}
         )
 
@@ -142,6 +146,19 @@ class WebhookServer:
                     logger.warning(f"Invalid signature for webhook: {path}")
                     return web.json_response(
                         {"error": "Invalid signature"},
+                        status=401
+                    )
+
+            # Custom verification (e.g. Pub/Sub JWT)
+            if webhook.verify:
+                if asyncio.iscoroutinefunction(webhook.verify):
+                    ok = await webhook.verify(request)
+                else:
+                    ok = webhook.verify(request)
+                if not ok:
+                    logger.warning(f"Verification failed for webhook: {path}")
+                    return web.json_response(
+                        {"error": "Verification failed"},
                         status=401
                     )
 

@@ -63,6 +63,13 @@ class Settings(BaseSettings):
     )
     whatsapp_session_path: Optional[str] = Field(default="~/.grizzyclaw/whatsapp_session", alias="WHATSAPP_SESSION_PATH")
 
+    # Gmail Pub/Sub
+    gmail_credentials_json: Optional[str] = Field(default=None, alias="GMAIL_CREDENTIALS_JSON")
+    gmail_pubsub_topic: Optional[str] = Field(default=None, alias="GMAIL_PUBSUB_TOPIC")
+    gmail_pubsub_audience: Optional[str] = Field(
+        default=None, alias="GMAIL_PUBSUB_AUDIENCE"
+    )  # Push endpoint URL for JWT verification (e.g. https://your-host/gmail)
+
     # Prompts & Rules
     system_prompt: str = Field(default="You are GrizzyClaw, a helpful AI assistant with memory. You can remember previous conversations and use that context to help the user.", alias="SYSTEM_PROMPT")
     rules_file: Optional[str] = Field(default=None, alias="RULES_FILE")
@@ -74,12 +81,38 @@ class Settings(BaseSettings):
 
     # Security
     jwt_secret: str = Field(default="your-jwt-secret", alias="JWT_SECRET")
+    gateway_auth_token: Optional[str] = Field(
+        default=None, alias="GATEWAY_AUTH_TOKEN"
+    )
     jwt_algorithm: str = "HS256"
     jwt_expiration_hours: int = 24
+
+    # Agent queue
+    queue_enabled: bool = Field(default=False, alias="QUEUE_ENABLED")
+    queue_max_per_session: int = Field(default=50, alias="QUEUE_MAX_PER_SESSION")
+
+    # Gateway rate limiting (per client)
+    gateway_rate_limit_requests: int = Field(
+        default=60, alias="GATEWAY_RATE_LIMIT_REQUESTS"
+    )
+    gateway_rate_limit_window: int = Field(
+        default=60, alias="GATEWAY_RATE_LIMIT_WINDOW"
+    )
 
     # Rate limiting
     rate_limit_requests: int = 100
     rate_limit_window: int = 60
+
+    # Media / Transcription
+    transcription_provider: str = Field(
+        default="openai", alias="TRANSCRIPTION_PROVIDER"
+    )  # "local" or "openai"
+    media_retention_days: int = Field(
+        default=7, alias="MEDIA_RETENTION_DAYS"
+    )
+    media_max_size_mb: int = Field(
+        default=0, alias="MEDIA_MAX_SIZE_MB"
+    )  # 0 = no limit; delete oldest when over
 
     # Memory
     max_context_length: int = 4000

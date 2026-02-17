@@ -100,7 +100,7 @@ class RateLimiter:
         self._requests[key] = [
             req_time
             for req_time in self._requests[key]
-            if (now - req_time).seconds < self.window
+            if (now - req_time).total_seconds() < self.window
         ]
 
         if len(self._requests[key]) >= self.max_requests:

@@ -1,6 +1,8 @@
 import asyncio
+import os
 import sys
 from pathlib import Path
+from typing import Optional
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -45,12 +47,13 @@ class MessageWorker(QThread):
     chunk_ready = pyqtSignal(str)
     error_occurred = pyqtSignal(str)
 
-    def __init__(self, agent, user_id, message, images=None):
+    def __init__(self, agent, user_id, message, images=None, audio_path=None):
         super().__init__()
         self.agent = agent
         self.user_id = user_id
         self.message = message
         self.images = images or []
+        self.audio_path = audio_path
 
     def run(self):
         """Run the async processing in a separate thread"""
@@ -64,8 +67,11 @@ class MessageWorker(QThread):
     async def _process_message(self):
         """Process the message asynchronously, streaming each chunk."""
         response_text = ""
+        kwargs = {"images": self.images}
+        if self.audio_path:
+            kwargs["audio_path"] = self.audio_path
         async for chunk in self.agent.process_message(
-            self.user_id, self.message, images=self.images
+            self.user_id, self.message, **kwargs
         ):
             response_text += chunk
             self.chunk_ready.emit(chunk)
@@ -285,9 +291,10 @@ class ChatWidget(QWidget):
         input_layout.setSpacing(12)
         
         self.pending_images: list[str] = []
+        self.pending_audio: Optional[str] = None
 
         self.input_field = QLineEdit()
-        self.input_field.setPlaceholderText("Type your message or attach an image...")
+        self.input_field.setPlaceholderText("Type your message or attach an image/audio...")
         self.input_field.setFont(QFont("-apple-system", 14))
         self.input_field.setFixedHeight(44)
         self.input_field.setStyleSheet("""
@@ -311,8 +318,8 @@ class ChatWidget(QWidget):
         self.input_field.dragEnterEvent = self._input_drag_enter
         self.input_field.dropEvent = self._input_drop
 
-        self.attach_btn = QPushButton("📷")
-        self.attach_btn.setToolTip("Attach image (or drag and drop)")
+        self.attach_btn = QPushButton("📎")
+        self.attach_btn.setToolTip("Attach image or audio (or drag and drop)")
         self.attach_btn.setFont(QFont("-apple-system", 14))
         self.attach_btn.setFixedSize(44, 44)
         self.attach_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -328,7 +335,7 @@ class ChatWidget(QWidget):
                 color: #1C1C1E;
             }
         """)
-        self.attach_btn.clicked.connect(self._attach_image)
+        self.attach_btn.clicked.connect(self._attach_file)
 
         self.send_btn = QPushButton("Send")
         self.send_btn.setFont(QFont("-apple-system", 14, QFont.Weight.Medium))
@@ -366,18 +373,27 @@ class ChatWidget(QWidget):
 
         layout.addWidget(input_container)
     
-    def _attach_image(self):
+    def _attach_file(self):
         paths, _ = QFileDialog.getOpenFileNames(
             self,
-            "Attach images",
+            "Attach image or audio",
             "",
-            "Images (*.png *.jpg *.jpeg *.gif *.webp);;All files (*)",
+            "Images (*.png *.jpg *.jpeg *.gif *.webp);;"
+            "Audio (*.mp3 *.wav *.m4a *.ogg *.oga *.webm);;"
+            "All files (*)",
         )
-        self._add_images(paths)
+        self._add_attachments(paths)
 
-    def _add_images(self, paths: list[str]):
+    def _add_attachments(self, paths: list[str]):
+        _AUDIO_EXT = (".mp3", ".wav", ".m4a", ".ogg", ".oga", ".webm")
+        _IMAGE_EXT = (".png", ".jpg", ".jpeg", ".gif", ".webp")
         for p in paths:
-            if p and p not in self.pending_images:
+            if not p:
+                continue
+            low = p.lower()
+            if any(low.endswith(ext) for ext in _AUDIO_EXT):
+                self.pending_audio = p
+            elif any(low.endswith(ext) for ext in _IMAGE_EXT) and p not in self.pending_images:
                 self.pending_images.append(p)
         self._update_attached_label()
 
@@ -386,20 +402,30 @@ class ChatWidget(QWidget):
             event.acceptProposedAction()
 
     def _input_drop(self, event: QDropEvent):
-        paths = [
-            u.toLocalFile()
-            for u in event.mimeData().urls()
-            if u.toLocalFile().lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp"))
-        ]
-        self._add_images(paths)
+        _AUDIO_EXT = (".mp3", ".wav", ".m4a", ".ogg", ".oga", ".webm")
+        _IMAGE_EXT = (".png", ".jpg", ".jpeg", ".gif", ".webp")
+        paths = [u.toLocalFile() for u in event.mimeData().urls()]
+        for p in paths:
+            if not p:
+                continue
+            low = p.lower()
+            if any(low.endswith(ext) for ext in _AUDIO_EXT):
+                self.pending_audio = p
+            elif any(low.endswith(ext) for ext in _IMAGE_EXT) and p not in self.pending_images:
+                self.pending_images.append(p)
+        self._update_attached_label()
 
     def _update_attached_label(self):
-        if not self.pending_images:
+        parts = []
+        if self.pending_images:
+            parts.append(f"📷 {len(self.pending_images)} image(s)")
+        if self.pending_audio:
+            parts.append("🎤 1 audio")
+        if not parts:
             self.attached_label.setText("")
             self.attached_label.hide()
         else:
-            n = len(self.pending_images)
-            self.attached_label.setText(f"📷 {n} image(s) attached")
+            self.attached_label.setText(" • ".join(parts) + " attached")
             self.attached_label.show()
 
     def _new_chat(self):
@@ -432,21 +458,31 @@ class ChatWidget(QWidget):
     def send_message(self):
         text = self.input_field.text().strip()
         images = list(self.pending_images)
-        if not text and not images:
+        audio_path = self.pending_audio
+        if not text and not images and not audio_path:
             return
 
         self._set_loading(True)
         self.input_field.clear()
         self.pending_images.clear()
+        self.pending_audio = None
         self._update_attached_label()
 
-        display_text = text or "(image)"
+        if text:
+            display_text = text
+        elif audio_path:
+            display_text = "(audio message)"
+        else:
+            display_text = "(image)"
 
         self.add_message(display_text, is_user=True)
 
         self._streaming_bubble = None
         self._user_near_bottom = True
-        self.worker = MessageWorker(self.agent, self.user_id, text or "What's in this image?", images)
+        prompt = text or ("What's in this image?" if images else "")
+        self.worker = MessageWorker(
+            self.agent, self.user_id, prompt, images=images, audio_path=audio_path
+        )
         self.worker.chunk_ready.connect(self._on_stream_chunk)
         self.worker.message_ready.connect(self.on_message_ready)
         self.worker.error_occurred.connect(self.on_error)
@@ -892,6 +928,11 @@ class GrizzyClawApp(QMainWindow):
         self.setup_menu()
         self.setup_tray()
         self.setup_shortcuts()
+
+        # Clean up workers before quit to avoid macOS "quit unexpectedly" crash
+        app = QApplication.instance()
+        if app:
+            app.aboutToQuit.connect(self._cleanup_before_quit)
         
         # Apply appearance settings on startup
         self.apply_appearance_settings()
@@ -1606,6 +1647,24 @@ class GrizzyClawApp(QMainWindow):
                 3000,
             )
     
+    def _cleanup_before_quit(self):
+        """Stop background workers before exit to prevent macOS crash report."""
+        # Signal Telegram bot to stop (runs in TelegramStartWorker thread)
+        if self.telegram_bot and hasattr(self.telegram_bot, "_stop_event"):
+            try:
+                self.telegram_bot._stop_event.set()
+            except Exception:
+                pass
+        # Wait for Telegram worker to finish (with timeout)
+        if hasattr(self, "_telegram_worker") and self._telegram_worker and self._telegram_worker.isRunning():
+            self._telegram_worker.wait(3000)
+        # Wait for stop worker if token was being changed
+        if hasattr(self, "_stop_worker") and self._stop_worker and self._stop_worker.isRunning():
+            self._stop_worker.wait(2000)
+        # Wait for chat MessageWorker if one is running
+        if hasattr(self.chat_widget, "worker") and self.chat_widget.worker and self.chat_widget.worker.isRunning():
+            self.chat_widget.worker.wait(2000)
+
     def quit_app(self):
         if hasattr(self, "tray_icon"):
             self.tray_icon.hide()
@@ -1640,8 +1699,13 @@ def main():
     
     window = GrizzyClawApp()
     window.show()
-    
-    sys.exit(app.exec())
+
+    exit_code = app.exec()
+    # Use os._exit(0) for normal quit to bypass Python shutdown - avoids macOS
+    # "quit unexpectedly" crash (often caused by Qt/PyInstaller during teardown)
+    if exit_code == 0:
+        os._exit(0)
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

@@ -48,6 +48,13 @@ class IPCServer:
             path=self.socket_path
         )
 
+        # Restrict socket permissions (chmod 600) for security
+        try:
+            import os
+            os.chmod(self.socket_path, 0o600)
+        except OSError as e:
+            logger.warning(f"Could not set socket permissions: {e}")
+
         logger.info(f"IPC server listening on {self.socket_path}")
 
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
