@@ -9,6 +9,18 @@ from pydantic import Field
 from pydantic_settings import BaseSettings
 
 
+# Deprecated Anthropic models (retired) -> replacement
+ANTHROPIC_DEPRECATED = {
+    "claude-3-5-sonnet-20241022": "claude-sonnet-4-5-20250929",
+    "claude-3-5-sonnet-20240620": "claude-sonnet-4-5-20250929",
+    "claude-3-5-haiku-20241022": "claude-haiku-4-5-20251001",
+    "claude-3-7-sonnet-20250219": "claude-sonnet-4-5-20250929",
+    "claude-3-opus-20240229": "claude-opus-4-6",
+    "claude-3-sonnet-20240229": "claude-sonnet-4-5-20250929",
+    "claude-3-haiku-20240307": "claude-haiku-4-5-20251001",
+}
+
+
 def get_config_path() -> Path:
     """Return the path to config.yaml used for both loading and saving.
     When running as a frozen app, use a user-writable path so saves persist.
@@ -107,6 +119,12 @@ class Settings(BaseSettings):
     transcription_provider: str = Field(
         default="openai", alias="TRANSCRIPTION_PROVIDER"
     )  # "local" or "openai"
+    input_device_index: Optional[int] = Field(
+        default=None, alias="INPUT_DEVICE_INDEX"
+    )  # Deprecated: use input_device_name
+    input_device_name: Optional[str] = Field(
+        default=None, alias="INPUT_DEVICE_NAME"
+    )  # Device name substring for sounddevice; more reliable than index in bundled app
     media_retention_days: int = Field(
         default=7, alias="MEDIA_RETENTION_DAYS"
     )
@@ -131,6 +149,13 @@ class Settings(BaseSettings):
     log_pii_redact: bool = Field(default=True, alias="LOG_PII_REDACT")
     tracing_enabled: bool = Field(default=False, alias="TRACING_ENABLED")
 
+    # Voice (ElevenLabs for high-quality TTS)
+    elevenlabs_api_key: Optional[str] = Field(default=None, alias="ELEVENLABS_API_KEY")
+    elevenlabs_voice_id: str = Field(
+        default="21m00Tcm4TlvDq8ikWAM", alias="ELEVENLABS_VOICE_ID"
+    )
+    tts_provider: str = Field(default="auto", alias="TTS_PROVIDER")  # auto, elevenlabs, pyttsx3, say
+
     # Appearance
     theme: str = "Light"
     font_family: str = "System Default"
@@ -142,17 +167,6 @@ class Settings(BaseSettings):
         env_file_encoding = "utf-8"
         populate_by_name = True
 
-    # Deprecated Anthropic models (retired) -> replacement
-    _ANTHROPIC_DEPRECATED = {
-        "claude-3-5-sonnet-20241022": "claude-sonnet-4-5-20250929",
-        "claude-3-5-sonnet-20240620": "claude-sonnet-4-5-20250929",
-        "claude-3-5-haiku-20241022": "claude-haiku-4-5-20251001",
-        "claude-3-7-sonnet-20250219": "claude-sonnet-4-5-20250929",
-        "claude-3-opus-20240229": "claude-opus-4-6",
-        "claude-3-sonnet-20240229": "claude-sonnet-4-5-20250929",
-        "claude-3-haiku-20240307": "claude-haiku-4-5-20251001",
-    }
-
     @classmethod
     def from_file(cls, path: str) -> "Settings":
         """Load settings from YAML file"""
@@ -160,8 +174,8 @@ class Settings(BaseSettings):
             config = yaml.safe_load(f)
         if config and "anthropic_model" in config:
             old = config["anthropic_model"]
-            if old in cls._ANTHROPIC_DEPRECATED:
-                config["anthropic_model"] = cls._ANTHROPIC_DEPRECATED[old]
+            if old in ANTHROPIC_DEPRECATED:
+                config["anthropic_model"] = ANTHROPIC_DEPRECATED[old]
         return cls(**config)
 
     def to_file(self, path: str):

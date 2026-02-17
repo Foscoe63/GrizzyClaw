@@ -205,7 +205,7 @@ class LLMTab(SettingsTab):
         self.ollama_model = QComboBox()
         self.ollama_model.setEditable(True)
         self.ollama_model.addItems([
-            "llama3.2", "llama3.2:1b", "llama3.2:3b",
+            "gpt-oss:20b", "llama3.2", "llama3.2:1b", "llama3.2:3b",
             "llama3.1", "llama3.1:70b", "llama3.1:405b",
             "mistral", "mixtral", "codellama",
             "phi3", "qwen2.5", "gemma2"
@@ -861,7 +861,7 @@ class SkillsTab(SettingsTab):
         scroll_layout.addWidget(hf_card)
         
         # ===== Skills Section =====
-        skills_card = self._create_card("⚡ Skills Ecosystem", "Enable AI capabilities from the built-in registry")
+        skills_card = self._create_card("⚡ ClawHub - Skills Registry", "Discover and install AI capabilities from the built-in registry")
         skills_layout = skills_card.layout()
 
         skills_hint = QLabel("Skills: web_search, filesystem, documentation, browser, memory, scheduler")
@@ -1952,6 +1952,18 @@ class IntegrationsTab(SettingsTab):
         self.transcription_provider.setFixedHeight(32)
         media_form.addRow("Transcription Provider:", self.transcription_provider)
 
+        self.input_device_combo = QComboBox()
+        self.input_device_combo.setFixedHeight(32)
+        self._populate_input_devices()
+        media_form.addRow("Microphone (voice input):", self.input_device_combo)
+        input_device_hint = QLabel("If voice fails in app but works from terminal, select your mic explicitly.")
+        input_device_hint.setStyleSheet("font-size: 11px; color: #8E8E93;")
+        media_form.addRow("", input_device_hint)
+
+        transcribe_hint = QLabel("local = Whisper on device (pip install openai-whisper)")
+        transcribe_hint.setStyleSheet("font-size: 11px; color: #8E8E93;")
+        media_form.addRow("", transcribe_hint)
+
         self.media_retention_days = QSpinBox()
         self.media_retention_days.setRange(1, 365)
         self.media_retention_days.setValue(
@@ -1974,6 +1986,35 @@ class IntegrationsTab(SettingsTab):
         media_form.addRow("", media_hint)
 
         container_layout.addWidget(media_group)
+
+        # Voice (TTS) - ElevenLabs for high-quality synthesis
+        voice_group = QGroupBox("Voice (TTS)")
+        voice_group.setStyleSheet(self.get_group_style())
+        voice_form = QFormLayout(voice_group)
+        self.elevenlabs_key = QLineEdit(
+            getattr(self.settings, "elevenlabs_api_key", None) or ""
+        )
+        self.elevenlabs_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.elevenlabs_key.setPlaceholderText("Optional: ElevenLabs API key for high-quality TTS")
+        self.elevenlabs_key.setFixedHeight(32)
+        voice_form.addRow("ElevenLabs API Key:", self.elevenlabs_key)
+        self.elevenlabs_voice = QLineEdit(
+            getattr(self.settings, "elevenlabs_voice_id", "21m00Tcm4TlvDq8ikWAM") or ""
+        )
+        self.elevenlabs_voice.setPlaceholderText("Voice ID (default: Rachel)")
+        self.elevenlabs_voice.setFixedHeight(32)
+        voice_form.addRow("Voice ID:", self.elevenlabs_voice)
+        self.tts_provider_combo = QComboBox()
+        self.tts_provider_combo.addItems(["auto", "elevenlabs", "pyttsx3", "say"])
+        self.tts_provider_combo.setCurrentText(
+            getattr(self.settings, "tts_provider", "auto")
+        )
+        self.tts_provider_combo.setFixedHeight(32)
+        voice_form.addRow("TTS Provider:", self.tts_provider_combo)
+        voice_hint = QLabel("auto = try ElevenLabs → pyttsx3 → macOS say")
+        voice_hint.setStyleSheet("font-size: 12px; color: #8E8E93;")
+        voice_form.addRow("", voice_hint)
+        container_layout.addWidget(voice_group)
 
         # Gmail Pub/Sub
         gmail_group = QGroupBox("Gmail Pub/Sub")
@@ -2041,6 +2082,30 @@ class IntegrationsTab(SettingsTab):
 
         scroll.setWidget(container)
         layout.addWidget(scroll)
+
+    def _populate_input_devices(self):
+        """Populate microphone dropdown with available input devices."""
+        try:
+            from grizzyclaw.utils.audio_record import list_input_devices
+            devices = list_input_devices()
+            self.input_device_combo.clear()
+            self.input_device_combo.addItem("System default", None)
+            for idx, name in devices:
+                self.input_device_combo.addItem(name, idx)
+            saved_idx = getattr(self.settings, "input_device_index", None)
+            saved_name = getattr(self.settings, "input_device_name", None)
+            if saved_name:
+                for i in range(self.input_device_combo.count()):
+                    if self.input_device_combo.itemText(i) == saved_name:
+                        self.input_device_combo.setCurrentIndex(i)
+                        break
+            elif saved_idx is not None:
+                for i in range(self.input_device_combo.count()):
+                    if self.input_device_combo.itemData(i) == saved_idx:
+                        self.input_device_combo.setCurrentIndex(i)
+                        break
+        except Exception:
+            self.input_device_combo.addItem("System default", None)
 
     def _open_triggers_dialog(self):
         """Open the automation triggers management dialog."""
@@ -2146,8 +2211,13 @@ class IntegrationsTab(SettingsTab):
             "queue_enabled": self.queue_enabled.isChecked(),
             "queue_max_per_session": self.queue_max_per_session.value(),
             "transcription_provider": self.transcription_provider.currentText(),
+            "input_device_index": self.input_device_combo.currentData(),
+            "input_device_name": self.input_device_combo.currentText() if self.input_device_combo.currentData() is not None else None,
             "media_retention_days": self.media_retention_days.value(),
             "media_max_size_mb": self.media_max_size_mb.value(),
+            "elevenlabs_api_key": self.elevenlabs_key.text().strip() or None,
+            "elevenlabs_voice_id": self.elevenlabs_voice.text().strip() or "21m00Tcm4TlvDq8ikWAM",
+            "tts_provider": self.tts_provider_combo.currentText(),
             "gmail_credentials_json": self.gmail_credentials_json.text().strip() or None,
             "gmail_pubsub_topic": self.gmail_pubsub_topic.text().strip() or None,
             "gmail_pubsub_audience": self.gmail_pubsub_audience.text().strip() or None,
@@ -2191,7 +2261,8 @@ class DaemonTab(SettingsTab):
 
         hint = QLabel(
             "The daemon runs 24/7 in the background with Gateway, webhooks, and IPC. "
-            "WebChat: http://127.0.0.1:18789/chat"
+            "WebChat: http://127.0.0.1:18788/chat. "
+            "If it stops, check ~/.grizzyclaw/daemon_stderr.log for errors."
         )
         hint.setStyleSheet("font-size: 12px; color: #8E8E93;")
         hint.setWordWrap(True)
@@ -2248,13 +2319,24 @@ class DaemonTab(SettingsTab):
 
     def _on_start_daemon(self):
         try:
-            subprocess.Popen(
-                [sys.executable, "-m", "grizzyclaw", "daemon", "run"],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
+            # When frozen (app bundle), sys.executable is the app; pass args directly.
+            # When running from source, use python -m grizzyclaw daemon run.
+            if getattr(sys, "frozen", False):
+                cmd = [sys.executable, "daemon", "run"]
+            else:
+                cmd = [sys.executable, "-m", "grizzyclaw", "daemon", "run"]
+            log_dir = Path.home() / ".grizzyclaw"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            stderr_path = log_dir / "daemon_stderr.log"
+            with open(stderr_path, "w") as f:
+                subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.DEVNULL,
+                    stdout=f,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                    cwd=str(Path.home()),
+                )
             self.daemon_status_label.setText("Starting...")
             QTimer.singleShot(2500, self._refresh_status)
         except Exception as e:
@@ -2551,7 +2633,7 @@ class SettingsDialog(QDialog):
         self.tabs.addTab(self.telegram_tab, "Telegram")
         self.tabs.addTab(self.whatsapp_tab, "WhatsApp")
         self.tabs.addTab(self.prompts_tab, "Prompts & Rules")
-        self.tabs.addTab(self.skills_tab, "Skills & MCP")
+        self.tabs.addTab(self.skills_tab, "ClawHub & MCP")
         self.tabs.addTab(self.security_tab, "Security")
         self.tabs.addTab(self.integrations_tab, "Integrations")
         self.tabs.addTab(self.daemon_tab, "Daemon")

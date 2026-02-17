@@ -85,8 +85,8 @@ class DaemonService:
             self.agent = AgentCore(self.settings)
             logger.info("Agent core initialized")
 
-            # Test LLM connections
-            await self.llm_router.test_connections()
+            # Test LLM connections in background (don't block startup; Anthropic etc. can timeout)
+            asyncio.create_task(self._test_connections_background())
 
             # Start HTTP server (for WebChat UI)
             self.http_server = HTTPServer()
@@ -121,6 +121,13 @@ class DaemonService:
         except Exception as e:
             logger.error(f"Failed to start daemon: {e}", exc_info=True)
             raise
+
+    async def _test_connections_background(self):
+        """Run LLM connection tests in background; don't block daemon startup."""
+        try:
+            await self.llm_router.test_connections()
+        except Exception as e:
+            logger.debug(f"LLM connection test failed (non-fatal): {e}")
 
     async def _run_event_loop(self):
         """Main event loop for daemon"""

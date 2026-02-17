@@ -260,7 +260,17 @@ class WorkspaceManager:
         # Provider URLs (ollama_url, lmstudio_url) always come from base_settings (main Settings)
         # so "where to connect" is set in Settings → LLM Providers; workspace only picks provider + model.
         settings.default_llm_provider = config.llm_provider
-        settings.default_model = config.llm_model
+        # Set provider-specific model so router uses it (no default_model override needed)
+        if config.llm_provider == "ollama":
+            settings.ollama_model = config.llm_model
+        elif config.llm_provider == "lmstudio":
+            settings.lmstudio_model = config.llm_model
+        elif config.llm_provider == "openai":
+            settings.openai_model = config.llm_model
+        elif config.llm_provider == "anthropic":
+            settings.anthropic_model = config.llm_model
+        elif config.llm_provider == "openrouter":
+            settings.openrouter_model = config.llm_model
         settings.system_prompt = config.system_prompt
         settings.max_context_length = config.max_context_length
         settings.max_session_messages = config.max_session_messages

@@ -22,6 +22,7 @@ from grizzyclaw.gui.settings_dialog import SettingsDialog, _sanitize_telegram_to
 from .memory_dialog import MemoryDialog
 from .scheduler_dialog import SchedulerDialog
 from .browser_dialog import BrowserDialog
+from .sessions_dialog import SessionsDialog
 from .workspace_dialog import WorkspaceDialog
 from .canvas_widget import CanvasWidget
 from grizzyclaw.workspaces import WorkspaceManager
@@ -46,23 +47,59 @@ class TTSWorker(QThread):
     """Speak text using TTS in background."""
     finished = pyqtSignal(bool)
 
-    def __init__(self, text: str, parent=None):
+    def __init__(self, text: str, settings=None, parent=None):
         super().__init__(parent)
         self.text = text
+        self.settings = settings
 
     def run(self):
         try:
             from grizzyclaw.utils.tts import speak_text
-            ok = speak_text(self.text)
+            s = self.settings
+            ok = speak_text(
+                self.text,
+                provider=getattr(s, "tts_provider", "auto"),
+                elevenlabs_api_key=getattr(s, "elevenlabs_api_key", None),
+                elevenlabs_voice_id=getattr(s, "elevenlabs_voice_id", "21m00Tcm4TlvDq8ikWAM"),
+            )
             self.finished.emit(ok)
         except Exception:
             self.finished.emit(False)
+
+
+class RecordVoiceWorker(QThread):
+    """Record from microphone until stop_event is set."""
+    finished = pyqtSignal(object)  # Path or None
+
+    def __init__(self, stop_event, parent=None, device=None):
+        super().__init__(parent)
+        self.stop_event = stop_event
+        self.device = device
+
+    def run(self):
+        import tempfile
+        import threading
+        from grizzyclaw.utils.audio_record import record_audio_callback, is_recording_available
+
+        if not is_recording_available():
+            self.finished.emit(None)
+            return
+        fd, path = tempfile.mkstemp(suffix=".wav")
+        import os
+        os.close(fd)
+        ok = record_audio_callback(self.stop_event, Path(path), device=self.device)
+        if ok:
+            self.finished.emit(Path(path))
+        else:
+            Path(path).unlink(missing_ok=True)
+            self.finished.emit(None)
 
 
 class MessageWorker(QThread):
     """Worker thread to handle async agent processing."""
     message_ready = pyqtSignal(str)
     chunk_ready = pyqtSignal(str)
+    transcript_ready = pyqtSignal(str)
     error_occurred = pyqtSignal(str)
 
     def __init__(self, agent, user_id, message, images=None, audio_path=None):
@@ -85,11 +122,39 @@ class MessageWorker(QThread):
     async def _process_message(self):
         """Process the message asynchronously, streaming each chunk."""
         response_text = ""
-        kwargs = {"images": self.images}
+        message = self.message
+        audio_path = None
+
         if self.audio_path:
-            kwargs["audio_path"] = self.audio_path
+            # Pre-transcribe so we can show the transcript in the user bubble
+            try:
+                from grizzyclaw.media.transcribe import transcribe_audio
+                provider = getattr(
+                    self.agent.settings, "transcription_provider", "openai"
+                )
+                loop = asyncio.get_event_loop()
+                transcript = await loop.run_in_executor(
+                    None,
+                    lambda: transcribe_audio(
+                        self.audio_path,
+                        provider=provider,
+                        openai_api_key=self.agent.settings.openai_api_key,
+                    ),
+                )
+                if transcript:
+                    self.transcript_ready.emit(transcript)
+                    message = f"{self.message}\n\n{transcript}".strip() if self.message else transcript
+                # Don't pass audio_path to agent; we already have the transcript
+            except Exception as e:
+                self.error_occurred.emit(f"Error: {str(e)}")
+                return ""
+
+        kwargs = {"images": self.images}
+        if audio_path:
+            kwargs["audio_path"] = audio_path
+
         async for chunk in self.agent.process_message(
-            self.user_id, self.message, **kwargs
+            self.user_id, message, **kwargs
         ):
             response_text += chunk
             self.chunk_ready.emit(chunk)
@@ -184,9 +249,10 @@ class ChatWidget(QWidget):
     message_received = pyqtSignal(str, bool)
     image_attached = pyqtSignal(str)  # path to display in canvas
 
-    def __init__(self, agent, parent=None):
+    def __init__(self, agent, parent=None, settings=None):
         super().__init__(parent)
         self.agent = agent
+        self._settings = settings
         self.user_id = "gui_user"
         self.current_conversation = []
         self.is_dark = False
@@ -375,7 +441,7 @@ class ChatWidget(QWidget):
         self.attach_btn.clicked.connect(self._attach_file)
 
         self.mic_btn = QPushButton("🎤")
-        self.mic_btn.setToolTip("Attach voice/audio message")
+        self.mic_btn.setToolTip("Record voice or attach audio file")
         self.mic_btn.setFont(QFont("-apple-system", 14))
         self.mic_btn.setFixedSize(44, 44)
         self.mic_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -393,7 +459,9 @@ class ChatWidget(QWidget):
                 color: #1C1C1E;
             }
         """)
-        self.mic_btn.clicked.connect(self._attach_audio)
+        self.mic_btn.clicked.connect(self._on_mic_clicked)
+        self._record_stop_event = None
+        self._record_worker = None
 
         self.send_btn = QPushButton("Send")
         self.send_btn.setFont(QFont("-apple-system", 14, QFont.Weight.Medium))
@@ -432,6 +500,79 @@ class ChatWidget(QWidget):
 
         layout.addWidget(input_container)
     
+    def _on_mic_clicked(self):
+        """Show menu: Record or Attach file. If recording, stop."""
+        if self._record_worker and self._record_worker.isRunning():
+            self._stop_recording()
+            return
+        menu = QMenu(self)
+        if self._can_record():
+            menu.addAction("Record from microphone", self._start_recording)
+        menu.addAction("Attach audio file", self._attach_audio)
+        menu.exec(self.mic_btn.mapToGlobal(self.mic_btn.rect().bottomLeft()))
+
+    def _can_record(self) -> bool:
+        """Check if microphone recording is available."""
+        try:
+            from grizzyclaw.utils.audio_record import is_recording_available
+            return is_recording_available()
+        except Exception:
+            return False
+
+    def _start_recording(self):
+        """Start recording from microphone."""
+        import threading
+        self._record_stop_event = threading.Event()
+        settings = self.agent.settings if self.agent else self._settings
+        if not settings:
+            device = None
+        else:
+            # Prefer device name (more reliable in bundled app); fallback to index
+            name = getattr(settings, "input_device_name", None)
+            idx = getattr(settings, "input_device_index", None)
+            if name and str(name).strip() and str(name) != "System default":
+                device = str(name).strip()
+            elif idx is not None:
+                device = idx
+            else:
+                device = None
+        self._record_worker = RecordVoiceWorker(self._record_stop_event, self, device=device)
+        self._record_worker.finished.connect(self._on_recording_finished)
+        self._record_worker.start()
+        self.mic_btn.setText("⏹")
+        self.mic_btn.setToolTip("Stop recording")
+        self.attached_label.setText("Recording... Click mic to stop")
+        self.attached_label.show()
+
+    def _stop_recording(self):
+        """Stop recording and process."""
+        if self._record_stop_event:
+            self._record_stop_event.set()
+            self.mic_btn.setText("…")
+            self.mic_btn.setToolTip("Processing recording…")
+            self.attached_label.setText("Processing…")
+
+    def _on_recording_finished(self, path):
+        """Handle recording complete: send as voice message or show error."""
+        self.mic_btn.setText("🎤")
+        self.mic_btn.setToolTip("Record voice or attach audio file")
+        self.attached_label.hide()
+        self.attached_label.setText("")
+        self._record_worker = None
+        self._record_stop_event = None
+        if path and Path(path).exists():
+            self.pending_audio = str(path)
+            self._update_attached_label()
+            self.send_message()
+        elif path is None:
+            QMessageBox.warning(
+                self,
+                "Recording",
+                "Microphone recording is not available. Install sounddevice and scipy:\n"
+                "pip install sounddevice scipy\n\n"
+                "Or use 'Attach audio file' to select a pre-recorded file.",
+            )
+
     def _attach_audio(self):
         """Open file dialog for audio/voice message."""
         path, _ = QFileDialog.getOpenFileName(
@@ -545,11 +686,11 @@ class ChatWidget(QWidget):
         if text:
             display_text = text
         elif audio_path:
-            display_text = "(audio message)"
+            display_text = "Transcribing…"
         else:
             display_text = "(image)"
 
-        self.add_message(display_text, is_user=True)
+        user_bubble = self.add_message(display_text, is_user=True)
 
         self._streaming_bubble = None
         self._user_near_bottom = True
@@ -560,6 +701,12 @@ class ChatWidget(QWidget):
         self.worker.chunk_ready.connect(self._on_stream_chunk)
         self.worker.message_ready.connect(self.on_message_ready)
         self.worker.error_occurred.connect(self.on_error)
+        if audio_path and user_bubble:
+            prefix = text if text else ""
+            def _on_transcript(transcript: str):
+                user_bubble.label.setText(f"{prefix}\n\n{transcript}".strip() if prefix else transcript)
+                QTimer.singleShot(0, self._scroll_to_bottom_if_near)
+            self.worker.transcript_ready.connect(_on_transcript)
         self.worker.start()
 
     def _scroll_to_bottom_if_near(self):
@@ -579,7 +726,8 @@ class ChatWidget(QWidget):
         """Handle speak button - run TTS in background."""
         if not text or not text.strip():
             return
-        worker = TTSWorker(text)
+        settings = getattr(self, "_settings", None)
+        worker = TTSWorker(text, settings=settings)
         worker.start()
 
     def _on_stream_chunk(self, chunk: str):
@@ -682,6 +830,7 @@ class ChatWidget(QWidget):
         # Scroll to bottom (smart scroll: only when user is near bottom)
         if getattr(self, "_user_near_bottom", True):
             QTimer.singleShot(50, self._scroll_to_bottom_if_near)
+        return bubble
     
     def update_workspace_name(self, name: str, icon: str = "🤖"):
         """Update chat header to show workspace name."""
@@ -867,6 +1016,7 @@ class SidebarWidget(QWidget):
         self.memory_btn = self.create_nav_button("🧠", "Memory")
         self.scheduler_btn = self.create_nav_button("⏰", "Scheduler")
         self.browser_btn = self.create_nav_button("🌐", "Browser")
+        self.sessions_btn = self.create_nav_button("👥", "Sessions")
         self.settings_btn = self.create_nav_button("⚙️", "Settings")
         
         layout.addWidget(self.chat_btn)
@@ -878,6 +1028,8 @@ class SidebarWidget(QWidget):
         layout.addWidget(self.scheduler_btn)
         layout.addSpacing(4)
         layout.addWidget(self.browser_btn)
+        layout.addSpacing(4)
+        layout.addWidget(self.sessions_btn)
         layout.addSpacing(4)
         layout.addWidget(self.settings_btn)
 
@@ -1056,6 +1208,7 @@ class GrizzyClawApp(QMainWindow):
         self.sidebar.memory_btn.clicked.connect(self.show_memory)
         self.sidebar.scheduler_btn.clicked.connect(self.show_scheduler)
         self.sidebar.browser_btn.clicked.connect(self.show_browser)
+        self.sidebar.sessions_btn.clicked.connect(self.show_sessions)
         self.sidebar.settings_btn.clicked.connect(self.show_settings)
         layout.addWidget(self.sidebar)
         
@@ -1067,7 +1220,7 @@ class GrizzyClawApp(QMainWindow):
         self.content_layout.setSpacing(0)
 
         self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
-        self.chat_widget = ChatWidget(self.agent)
+        self.chat_widget = ChatWidget(self.agent, settings=self.settings)
         self.canvas_widget = CanvasWidget()
         self.main_splitter.addWidget(self.chat_widget)
         self.main_splitter.addWidget(self.canvas_widget)
@@ -1263,7 +1416,11 @@ class GrizzyClawApp(QMainWindow):
     def show_browser(self):
         dialog = BrowserDialog(self.agent, self)
         dialog.exec()
-    
+
+    def show_sessions(self):
+        dialog = SessionsDialog(self)
+        dialog.exec()
+
     def show_workspaces(self):
         dialog = WorkspaceDialog(self.workspace_manager, self)
         dialog.workspace_changed.connect(self.on_workspace_changed)

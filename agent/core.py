@@ -8,7 +8,7 @@ from grizzyclaw.memory.sqlite_store import SQLiteMemoryStore
 from grizzyclaw.automation import CronScheduler, PLAYWRIGHT_AVAILABLE
 from grizzyclaw.mcp_client import call_mcp_tool, discover_tools
 from grizzyclaw.utils.vision import build_vision_content
-from grizzyclaw.media.transcribe import transcribe_audio
+from grizzyclaw.media.transcribe import transcribe_audio, TranscriptionError
 from grizzyclaw.safety.content_filter import ContentFilter
 from pathlib import Path
 import ast
@@ -346,7 +346,30 @@ class AgentCore:
             if transcript:
                 message = f"{message}\n\n[Audio transcript]: {transcript}".strip() if message else f"[Audio transcript]: {transcript}"
             elif not message:
-                message = "(Could not transcribe audio)"
+                # Save recording to Desktop for debugging when transcription fails
+                debug_path = None
+                if audio_path:
+                    try:
+                        src = Path(audio_path).expanduser()
+                        if src.exists() and src.is_file():
+                            desktop = Path.home() / "Desktop"
+                            desktop.mkdir(exist_ok=True)
+                            debug_path = desktop / "grizzyclaw_last_voice.wav"
+                            import shutil
+                            shutil.copy2(src, debug_path)
+                    except Exception as e:
+                        logger.debug(f"Could not save debug recording: {e}")
+
+                if provider == "openai":
+                    hint = "Add an OpenAI API key in Settings → Integrations."
+                else:
+                    hint = (
+                        "Transcription returned no text. Speak clearly for 2–3+ seconds. "
+                        "If input level is good, try: Settings → Sound → Input → select a different mic."
+                    )
+                if debug_path and debug_path.exists():
+                    hint += f" Recording saved to Desktop as grizzyclaw_last_voice.wav — play it to verify the mic captured your voice."
+                raise TranscriptionError(f"Transcription failed. {hint}")
         # Get or create session
         if user_id not in self.sessions:
             self.sessions[user_id] = []

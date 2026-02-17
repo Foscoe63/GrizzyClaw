@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 class HTTPServer:
     """HTTP server for static files and API"""
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 18789):
+    def __init__(self, host: str = "127.0.0.1", port: int = 18788):
         """Initialize HTTP server
 
         Args:

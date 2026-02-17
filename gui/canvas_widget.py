@@ -1,7 +1,7 @@
-"""Live Visual Canvas - displays images, diagrams, and visual content"""
+"""Live Visual Canvas - displays images, diagrams, and A2UI agent-generated content"""
 
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from PyQt6.QtWidgets import (
     QWidget,
@@ -95,6 +95,19 @@ class CanvasWidget(QWidget):
         label.setPixmap(pixmap.scaled(600, 400, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.content_layout.insertWidget(0, label)
+
+    def display_a2ui(self, payload: str | Dict[str, Any]) -> bool:
+        """Render A2UI (Agent-to-User Interface) JSON payload on the canvas."""
+        from .a2ui_renderer import render_a2ui
+
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(16, 16, 16, 16)
+        if render_a2ui(payload, container, layout):
+            self.placeholder.hide()
+            self.content_layout.insertWidget(0, container)
+            return True
+        return False
 
     def clear(self) -> None:
         """Clear the canvas."""

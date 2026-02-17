@@ -36,8 +36,9 @@ class LLMRouter:
             self.default_provider = name
 
     def configure_from_settings(self, settings):
-        if settings.ollama_url:
-            provider = OllamaProvider(settings.ollama_url)
+        ollama_url = (settings.ollama_url or "").strip() or "http://localhost:11434"
+        if ollama_url:
+            provider = OllamaProvider(ollama_url)
             self.add_provider(
                 "ollama", provider, settings.default_llm_provider == "ollama"
             )
@@ -71,9 +72,8 @@ class LLMRouter:
             )
             self.provider_models["openrouter"] = settings.openrouter_model
 
-        # Workspace override: use default_model for the default provider when set
-        if self.default_provider and getattr(settings, "default_model", None):
-            self.provider_models[self.default_provider] = settings.default_model
+        # Workspace override: workspace manager sets provider-specific model (ollama_model, etc.)
+        # so we don't need default_model override. Provider-specific model always wins.
 
         # If no provider was marked default (e.g. default_llm_provider not in list), use first available
         if self.default_provider is None and self.providers:
@@ -142,11 +142,13 @@ class LLMRouter:
                 await asyncio.sleep(wait)
                 backoff = min(backoff * 2, DEFAULT_MAX_BACKOFF)
 
-        # Try fallback providers before giving up
+        # Try fallback providers before giving up (skip for model-not-found - user should fix config)
         first_error = str(last_error or "Unknown error").strip()
-        logger.warning(f"Provider {provider_name} failed after {max_retries + 1} attempts: {first_error}, trying fallback")
+        is_model_not_found = "404" in first_error or "not found" in first_error.lower()
+        if not is_model_not_found:
+            logger.warning(f"Provider {provider_name} failed after {max_retries + 1} attempts: {first_error}, trying fallback")
         for name, fallback in self.providers.items():
-            if name != provider_name:
+            if name != provider_name and not is_model_not_found:
                 try:
                     if await fallback.health_check():
                         logger.info(f"Falling back to {name}")
@@ -160,15 +162,18 @@ class LLMRouter:
         raise LLMError(
             "No LLM providers available. "
             + f"{provider_name} failed: {first_error}. "
-            + "If you changed the LM Studio URL in Settings, click Save for chat to use it."
+            + "If you changed the Ollama/LM Studio URL or model in Settings, click Save and restart the app (or toggle Telegram off/on) for changes to take effect."
         )
 
     async def health_check(self) -> Dict[str, bool]:
         results = {}
         for name, provider in self.providers.items():
             try:
-                results[name] = await provider.health_check()
-            except:
+                # Short timeout so slow/unreachable providers (e.g. Anthropic) don't block
+                results[name] = await asyncio.wait_for(
+                    provider.health_check(), timeout=5.0
+                )
+            except (asyncio.TimeoutError, Exception):
                 results[name] = False
         return results
 

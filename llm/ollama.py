@@ -75,7 +75,17 @@ class OllamaProvider(LLMProvider):
             async with aiohttp.ClientSession() as session:
                 async with session.post(url, json=payload) as response:
                     if response.status != 200:
-                        raise LLMError(f"Ollama error: {response.status}")
+                        body = ""
+                        try:
+                            body = (await response.text()).strip()
+                        except Exception:
+                            pass
+                        if response.status == 404:
+                            raise LLMError(
+                                f"Ollama model '{model}' not found. "
+                                f"Run 'ollama pull {model}' to download it."
+                            )
+                        raise LLMError(f"Ollama error: {response.status}" + (f" - {body[:200]}" if body else ""))
 
                     async for line in response.content:
                         if line:

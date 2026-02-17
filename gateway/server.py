@@ -99,8 +99,8 @@ class GatewayServer:
         self.stats["uptime_start"] = time.time()
 
         logger.info(f"✓ Gateway server started on ws://{self.host}:{self.port}")
-        logger.info("  WebChat UI: http://127.0.0.1:18789/chat")
-        logger.info("  Control UI: http://127.0.0.1:18789/control")
+        logger.info("  WebChat UI: http://127.0.0.1:18788/chat")
+        logger.info("  Control UI: http://127.0.0.1:18788/control")
 
     async def stop(self):
         """Stop the gateway server"""
