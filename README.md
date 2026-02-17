@@ -1,6 +1,6 @@
 # GrizzyClaw
 
-A secure, multi-platform AI agent combining OpenClaw's multi-channel messaging with memuBot's proactive memory system. Supports local LLMs (LM Studio, Ollama) with built-in web chatbot, Telegram integration, browser automation, scheduled tasks, daemon mode, and multi-agent workspaces.
+A secure, multi-platform AI agent combining OpenClaw's multi-channel messaging with memuBot's proactive memory system. Supports local LLMs (LM Studio, Ollama) with built-in web chatbot, Telegram integration, voice chat, live visual canvas, skills/MCP, hooks and triggers, browser automation, scheduled tasks, daemon mode, and multi-agent workspaces.
 
 ## Features
 
@@ -9,8 +9,13 @@ A secure, multi-platform AI agent combining OpenClaw's multi-channel messaging w
 🔒 **Security-First**: Encryption, JWT auth, rate limiting
 ⚡ **Local LLMs**: Native support for Ollama and LM Studio
 🌐 **Cloud LLMs**: Also supports OpenAI, Anthropic, OpenRouter
+🎤 **Voice Chat**: Record and transcribe voice messages; speak responses aloud (TTS)
+🖼️ **Live Canvas**: Visual panel for images, screenshots, attachments, and agent-generated content
+⚙️ **Skills & MCP**: Extensible capabilities (web search, filesystem, docs, browser) via ClawHub registry and Model Context Protocol
+🔗 **Hooks & Triggers**: Incoming webhooks and message-based automation (e.g. when message contains "urgent" → fire webhook)
 🌍 **Browser Automation**: Control web browsers via Playwright (navigate, screenshot, extract content, fill forms)
 ⏰ **Scheduled Tasks**: Cron-based task scheduler for automated reminders and actions
+🔔 **Advanced Automation**: Gmail Pub/Sub integration and event-driven triggers
 🔄 **Daemon Mode**: Run as 24/7 background service (launchd/systemd)
 🗂️ **Multi-Agent Workspaces**: Isolated agent configurations with different LLMs, prompts, and memory
 📱 **Responsive UI**: Clean, modern macOS desktop interface
@@ -33,20 +38,66 @@ cp .env.example .env
 ### 3. Run GrizzyClaw
 
 ```bash
-# Run both web and Telegram (if configured)
-python -m grizzyclaw run --dev
+# Launch desktop GUI (default)
+python -m grizzyclaw gui
+# or simply:
+python -m grizzyclaw
 
-# Web only
-python -m grizzyclaw run --web-only
-
-# Telegram only
-python -m grizzyclaw run --telegram-only
+# Run daemon (web + Telegram 24/7 in background)
+python -m grizzyclaw daemon run
 ```
 
 ### 4. Access the Interface
 
-- **Web UI**: http://localhost:8000
-- **Telegram**: Message your bot (if configured)
+- **Desktop GUI**: Launches the PyQt6 app with chat, voice input, live canvas, and workspaces
+- **Web UI** (when daemon runs): http://localhost:18788/chat
+- **Telegram**: Message your bot (when daemon runs with `TELEGRAM_BOT_TOKEN`)
+
+## Voice Input & Media
+
+GrizzyClaw supports voice messages in the desktop GUI. Record your message, and it will be transcribed before being sent to the LLM.
+
+### Transcription Providers
+- **OpenAI**: Uses Whisper API (requires `OPENAI_API_KEY` in Settings → Integrations)
+- **Local**: Uses Whisper on device (`pip install openai-whisper`, requires `ffmpeg`)
+
+### Microphone Selection
+If voice works from the terminal but not from the bundled app, select your microphone explicitly in **Settings → Integrations → Media & Transcription → Microphone**.
+
+### Text-to-Speech
+Click the 🔊 button on assistant messages to hear the response. Configure TTS provider (ElevenLabs, pyttsx3, or system `say`) in Settings → Integrations.
+
+## Live Canvas
+
+The desktop GUI includes a **Visual Canvas** panel alongside the chat. It displays:
+- Images from browser screenshots and attachments
+- Agent-generated visual content (A2UI)
+- Diagrams and other visual outputs
+
+Images you attach or capture during a session appear on the canvas for quick reference.
+
+## Skills & MCP
+
+GrizzyClaw supports extensible AI capabilities via **Skills** and **MCP (Model Context Protocol)** servers.
+
+### Built-in Skills (ClawHub Registry)
+Enable skills in **Settings → ClawHub & MCP**:
+- **web_search**: Search the web via DuckDuckGo
+- **filesystem**: Read, write, and manage files
+- **documentation**: Query library docs via Context7
+- **browser**: Navigate, screenshot, and interact with pages
+- **memory**: Remember and recall across conversations
+- **scheduler**: Schedule tasks and reminders
+
+### MCP Servers
+Add MCP servers for additional tools (e.g. database access, custom APIs). Configure in Settings → ClawHub & MCP.
+
+## Hooks & Triggers
+
+GrizzyClaw supports event-driven automation:
+
+- **Incoming Webhooks**: POST to your webhook URL to trigger actions. Configure in Settings → Integrations.
+- **Triggers**: Run actions when messages match conditions (e.g. "when message contains 'urgent' → fire webhook"). Manage via **Settings → Integrations → Manage Triggers**.
 
 ## LLM Setup
 
@@ -64,9 +115,15 @@ ollama serve
 2. Load a model
 3. Start the local server (default: http://localhost:1234)
 
+## Automation (Gmail Pub/Sub)
+
+- **Gmail Pub/Sub**: Configure OAuth credentials and Pub/Sub topic in Settings → Integrations for push notifications on new emails.
+
+For webhooks and message-based triggers, see [Hooks & Triggers](#hooks--triggers) above.
+
 ## Configuration
 
-See `.env.example` for all configuration options.
+See `.env.example` for environment variables. The GUI saves settings to `config.yaml` (project root when running from source, `~/.grizzyclaw/config.yaml` when running the bundled app).
 
 ### Required Settings
 
@@ -77,6 +134,22 @@ See `.env.example` for all configuration options.
 
 - `TELEGRAM_BOT_TOKEN`: Get from @BotFather
 - `DATABASE_URL`: Defaults to SQLite
+- `TRANSCRIPTION_PROVIDER`: `openai` or `local` for voice input
+- `INPUT_DEVICE_NAME`: Microphone name (e.g. for bundled app compatibility)
+
+## Building the macOS App
+
+To create `GrizzyClaw.app` and `GrizzyClaw.dmg`:
+
+```bash
+./build_dmg.sh
+```
+
+Output:
+- **App**: `dist/GrizzyClaw.app`
+- **DMG**: `dist/GrizzyClaw.dmg`
+
+Requires PyInstaller (`pip install pyinstaller`). The app includes microphone permission for voice input.
 
 ## Security Features
 
@@ -234,12 +307,15 @@ Each workspace memory is stored in `~/.grizzyclaw/workspace_<id>.db`
 ```
 grizzyclaw/
 ├── agent/         # Core agent logic
-├── automation/    # Browser control & scheduler
-├── channels/      # Telegram integration
+├── automation/    # Browser control, scheduler, triggers, webhooks
+├── channels/      # Telegram, WhatsApp
 ├── daemon/        # 24/7 background service (launchd/systemd)
+├── gateway/       # WebSocket gateway, HTTP server, web chat
 ├── gui/           # PyQt6 desktop interface
-├── llm/           # LLM provider integrations
+├── llm/           # LLM provider integrations (Ollama, LM Studio, OpenAI, etc.)
 ├── memory/        # Persistent memory system (SQLite)
+├── media/         # Transcription, media lifecycle
+├── utils/         # Audio recording, TTS, vision
 ├── web/           # Web interface
 └── workspaces/    # Multi-agent workspace management
 ```
