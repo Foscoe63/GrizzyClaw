@@ -43,7 +43,7 @@ class Settings(BaseSettings):
     openai_model: str = Field(default="gpt-4o", alias="OPENAI_MODEL")
 
     anthropic_api_key: Optional[str] = Field(default=None, alias="ANTHROPIC_API_KEY")
-    anthropic_model: str = Field(default="claude-3-5-sonnet-20241022", alias="ANTHROPIC_MODEL")
+    anthropic_model: str = Field(default="claude-sonnet-4-5-20250929", alias="ANTHROPIC_MODEL")
 
     openrouter_api_key: Optional[str] = Field(default=None, alias="OPENROUTER_API_KEY")
     openrouter_model: str = Field(default="openai/gpt-4o", alias="OPENROUTER_MODEL")
@@ -142,11 +142,26 @@ class Settings(BaseSettings):
         env_file_encoding = "utf-8"
         populate_by_name = True
 
+    # Deprecated Anthropic models (retired) -> replacement
+    _ANTHROPIC_DEPRECATED = {
+        "claude-3-5-sonnet-20241022": "claude-sonnet-4-5-20250929",
+        "claude-3-5-sonnet-20240620": "claude-sonnet-4-5-20250929",
+        "claude-3-5-haiku-20241022": "claude-haiku-4-5-20251001",
+        "claude-3-7-sonnet-20250219": "claude-sonnet-4-5-20250929",
+        "claude-3-opus-20240229": "claude-opus-4-6",
+        "claude-3-sonnet-20240229": "claude-sonnet-4-5-20250929",
+        "claude-3-haiku-20240307": "claude-haiku-4-5-20251001",
+    }
+
     @classmethod
     def from_file(cls, path: str) -> "Settings":
         """Load settings from YAML file"""
         with open(path, "r") as f:
             config = yaml.safe_load(f)
+        if config and "anthropic_model" in config:
+            old = config["anthropic_model"]
+            if old in cls._ANTHROPIC_DEPRECATED:
+                config["anthropic_model"] = cls._ANTHROPIC_DEPRECATED[old]
         return cls(**config)
 
     def to_file(self, path: str):

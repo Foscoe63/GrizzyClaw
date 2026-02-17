@@ -318,11 +318,13 @@ class LLMTab(SettingsTab):
         self.anthropic_model = QComboBox()
         self.anthropic_model.setEditable(True)
         self.anthropic_model.addItems([
-            "claude-3-5-sonnet-20241022", "claude-3-5-haiku-20241022",
-            "claude-3-opus-20240229", "claude-3-sonnet-20240229",
-            "claude-3-haiku-20240307"
+            "claude-sonnet-4-5-20250929", "claude-opus-4-6",
+            "claude-sonnet-4-20250514", "claude-haiku-4-5-20251001",
+            "claude-opus-4-5-20251101", "claude-opus-4-20250514",
         ])
-        self.anthropic_model.setCurrentText(getattr(self.settings, 'anthropic_model', 'claude-3-5-sonnet-20241022'))
+        self.anthropic_model.setCurrentText(
+            getattr(self.settings, 'anthropic_model', 'claude-sonnet-4-5-20250929')
+        )
         self.anthropic_model.setFixedHeight(32)
         anthropic_form.addRow("Model:", self.anthropic_model)
 
