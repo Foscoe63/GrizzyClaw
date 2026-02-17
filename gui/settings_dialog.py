@@ -859,9 +859,13 @@ class SkillsTab(SettingsTab):
         scroll_layout.addWidget(hf_card)
         
         # ===== Skills Section =====
-        skills_card = self._create_card("⚡ Skills", "Enable specific AI capabilities")
+        skills_card = self._create_card("⚡ Skills Ecosystem", "Enable AI capabilities from the built-in registry")
         skills_layout = skills_card.layout()
-        
+
+        skills_hint = QLabel("Skills: web_search, filesystem, documentation, browser, memory, scheduler")
+        skills_hint.setStyleSheet(f"color: {self.secondary_text}; font-size: 12px;")
+        skills_layout.addWidget(skills_hint)
+
         self.skills_list = QListWidget()
         self.skills_list.setFixedHeight(100)
         self.skills_list.setStyleSheet(self._list_style())
@@ -1140,9 +1144,23 @@ Names: {names_str}"""
         QMessageBox.information(self, "Test MCP", msg)
     
     def add_skill(self):
-        skill, ok = QInputDialog.getText(self, "Add Skill", "Enter skill name:")
-        if ok and skill.strip():
-            self.skills_list.addItem(skill.strip())
+        try:
+            from grizzyclaw.skills.registry import get_available_skills
+            skills = get_available_skills()
+            items = [f"{s.icon} {s.name} ({s.id})" for s in skills]
+            skill_id, ok = QInputDialog.getItem(
+                self, "Add Skill", "Select a skill from the ecosystem:",
+                items, 0, False
+            )
+            if ok and skill_id:
+                # Extract id from "icon name (id)"
+                sid = skill_id.split("(")[-1].rstrip(")")
+                if sid and sid not in [self.skills_list.item(i).text() for i in range(self.skills_list.count())]:
+                    self.skills_list.addItem(sid)
+        except ImportError:
+            skill, ok = QInputDialog.getText(self, "Add Skill", "Enter skill name:")
+            if ok and skill.strip():
+                self.skills_list.addItem(skill.strip())
 
     def remove_skill(self):
         row = self.skills_list.currentRow()
@@ -1999,10 +2017,35 @@ class IntegrationsTab(SettingsTab):
         gmail_form.addRow("", encrypt_btn)
 
         container_layout.addWidget(gmail_group)
+
+        # Automation Triggers
+        triggers_group = QGroupBox("Automation Triggers")
+        triggers_group.setStyleSheet(self.get_group_style())
+        triggers_layout = QVBoxLayout(triggers_group)
+        triggers_hint = QLabel(
+            "Event-based automation: run actions when messages match conditions "
+            "(e.g. message contains 'urgent' → call webhook)"
+        )
+        triggers_hint.setWordWrap(True)
+        triggers_hint.setStyleSheet("font-size: 12px; color: #8E8E93;")
+        triggers_layout.addWidget(triggers_hint)
+        self.triggers_btn = QPushButton("Manage Triggers...")
+        self.triggers_btn.setFixedHeight(36)
+        self.triggers_btn.clicked.connect(self._open_triggers_dialog)
+        triggers_layout.addWidget(self.triggers_btn)
+        container_layout.addWidget(triggers_group)
+
         container_layout.addStretch()
 
         scroll.setWidget(container)
         layout.addWidget(scroll)
+
+    def _open_triggers_dialog(self):
+        """Open the automation triggers management dialog."""
+        from grizzyclaw.gui.triggers_dialog import TriggersDialog
+
+        dlg = TriggersDialog(parent=self)
+        dlg.exec()
 
     def _browse_gmail_credentials(self):
         path, _ = QFileDialog.getOpenFileName(

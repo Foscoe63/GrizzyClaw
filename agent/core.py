@@ -311,6 +311,20 @@ class AgentCore:
         audio_path: Optional[str] = None,
         audio_base64: Optional[str] = None,
     ) -> AsyncIterator[str]:
+        # Evaluate automation triggers (fire webhooks, etc.)
+        try:
+            from grizzyclaw.automation.triggers import (
+                execute_trigger_actions,
+                get_matching_triggers,
+            )
+
+            ctx = {"message": message, "session_id": user_id, "user_id": user_id}
+            matching = get_matching_triggers("message", ctx)
+            if matching:
+                await execute_trigger_actions(matching, ctx)
+        except Exception:
+            pass  # Don't block chat on trigger errors
+
         # Transcribe audio if provided
         if audio_path or audio_base64:
             loop = asyncio.get_event_loop()

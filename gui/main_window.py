@@ -23,6 +23,7 @@ from .memory_dialog import MemoryDialog
 from .scheduler_dialog import SchedulerDialog
 from .browser_dialog import BrowserDialog
 from .workspace_dialog import WorkspaceDialog
+from .canvas_widget import CanvasWidget
 from grizzyclaw.workspaces import WorkspaceManager
 
 
@@ -39,6 +40,23 @@ class TelegramStartWorker(QThread):
             asyncio.run(self.bot.start())
         except Exception as e:
             self.failed.emit(str(e))
+
+
+class TTSWorker(QThread):
+    """Speak text using TTS in background."""
+    finished = pyqtSignal(bool)
+
+    def __init__(self, text: str, parent=None):
+        super().__init__(parent)
+        self.text = text
+
+    def run(self):
+        try:
+            from grizzyclaw.utils.tts import speak_text
+            ok = speak_text(self.text)
+            self.finished.emit(ok)
+        except Exception:
+            self.finished.emit(False)
 
 
 class MessageWorker(QThread):
@@ -79,31 +97,47 @@ class MessageWorker(QThread):
 
 
 class MessageBubble(QFrame):
+    speak_requested = pyqtSignal(str)
+
     def __init__(self, text, is_user=True, parent=None, is_dark=False):
         super().__init__(parent)
         self.is_user = is_user
         self.is_dark = is_dark
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setAutoFillBackground(False)
-        
+
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 4, 0, 4)
-        layout.setSpacing(0)
-        
+        layout.setSpacing(8)
+
         self.label = QLabel(text)
         self.label.setWordWrap(True)
         self.label.setFont(QFont("-apple-system", 14))
         self.label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        
+
         self.update_style()
-        
+
         if is_user:
             layout.addStretch()
             layout.addWidget(self.label, alignment=Qt.AlignmentFlag.AlignRight)
         else:
             layout.addWidget(self.label, alignment=Qt.AlignmentFlag.AlignLeft)
+            self.speak_btn = QPushButton("🔊")
+            self.speak_btn.setToolTip("Speak response")
+            self.speak_btn.setFixedSize(28, 28)
+            self.speak_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.speak_btn.setStyleSheet("""
+                QPushButton {
+                    background: transparent;
+                    border: none;
+                    border-radius: 14px;
+                }
+                QPushButton:hover { background: rgba(0,0,0,0.1); }
+            """)
+            self.speak_btn.clicked.connect(lambda: self.speak_requested.emit(self.label.text()))
+            layout.addWidget(self.speak_btn, alignment=Qt.AlignmentFlag.AlignLeft)
             layout.addStretch()
-        
+
         self.setMaximumWidth(750)
         self.label.setMaximumWidth(600)
     
@@ -148,7 +182,8 @@ class MessageBubble(QFrame):
 
 class ChatWidget(QWidget):
     message_received = pyqtSignal(str, bool)
-    
+    image_attached = pyqtSignal(str)  # path to display in canvas
+
     def __init__(self, agent, parent=None):
         super().__init__(parent)
         self.agent = agent
@@ -329,6 +364,8 @@ class ChatWidget(QWidget):
                 color: #8E8E93;
                 border: none;
                 border-radius: 22px;
+                text-align: center;
+                padding: 10px;
             }
             QPushButton:hover {
                 background-color: #E5E5EA;
@@ -336,6 +373,27 @@ class ChatWidget(QWidget):
             }
         """)
         self.attach_btn.clicked.connect(self._attach_file)
+
+        self.mic_btn = QPushButton("🎤")
+        self.mic_btn.setToolTip("Attach voice/audio message")
+        self.mic_btn.setFont(QFont("-apple-system", 14))
+        self.mic_btn.setFixedSize(44, 44)
+        self.mic_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.mic_btn.setStyleSheet("""
+            QPushButton {
+                background-color: transparent;
+                color: #8E8E93;
+                border: none;
+                border-radius: 22px;
+                text-align: center;
+                padding: 10px;
+            }
+            QPushButton:hover {
+                background-color: #E5E5EA;
+                color: #1C1C1E;
+            }
+        """)
+        self.mic_btn.clicked.connect(self._attach_audio)
 
         self.send_btn = QPushButton("Send")
         self.send_btn.setFont(QFont("-apple-system", 14, QFont.Weight.Medium))
@@ -363,6 +421,7 @@ class ChatWidget(QWidget):
         self.send_btn.clicked.connect(self.send_message)
         
         input_layout.addWidget(self.attach_btn)
+        input_layout.addWidget(self.mic_btn)
         input_layout.addWidget(self.input_field, 1)
         input_layout.addWidget(self.send_btn)
 
@@ -373,6 +432,18 @@ class ChatWidget(QWidget):
 
         layout.addWidget(input_container)
     
+    def _attach_audio(self):
+        """Open file dialog for audio/voice message."""
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Audio File",
+            "",
+            "Audio (*.mp3 *.wav *.m4a *.ogg *.oga *.webm);;All files (*)",
+        )
+        if path:
+            self.pending_audio = path
+            self._update_attached_label()
+
     def _attach_file(self):
         paths, _ = QFileDialog.getOpenFileNames(
             self,
@@ -395,6 +466,7 @@ class ChatWidget(QWidget):
                 self.pending_audio = p
             elif any(low.endswith(ext) for ext in _IMAGE_EXT) and p not in self.pending_images:
                 self.pending_images.append(p)
+                self.image_attached.emit(p)
         self._update_attached_label()
 
     def _input_drag_enter(self, event: QDragEnterEvent):
@@ -413,6 +485,7 @@ class ChatWidget(QWidget):
                 self.pending_audio = p
             elif any(low.endswith(ext) for ext in _IMAGE_EXT) and p not in self.pending_images:
                 self.pending_images.append(p)
+                self.image_attached.emit(p)
         self._update_attached_label()
 
     def _update_attached_label(self):
@@ -450,6 +523,7 @@ class ChatWidget(QWidget):
         self.send_btn.setEnabled(not loading)
         self.input_field.setEnabled(not loading)
         self.attach_btn.setEnabled(not loading)
+        self.mic_btn.setEnabled(not loading)
         if loading:
             self.send_btn.setText("...")
         else:
@@ -501,10 +575,18 @@ class ChatWidget(QWidget):
         threshold = 80
         self._user_near_bottom = sb.value() >= sb.maximum() - threshold
 
+    def _on_speak_requested(self, text: str):
+        """Handle speak button - run TTS in background."""
+        if not text or not text.strip():
+            return
+        worker = TTSWorker(text)
+        worker.start()
+
     def _on_stream_chunk(self, chunk: str):
         """Append a streamed chunk to the assistant bubble."""
         if self._streaming_bubble is None:
             self._streaming_bubble = MessageBubble("", is_user=False, is_dark=self.is_dark)
+            self._streaming_bubble.speak_requested.connect(self._on_speak_requested)
             self.chat_layout.insertWidget(self.chat_layout.count() - 1, self._streaming_bubble)
         current = self._streaming_bubble.label.text()
         self._streaming_bubble.label.setText(current + chunk)
@@ -593,6 +675,8 @@ class ChatWidget(QWidget):
     def add_message(self, text, is_user=True):
         self.empty_state.hide()
         bubble = MessageBubble(text, is_user, is_dark=self.is_dark)
+        if not is_user:
+            bubble.speak_requested.connect(self._on_speak_requested)
         self.chat_layout.insertWidget(self.chat_layout.count() - 1, bubble)
 
         # Scroll to bottom (smart scroll: only when user is near bottom)
@@ -975,17 +1059,24 @@ class GrizzyClawApp(QMainWindow):
         self.sidebar.settings_btn.clicked.connect(self.show_settings)
         layout.addWidget(self.sidebar)
         
-        # Main content
+        # Main content: chat + visual canvas splitter
         self.content_stack = QWidget()
         self.content_stack.setStyleSheet("background-color: #FFFFFF;")
         self.content_layout = QVBoxLayout(self.content_stack)
         self.content_layout.setContentsMargins(0, 0, 0, 0)
         self.content_layout.setSpacing(0)
-        
-        # Chat widget
+
+        self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.chat_widget = ChatWidget(self.agent)
-        self.content_layout.addWidget(self.chat_widget)
-        
+        self.canvas_widget = CanvasWidget()
+        self.main_splitter.addWidget(self.chat_widget)
+        self.main_splitter.addWidget(self.canvas_widget)
+        self.main_splitter.setSizes([700, 300])  # Chat gets more space by default
+        self.main_splitter.setStretchFactor(0, 1)
+        self.main_splitter.setStretchFactor(1, 0)
+        self.chat_widget.image_attached.connect(self.canvas_widget.display_image)
+        self.content_layout.addWidget(self.main_splitter)
+
         layout.addWidget(self.content_stack, 1)
         
         # Status bar with better styling
