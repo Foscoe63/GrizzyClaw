@@ -2616,14 +2616,20 @@ class SettingsDialog(QDialog):
                 border: none;
             }
             QTabBar::tab {
-                padding: 10px 20px;
+                padding: 12px 14px;
+                min-width: 56px;
                 border: none;
                 background: transparent;
                 color: #3C3C43;
+                font-size: 15px;
+                font-weight: bold;
             }
             QTabBar::tab:selected {
                 color: #007AFF;
-                border-bottom: 2px solid #007AFF;
+                border-right: 3px solid #007AFF;
+            }
+            QTabBar::tab:hover:!selected {
+                background: rgba(0,122,255,0.06);
             }
         """)
         
@@ -2831,14 +2837,20 @@ class SettingsDialog(QDialog):
                     background: #1E1E1E;
                 }
                 QTabBar::tab {
-                    padding: 10px 20px;
+                    padding: 12px 14px;
+                    min-width: 56px;
                     border: none;
                     background: transparent;
                     color: #8E8E93;
+                    font-size: 15px;
+                    font-weight: bold;
                 }
                 QTabBar::tab:selected {
                     color: #0A84FF;
-                    border-bottom: 2px solid #0A84FF;
+                    border-right: 3px solid #0A84FF;
+                }
+                QTabBar::tab:hover:!selected {
+                    background: rgba(10,132,255,0.08);
                 }
                 QCheckBox {
                     color: #FFFFFF;
@@ -2923,14 +2935,20 @@ class SettingsDialog(QDialog):
                     border: none;
                 }
                 QTabBar::tab {
-                    padding: 10px 20px;
+                    padding: 12px 14px;
+                    min-width: 56px;
                     border: none;
                     background: transparent;
                     color: #3C3C43;
+                    font-size: 15px;
+                    font-weight: bold;
                 }
                 QTabBar::tab:selected {
                     color: #007AFF;
-                    border-bottom: 2px solid #007AFF;
+                    border-right: 3px solid #007AFF;
+                }
+                QTabBar::tab:hover:!selected {
+                    background: rgba(0,122,255,0.06);
                 }
             """)
         

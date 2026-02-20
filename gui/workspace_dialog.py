@@ -4,7 +4,8 @@ from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QListWidget,
     QListWidgetItem, QPushButton, QMessageBox, QLineEdit,
     QTextEdit, QComboBox, QGroupBox, QFormLayout, QSpinBox,
-    QDoubleSpinBox, QCheckBox, QTabWidget, QWidget, QFrame
+    QDoubleSpinBox, QCheckBox, QTabWidget, QWidget, QFrame,
+    QApplication
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QThread
 from PyQt6.QtGui import QFont, QColor
@@ -464,11 +465,23 @@ class WorkspaceDialog(QDialog):
         """
         self.right_panel.setStyleSheet(f"background-color: {self.bg_color}; " + input_style)
 
-    def refresh_list(self):
-        """Refresh the workspace list"""
-        self.workspace_list.clear()
+    def refresh_list(self, select_workspace_id: str = None):
+        """Refresh the workspace list
+        
+        Args:
+            select_workspace_id: Workspace ID to re-select after refresh.
+                                 Defaults to the active workspace.
+        """
+        # Remember which workspace to re-select
+        target_id = select_workspace_id or self.get_selected_workspace_id() or self.manager.active_workspace_id
         active_id = self.manager.active_workspace_id
         
+        # Block signals while rebuilding to avoid triggering on_workspace_selected
+        # multiple times during list rebuild
+        self.workspace_list.blockSignals(True)
+        self.workspace_list.clear()
+        
+        target_item = None
         for workspace in self.manager.list_workspaces():
             item_text = f"{workspace.icon} {workspace.name}"
             if workspace.id == active_id:
@@ -478,8 +491,14 @@ class WorkspaceDialog(QDialog):
             item.setData(Qt.ItemDataRole.UserRole, workspace.id)
             self.workspace_list.addItem(item)
             
-            if workspace.id == active_id:
-                item.setSelected(True)
+            if workspace.id == target_id:
+                target_item = item
+        
+        self.workspace_list.blockSignals(False)
+        
+        # Now select the target workspace (triggers on_workspace_selected once)
+        if target_item:
+            self.workspace_list.setCurrentItem(target_item)
     
     def on_workspace_selected(self, current, previous):
         """Handle workspace selection"""
@@ -501,10 +520,18 @@ class WorkspaceDialog(QDialog):
         self.color_input.setText(workspace.color)
         self.avatar_path_input.setText(workspace.avatar_path or "")
         
-        # LLM tab
+        # LLM tab — block provider_combo signals so _on_provider_changed
+        # does NOT fire during form population (it would clear model_combo
+        # and cause unnecessary side effects)
+        self.provider_combo.blockSignals(True)
         provider_idx = self.provider_combo.findText(workspace.config.llm_provider)
         if provider_idx >= 0:
             self.provider_combo.setCurrentIndex(provider_idx)
+        self.provider_combo.blockSignals(False)
+        
+        # Manually refresh model defaults for the provider (since we blocked the signal)
+        self._on_provider_changed(workspace.config.llm_provider)
+        
         # Set model in combo box
         model_text = workspace.config.llm_model
         idx = self.model_combo.findText(model_text)
@@ -581,18 +608,22 @@ class WorkspaceDialog(QDialog):
         if not workspace_id:
             return
         
-        # Update workspace
-        self.manager.update_workspace(
-            workspace_id,
-            name=self.name_input.text(),
-            description=self.desc_input.toPlainText(),
-            icon=self.icon_input.text() or "🤖",
-            color=self.color_input.text() or "#007AFF",
-            avatar_path=self.avatar_path_input.text().strip() or None,
-        )
+        # Flush any pending UI events so that checkbox / widget states
+        # are fully up-to-date before we read them.  Without this,
+        # rapidly clicking a checkbox then Save can read stale isChecked()
+        # values because the checkbox click event hasn't propagated yet.
+        QApplication.processEvents()
         
-        # Update config
-        self.manager.update_workspace_config(workspace_id, {
+        # Collect ALL values from the form FIRST, before any save calls
+        # that might trigger signals / refresh_list / on_workspace_selected
+        # and overwrite widget state.
+        name = self.name_input.text()
+        description = self.desc_input.toPlainText()
+        icon = self.icon_input.text() or "🤖"
+        color = self.color_input.text() or "#007AFF"
+        avatar_path = self.avatar_path_input.text().strip() or None
+        
+        config_updates = {
             "llm_provider": self.provider_combo.currentText(),
             "llm_model": self.model_combo.currentText(),
             "temperature": self.temp_spin.value(),
@@ -610,9 +641,22 @@ class WorkspaceDialog(QDialog):
             "proactive_habits": self.proactive_habits_cb.isChecked(),
             "proactive_screen": self.proactive_screen_cb.isChecked(),
             "proactive_file_triggers": self.proactive_file_triggers_cb.isChecked(),
-        })
+        }
         
-        self.refresh_list()
+        # Now perform the saves using the captured values
+        self.manager.update_workspace(
+            workspace_id,
+            name=name,
+            description=description,
+            icon=icon,
+            color=color,
+            avatar_path=avatar_path,
+        )
+        
+        self.manager.update_workspace_config(workspace_id, config_updates)
+        
+        # Re-select the same workspace (not just the active one)
+        self.refresh_list(select_workspace_id=workspace_id)
         self.workspace_config_saved.emit(workspace_id)
         QMessageBox.information(self, "Saved", "Workspace saved successfully.")
     
