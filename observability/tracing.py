@@ -33,7 +33,9 @@ def init_tracing(
         if export_console:
             provider.add_span_processor(BatchSpanProcessor(ConsoleSpanExporter()))
         trace.set_tracer_provider(provider)
-        _tracer = trace.get_tracer(service_name, "0.1.0")
+        from grizzyclaw import __version__
+
+        _tracer = trace.get_tracer(service_name, __version__)
         logger.info("OpenTelemetry tracing initialized")
         return True
     except Exception as e:

@@ -65,6 +65,34 @@ SKILL_REGISTRY: Dict[str, SkillMetadata] = {
         icon="⏰",
         source="builtin",
     ),
+    "calendar": SkillMetadata(
+        id="calendar",
+        name="Google Calendar",
+        description="List, create, update calendar events",
+        icon="📅",
+        source="builtin",
+    ),
+    "gmail": SkillMetadata(
+        id="gmail",
+        name="Gmail",
+        description="Send emails, reply to threads",
+        icon="📧",
+        source="builtin",
+    ),
+    "github": SkillMetadata(
+        id="github",
+        name="GitHub",
+        description="Manage PRs, issues, repos",
+        icon="💻",
+        source="builtin",
+    ),
+    "mcp_marketplace": SkillMetadata(
+        id="mcp_marketplace",
+        name="MCP Marketplace",
+        description="Discover and install ClawHub MCP servers",
+        icon="🛒",
+        source="builtin",
+    ),
 }
 
 

@@ -67,7 +67,8 @@ class HTTPServer:
         try:
             from grizzyclaw.observability.metrics import get_metrics
             return web.json_response(get_metrics().get_stats())
-        except Exception:
+        except Exception as e:
+            logger.warning("Metrics endpoint failed: %s", e)
             return web.json_response({})
 
     async def start(self):

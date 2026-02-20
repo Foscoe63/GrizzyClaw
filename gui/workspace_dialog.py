@@ -34,6 +34,7 @@ class WorkspaceDialog(QDialog):
         
         self.setup_ui()
         self.refresh_list()
+        self.workspace_list.model().rowsMoved.connect(self.on_rows_reordered)
     
     def setup_ui(self):
         # Theme colors
@@ -96,6 +97,7 @@ class WorkspaceDialog(QDialog):
             }}
         """)
         self.workspace_list.currentItemChanged.connect(self.on_workspace_selected)
+        self.workspace_list.setDragDropMode(QListWidget.DragDropMode.InternalMove)
         left_layout.addWidget(self.workspace_list, 1)
         
         # Buttons
@@ -205,6 +207,10 @@ class WorkspaceDialog(QDialog):
         icon_row.addStretch()
         general_layout.addRow("Icon:", icon_row)
         
+        self.avatar_path_input = QLineEdit()
+        self.avatar_path_input.setPlaceholderText("Path or URL to custom/VL-generated avatar image (optional)")
+        general_layout.addRow("Avatar:", self.avatar_path_input)
+        
         self.tabs.addTab(general_tab, "General")
         
         # LLM tab
@@ -287,6 +293,77 @@ class WorkspaceDialog(QDialog):
         api_layout.addRow("OpenRouter Key:", self.openrouter_key_input)
         
         self.tabs.addTab(api_tab, "API Keys")
+
+        # Swarm / Inter-agent tab
+        swarm_tab = QWidget()
+        swarm_layout = QFormLayout(swarm_tab)
+        swarm_layout.setContentsMargins(16, 16, 16, 16)
+        swarm_layout.setSpacing(12)
+        self.enable_inter_agent_cb = QCheckBox("Allow this workspace to receive and send messages to other agents (@mentions)")
+        self.enable_inter_agent_cb.setToolTip("Enable agent-to-agent chat: type @workspace_name or @slug to delegate (e.g. @code_assistant analyze this).")
+        swarm_layout.addRow(self.enable_inter_agent_cb)
+        self.inter_agent_channel_input = QLineEdit()
+        self.inter_agent_channel_input.setPlaceholderText("Optional: e.g. swarm1 (only same-channel workspaces can message each other)")
+        swarm_layout.addRow("Inter-agent channel:", self.inter_agent_channel_input)
+        self.use_shared_memory_cb = QCheckBox("Use shared memory with other agents in the same channel")
+        self.use_shared_memory_cb.setToolTip("When enabled, this workspace shares a memory DB with other workspaces on the same channel for swarm context.")
+        swarm_layout.addRow(self.use_shared_memory_cb)
+        self.swarm_auto_delegate_cb = QCheckBox("Leader: auto-run @mentions from my response (break task → delegate to specialists)")
+        self.swarm_auto_delegate_cb.setToolTip("When this workspace is the leader, any @research / @coding / @personal lines in its reply are executed and specialist replies are collected.")
+        swarm_layout.addRow(self.swarm_auto_delegate_cb)
+        self.swarm_consensus_cb = QCheckBox("Leader: synthesize specialist replies into one consensus answer")
+        self.swarm_consensus_cb.setToolTip("After delegations, call the leader again to combine specialist responses into a single recommendation.")
+        swarm_layout.addRow(self.swarm_consensus_cb)
+        # Proactivity (memuBot-style)
+        proact_group = QGroupBox("Proactivity")
+        proact_layout = QFormLayout(proact_group)
+        self.proactive_habits_cb = QCheckBox("Habit learning: analyze memory and auto-schedule actions (e.g. prep env Mon–Fri)")
+        self.proactive_habits_cb.setToolTip("Daily job analyzes memory patterns and suggests habit-based reminders.")
+        proact_layout.addRow(self.proactive_habits_cb)
+        self.proactive_screen_cb = QCheckBox("Screen awareness: periodic screenshot + VL analysis for desktop context")
+        self.proactive_screen_cb.setToolTip("Every 30 min, capture screen and ask the model what the user is doing; store summary in memory.")
+        proact_layout.addRow(self.proactive_screen_cb)
+        self.proactive_file_triggers_cb = QCheckBox("Triggers on file changes and Git events")
+        self.proactive_file_triggers_cb.setToolTip("Watch ~/.grizzyclaw/file_watcher.json for watch_dirs; triggers.json can use event file_change or git_event.")
+        proact_layout.addRow(self.proactive_file_triggers_cb)
+        swarm_layout.addRow(proact_group)
+        swarm_hint = QLabel("Tip: In chat, use @workspace_slug or @Workspace Name to delegate (e.g. @coding analyze this code). Leader can output @research / @coding / @personal to auto-delegate.")
+        swarm_hint.setWordWrap(True)
+        swarm_hint.setStyleSheet("color: gray; font-size: 11px;")
+        swarm_layout.addRow(swarm_hint)
+        self.tabs.addTab(swarm_tab, "Swarm")
+
+        # Metrics tab
+        metrics_tab = QWidget()
+        metrics_layout = QVBoxLayout(metrics_tab)
+        metrics_layout.setContentsMargins(16, 16, 16, 16)
+        
+        metrics_group = QGroupBox("📊 Performance Metrics")
+        metrics_form = QFormLayout(metrics_group)
+        metrics_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        
+        self.avg_time_lbl = QLabel("0.0 ms")
+        metrics_form.addRow("Avg Response Time:", self.avg_time_lbl)
+        
+        self.total_tokens_lbl = QLabel("0")
+        metrics_form.addRow("Total Tokens:", self.total_tokens_lbl)
+        
+        self.quality_lbl = QLabel("0.0%")
+        metrics_form.addRow("Quality Score:", self.quality_lbl)
+        
+        self.messages_lbl = QLabel("0")
+        metrics_form.addRow("Messages:", self.messages_lbl)
+        
+        self.session_lbl = QLabel("0")
+        metrics_form.addRow("Sessions:", self.session_lbl)
+        
+        metrics_layout.addWidget(metrics_group)
+        
+        benchmark_btn = QPushButton("🚀 Run Benchmark (5 prompts)")
+        benchmark_btn.clicked.connect(self.run_benchmark)
+        metrics_layout.addWidget(benchmark_btn)
+        
+        self.tabs.addTab(metrics_tab, "Metrics")
         
         right_layout.addWidget(self.tabs, 1)
         
@@ -422,6 +499,7 @@ class WorkspaceDialog(QDialog):
         self.desc_input.setText(workspace.description)
         self.icon_input.setText(workspace.icon)
         self.color_input.setText(workspace.color)
+        self.avatar_path_input.setText(workspace.avatar_path or "")
         
         # LLM tab
         provider_idx = self.provider_combo.findText(workspace.config.llm_provider)
@@ -445,6 +523,23 @@ class WorkspaceDialog(QDialog):
         self.openai_key_input.setText(workspace.config.openai_api_key or "")
         self.anthropic_key_input.setText(workspace.config.anthropic_api_key or "")
         self.openrouter_key_input.setText(workspace.config.openrouter_api_key or "")
+        
+        # Swarm tab
+        self.enable_inter_agent_cb.setChecked(getattr(workspace.config, "enable_inter_agent", False))
+        self.inter_agent_channel_input.setText((workspace.config.inter_agent_channel or "").strip())
+        self.use_shared_memory_cb.setChecked(getattr(workspace.config, "use_shared_memory", False))
+        self.swarm_auto_delegate_cb.setChecked(getattr(workspace.config, "swarm_auto_delegate", False))
+        self.swarm_consensus_cb.setChecked(getattr(workspace.config, "swarm_consensus", False))
+        self.proactive_habits_cb.setChecked(getattr(workspace.config, "proactive_habits", False))
+        self.proactive_screen_cb.setChecked(getattr(workspace.config, "proactive_screen", False))
+        self.proactive_file_triggers_cb.setChecked(getattr(workspace.config, "proactive_file_triggers", False))
+        
+        # Metrics tab
+        self.avg_time_lbl.setText(f"{workspace.avg_response_time_ms:.1f} ms")
+        self.total_tokens_lbl.setText(f"{workspace.total_tokens:,}")
+        self.quality_lbl.setText(f"{workspace.quality_score:.1f}%")
+        self.messages_lbl.setText(str(workspace.message_count))
+        self.session_lbl.setText(str(workspace.session_count))
         
         # Update button state
         is_active = workspace.id == self.manager.active_workspace_id
@@ -492,7 +587,8 @@ class WorkspaceDialog(QDialog):
             name=self.name_input.text(),
             description=self.desc_input.toPlainText(),
             icon=self.icon_input.text() or "🤖",
-            color=self.color_input.text() or "#007AFF"
+            color=self.color_input.text() or "#007AFF",
+            avatar_path=self.avatar_path_input.text().strip() or None,
         )
         
         # Update config
@@ -506,6 +602,14 @@ class WorkspaceDialog(QDialog):
             "openai_api_key": self.openai_key_input.text() or None,
             "anthropic_api_key": self.anthropic_key_input.text() or None,
             "openrouter_api_key": self.openrouter_key_input.text() or None,
+            "enable_inter_agent": self.enable_inter_agent_cb.isChecked(),
+            "inter_agent_channel": self.inter_agent_channel_input.text().strip() or None,
+            "use_shared_memory": self.use_shared_memory_cb.isChecked(),
+            "swarm_auto_delegate": self.swarm_auto_delegate_cb.isChecked(),
+            "swarm_consensus": self.swarm_consensus_cb.isChecked(),
+            "proactive_habits": self.proactive_habits_cb.isChecked(),
+            "proactive_screen": self.proactive_screen_cb.isChecked(),
+            "proactive_file_triggers": self.proactive_file_triggers_cb.isChecked(),
         })
         
         self.refresh_list()
@@ -539,6 +643,11 @@ class WorkspaceDialog(QDialog):
         if reply == QMessageBox.StandardButton.Yes:
             if self.manager.delete_workspace(workspace_id):
                 self.refresh_list()
+    
+    def run_benchmark(self):
+        """Run benchmark test"""
+        QMessageBox.information(self, "Benchmark", "Benchmark runs 5 standard prompts to measure speed.\nMetrics update live with real chats too!")
+        # TODO: Implement full benchmark thread\n        pass
     
     def duplicate_workspace(self):
         """Duplicate the selected workspace"""
@@ -598,7 +707,8 @@ class WorkspaceDialog(QDialog):
             if parent and hasattr(parent, "settings"):
                 url = getattr(parent.settings, "ollama_url", url) or url
             provider = OllamaProvider(url)
-            models_data = asyncio.run(provider.list_models())
+            from grizzyclaw.utils.async_runner import run_async
+            models_data = run_async(provider.list_models())
             models = [m["id"] if isinstance(m, dict) else str(m) for m in models_data]
             current = self.model_combo.currentText()
             self.model_combo.clear()
@@ -631,7 +741,8 @@ class WorkspaceDialog(QDialog):
                         url = ws.config.lmstudio_url or url
             url = _normalize_lmstudio_url(url)
             provider = LMStudioProvider(url)
-            models_data = asyncio.run(provider.list_models())
+            from grizzyclaw.utils.async_runner import run_async
+            models_data = run_async(provider.list_models())
             models = [m["id"] if isinstance(m, dict) else str(m) for m in models_data]
             current = self.model_combo.currentText()
             self.model_combo.clear()
@@ -652,6 +763,22 @@ class WorkspaceDialog(QDialog):
         self.model_combo.clear()
         self.model_combo.addItems(["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo", "gpt-4"])
         QMessageBox.information(self, "OpenAI", "Default OpenAI models loaded.\nType a custom model name if needed.")
+
+    def on_rows_reordered(self, parent, start, end, destination):
+        """Handle row reordering after drag-drop"""
+        self._update_workspace_orders()
+
+    def _update_workspace_orders(self):
+        """Update workspace.order based on current list order"""
+        for row in range(self.workspace_list.count()):
+            item = self.workspace_list.item(row)
+            ws_id = item.data(Qt.ItemDataRole.UserRole)
+            ws = self.manager.workspaces.get(ws_id)
+            if ws:
+                ws.order = row
+        self.manager._save_workspaces()
+        if hasattr(self.parent(), 'sidebar') and self.parent():
+            self.parent().sidebar.refresh_workspace_buttons()
 
 
 class TemplateDialog(QDialog):

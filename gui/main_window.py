@@ -1,20 +1,25 @@
 import asyncio
+import logging
 import os
 import sys
+import threading
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTextEdit, QLineEdit, QPushButton, QLabel, QSystemTrayIcon,
     QMenu, QMenuBar, QMessageBox, QSplitter, QListWidget, QListWidgetItem,
     QFrame, QScrollArea, QToolBar, QStatusBar, QSizePolicy,
-    QFileDialog,
+    QFileDialog, QStackedWidget,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QMimeData
 from PyQt6.QtGui import QAction, QIcon, QFont, QPalette, QColor, QKeySequence, QShortcut, QDragEnterEvent, QDropEvent
 
 
+from grizzyclaw import __version__
 from grizzyclaw.config import Settings, get_config_path
 from grizzyclaw.agent.core import AgentCore
 from grizzyclaw.channels.telegram import TelegramChannel
@@ -25,6 +30,7 @@ from .browser_dialog import BrowserDialog
 from .sessions_dialog import SessionsDialog
 from .workspace_dialog import WorkspaceDialog
 from .canvas_widget import CanvasWidget
+from .usage_dashboard_dialog import UsageDashboardDialog
 from grizzyclaw.workspaces import WorkspaceManager
 
 
@@ -97,33 +103,44 @@ class RecordVoiceWorker(QThread):
 
 class MessageWorker(QThread):
     """Worker thread to handle async agent processing."""
-    message_ready = pyqtSignal(str)
+    message_ready = pyqtSignal(str, bool)  # (response_text, was_stopped)
     chunk_ready = pyqtSignal(str)
     transcript_ready = pyqtSignal(str)
     error_occurred = pyqtSignal(str)
 
-    def __init__(self, agent, user_id, message, images=None, audio_path=None):
+    def __init__(self, agent, user_id, message, images=None, audio_path=None, stop_requested=None):
         super().__init__()
         self.agent = agent
         self.user_id = user_id
         self.message = message
         self.images = images or []
         self.audio_path = audio_path
+        # threading.Event from GUI; we poll it from an asyncio task so Stop works from main thread
+        self._stop_requested = stop_requested
 
     def run(self):
         """Run the async processing in a separate thread"""
         try:
             import asyncio
-            response_text = asyncio.run(self._process_message())
-            self.message_ready.emit(response_text)
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                response_text, was_stopped = loop.run_until_complete(self._process_message())
+                self.message_ready.emit(response_text, was_stopped)
+            finally:
+                loop.close()
         except Exception as e:
             self.error_occurred.emit(f"Error: {str(e)}")
 
     async def _process_message(self):
-        """Process the message asynchronously, streaming each chunk."""
+        """Process the message asynchronously, streaming each chunk. Can be stopped via _stop_requested."""
         response_text = ""
         message = self.message
         audio_path = None
+        stop_requested = self._stop_requested
+
+        if stop_requested and stop_requested.is_set():
+            return (response_text, True)
 
         if self.audio_path:
             # Pre-transcribe so we can show the transcript in the user bubble
@@ -147,24 +164,57 @@ class MessageWorker(QThread):
                 # Don't pass audio_path to agent; we already have the transcript
             except Exception as e:
                 self.error_occurred.emit(f"Error: {str(e)}")
-                return ""
+                return ("", False)
 
         kwargs = {"images": self.images}
         if audio_path:
             kwargs["audio_path"] = audio_path
 
-        async for chunk in self.agent.process_message(
-            self.user_id, message, **kwargs
-        ):
-            response_text += chunk
-            self.chunk_ready.emit(chunk)
-        return response_text
+        async def stream_consumer():
+            nonlocal response_text
+            async for chunk in self.agent.process_message(
+                self.user_id, message, **kwargs
+            ):
+                if stop_requested and stop_requested.is_set():
+                    break
+                response_text += chunk
+                self.chunk_ready.emit(chunk)
+            return response_text
+
+        if not stop_requested:
+            text = await stream_consumer()
+            return (text, False)
+
+        # Poll stop_requested from this thread so main-thread Stop is seen reliably (no cross-thread asyncio)
+        async def stop_waiter():
+            while not stop_requested.is_set():
+                await asyncio.sleep(0.15)
+        stream_task = asyncio.create_task(stream_consumer())
+        stop_task = asyncio.create_task(stop_waiter())
+        done, pending = await asyncio.wait(
+            [stream_task, stop_task], return_when=asyncio.FIRST_COMPLETED
+        )
+        for p in pending:
+            p.cancel()
+            try:
+                await p
+            except asyncio.CancelledError:
+                pass
+        if stream_task in done and not stream_task.cancelled():
+            response_text = stream_task.result()
+        elif stop_requested.is_set():
+            stream_task.cancel()
+            try:
+                await stream_task
+            except asyncio.CancelledError:
+                pass
+        return (response_text, stop_requested.is_set())
 
 
 class MessageBubble(QFrame):
     speak_requested = pyqtSignal(str)
 
-    def __init__(self, text, is_user=True, parent=None, is_dark=False):
+    def __init__(self, text, is_user=True, parent=None, is_dark=False, avatar_path: Optional[str] = None):
         super().__init__(parent)
         self.is_user = is_user
         self.is_dark = is_dark
@@ -186,6 +236,18 @@ class MessageBubble(QFrame):
             layout.addStretch()
             layout.addWidget(self.label, alignment=Qt.AlignmentFlag.AlignRight)
         else:
+            if avatar_path and Path(avatar_path).exists():
+                try:
+                    from PyQt6.QtGui import QPixmap
+                    pix = QPixmap(avatar_path).scaled(32, 32, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
+                    avatar_lbl = QLabel()
+                    avatar_lbl.setPixmap(pix)
+                    avatar_lbl.setFixedSize(32, 32)
+                    avatar_lbl.setStyleSheet("border-radius: 16px;")
+                    avatar_lbl.setScaledContents(True)
+                    layout.addWidget(avatar_lbl, alignment=Qt.AlignmentFlag.AlignBottom)
+                except Exception:
+                    pass
             layout.addWidget(self.label, alignment=Qt.AlignmentFlag.AlignLeft)
             self.speak_btn = QPushButton("🔊")
             self.speak_btn.setToolTip("Speak response")
@@ -245,8 +307,64 @@ class MessageBubble(QFrame):
                 """)
 
 
+class MultiAgentMessageCard(QFrame):
+    """Single message row for multi-agent view: sender label + text."""
+    def __init__(self, text: str, is_user: bool, sender: str, is_dark: bool = False, parent=None):
+        super().__init__(parent)
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self.setStyleSheet("background: transparent; border: none;")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 4, 0, 4)
+        layout.setSpacing(2)
+        sender_label = QLabel(sender or ("You" if is_user else "Assistant"))
+        sender_label.setFont(QFont("-apple-system", 11, QFont.Weight.Medium))
+        sender_label.setStyleSheet("color: #8E8E93;" if not is_dark else "color: #98989D;")
+        layout.addWidget(sender_label)
+        msg = QLabel(text)
+        msg.setWordWrap(True)
+        msg.setFont(QFont("-apple-system", 13))
+        msg.setStyleSheet("color: #1C1C1E;" if not is_dark else "color: #FFFFFF;")
+        layout.addWidget(msg)
+
+
+class MultiAgentPanel(QWidget):
+    """Real-time multi-agent chat view: same messages with sender labels."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.is_dark = False
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        self.container = QWidget()
+        self.container_layout = QVBoxLayout(self.container)
+        self.container_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.container_layout.setSpacing(4)
+        self.scroll.setWidget(self.container)
+        layout.addWidget(self.scroll)
+
+    def add_message(self, text: str, is_user: bool, sender: str):
+        card = MultiAgentMessageCard(text, is_user, sender, self.is_dark, self)
+        self.container_layout.insertWidget(self.container_layout.count(), card)
+        QTimer.singleShot(0, self._scroll_bottom)
+
+    def _scroll_bottom(self):
+        sb = self.scroll.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def clear_messages(self):
+        while self.container_layout.count():
+            item = self.container_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+
 class ChatWidget(QWidget):
     message_received = pyqtSignal(str, bool)
+    message_added = pyqtSignal(str, bool, str)  # text, is_user, sender
+    conversation_cleared = pyqtSignal()
     image_attached = pyqtSignal(str)  # path to display in canvas
 
     def __init__(self, agent, parent=None, settings=None):
@@ -255,19 +373,45 @@ class ChatWidget(QWidget):
         self._settings = settings
         self.user_id = "gui_user"
         self.current_conversation = []
+        self._workspace_display_name = "Assistant"
+        self._workspace_avatar_path: Optional[str] = None
         self.is_dark = False
         self.setup_ui()
-        self.message_received.connect(self.add_message)
+        self.message_received.connect(self._on_message_received)
+
+    def _on_message_received(self, text: str, is_user: bool):
+        sender = "You" if is_user else self._workspace_display_name
+        self.add_message(text, is_user, sender=sender)
     
     def setup_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(30, 20, 30, 20)
         layout.setSpacing(0)
         
-        # Header with better spacing
+        # Header with Chat / Multi-Agent tabs
         header_container = QWidget()
         header_layout = QHBoxLayout(header_container)
         header_layout.setContentsMargins(0, 0, 0, 16)
+        
+        self.chat_tab_btn = QPushButton("Chat")
+        self.chat_tab_btn.setCheckable(True)
+        self.chat_tab_btn.setChecked(True)
+        self.chat_tab_btn.setFixedHeight(32)
+        self.multi_agent_tab_btn = QPushButton("Multi-Agent")
+        self.multi_agent_tab_btn.setCheckable(True)
+        self.multi_agent_tab_btn.setFixedHeight(32)
+        for b in (self.chat_tab_btn, self.multi_agent_tab_btn):
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setStyleSheet("""
+                QPushButton { background: transparent; border: none; color: #8E8E93; border-radius: 6px; padding: 4px 12px; }
+                QPushButton:hover { color: #1C1C1E; background: #E5E5EA; }
+                QPushButton:checked { color: #007AFF; font-weight: bold; }
+            """)
+        self.chat_tab_btn.clicked.connect(lambda: self._switch_view(0))
+        self.multi_agent_tab_btn.clicked.connect(lambda: self._switch_view(1))
+        header_layout.addWidget(self.chat_tab_btn)
+        header_layout.addWidget(self.multi_agent_tab_btn)
+        header_layout.addStretch()
         
         self.header_label = QLabel("Chat")
         self.header_label.setFont(QFont("-apple-system", 24, QFont.Weight.Bold))
@@ -372,7 +516,15 @@ class ChatWidget(QWidget):
         self.chat_scroll.setWidget(self.chat_container)
         self._user_near_bottom = True
         self.chat_scroll.verticalScrollBar().valueChanged.connect(self._on_scroll_changed)
-        layout.addWidget(self.chat_scroll, 1)
+
+        self.multi_agent_panel = MultiAgentPanel(self)
+        self.message_added.connect(self.multi_agent_panel.add_message)
+        self.conversation_cleared.connect(self.multi_agent_panel.clear_messages)
+
+        self.chat_stack = QStackedWidget()
+        self.chat_stack.addWidget(self.chat_scroll)
+        self.chat_stack.addWidget(self.multi_agent_panel)
+        layout.addWidget(self.chat_stack, 1)
         
         layout.addSpacing(16)
         
@@ -395,7 +547,7 @@ class ChatWidget(QWidget):
         self.pending_audio: Optional[str] = None
 
         self.input_field = QLineEdit()
-        self.input_field.setPlaceholderText("Type your message or attach an image/audio...")
+        self.input_field.setPlaceholderText("Type your message… Use @workspace to delegate (e.g. @code_assistant analyze this).")
         self.input_field.setFont(QFont("-apple-system", 14))
         self.input_field.setFixedHeight(44)
         self.input_field.setStyleSheet("""
@@ -487,10 +639,35 @@ class ChatWidget(QWidget):
             }
         """)
         self.send_btn.clicked.connect(self.send_message)
-        
+
+        self.stop_btn = QPushButton("Stop")
+        self.stop_btn.setToolTip("Stop the current response (may take effect after the next chunk)")
+        self.stop_btn.setFont(QFont("-apple-system", 14, QFont.Weight.Medium))
+        self.stop_btn.setFixedSize(80, 44)
+        self.stop_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.stop_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #FF3B30;
+                color: white;
+                border: none;
+                border-radius: 22px;
+                text-align: center;
+                padding: 0;
+            }
+            QPushButton:hover {
+                background-color: #E6342A;
+            }
+            QPushButton:pressed {
+                background-color: #CC2A22;
+            }
+        """)
+        self.stop_btn.clicked.connect(self._on_stop_chat)
+        self.stop_btn.hide()
+
         input_layout.addWidget(self.attach_btn)
         input_layout.addWidget(self.mic_btn)
         input_layout.addWidget(self.input_field, 1)
+        input_layout.addWidget(self.stop_btn)
         input_layout.addWidget(self.send_btn)
 
         self.attached_label = QLabel("")
@@ -499,6 +676,11 @@ class ChatWidget(QWidget):
         layout.addWidget(self.attached_label)
 
         layout.addWidget(input_container)
+
+    def _switch_view(self, index: int):
+        self.chat_stack.setCurrentIndex(index)
+        self.chat_tab_btn.setChecked(index == 0)
+        self.multi_agent_tab_btn.setChecked(index == 1)
     
     def _on_mic_clicked(self):
         """Show menu: Record or Attach file. If recording, stop."""
@@ -644,8 +826,8 @@ class ChatWidget(QWidget):
 
     def _new_chat(self):
         """Clear conversation and start fresh."""
-        import asyncio
-        asyncio.run(self.agent.clear_session(self.user_id))
+        from grizzyclaw.utils.async_runner import run_async
+        run_async(self.agent.clear_session(self.user_id))
         # Remove all message bubbles, keep empty state and stretch
         for i in range(self.chat_layout.count() - 1, -1, -1):
             item = self.chat_layout.itemAt(i)
@@ -654,21 +836,25 @@ class ChatWidget(QWidget):
             w = item.widget()
             if w and isinstance(w, MessageBubble):
                 w.deleteLater()
+        self.conversation_cleared.emit()
         self.empty_state.show()
         mw = self.window()
         if mw and hasattr(mw, "status_bar"):
             mw.status_bar.showMessage("New conversation started")
 
     def _set_loading(self, loading: bool):
-        """Enable/disable send during streaming, show loading state."""
+        """Enable/disable send during streaming, show Stop button when loading."""
         self.send_btn.setEnabled(not loading)
         self.input_field.setEnabled(not loading)
         self.attach_btn.setEnabled(not loading)
         self.mic_btn.setEnabled(not loading)
         if loading:
-            self.send_btn.setText("...")
+            self.send_btn.hide()
+            self.stop_btn.show()
+            self.stop_btn.setEnabled(True)
         else:
-            self.send_btn.setText("Send")
+            self.stop_btn.hide()
+            self.send_btn.show()
 
     def send_message(self):
         text = self.input_field.text().strip()
@@ -678,6 +864,14 @@ class ChatWidget(QWidget):
             return
 
         self._set_loading(True)
+        # Show which provider/model chat is using (helps debug "Ollama not getting requests")
+        mw = self.window()
+        if mw and hasattr(mw, "status_bar") and self.agent and getattr(self.agent, "llm_router", None):
+            r = self.agent.llm_router
+            prov = getattr(r, "default_provider", None) or ""
+            model = (getattr(r, "provider_models", None) or {}).get(prov, "") or ""
+            if prov:
+                mw.status_bar.showMessage(f"Sending to {prov}" + (f" ({model})" if model else "") + "...")
         self.input_field.clear()
         self.pending_images.clear()
         self.pending_audio = None
@@ -690,13 +884,15 @@ class ChatWidget(QWidget):
         else:
             display_text = "(image)"
 
-        user_bubble = self.add_message(display_text, is_user=True)
+        user_bubble = self.add_message(display_text, is_user=True, sender="You")
 
         self._streaming_bubble = None
         self._user_near_bottom = True
+        self._stop_requested = threading.Event()
         prompt = text or ("What's in this image?" if images else "")
         self.worker = MessageWorker(
-            self.agent, self.user_id, prompt, images=images, audio_path=audio_path
+            self.agent, self.user_id, prompt, images=images, audio_path=audio_path,
+            stop_requested=self._stop_requested,
         )
         self.worker.chunk_ready.connect(self._on_stream_chunk)
         self.worker.message_ready.connect(self.on_message_ready)
@@ -708,6 +904,12 @@ class ChatWidget(QWidget):
                 QTimer.singleShot(0, self._scroll_to_bottom_if_near)
             self.worker.transcript_ready.connect(_on_transcript)
         self.worker.start()
+
+    def _on_stop_chat(self):
+        """Stop the current LLM response (works even when the LLM is not sending)."""
+        if getattr(self, "_stop_requested", None):
+            self._stop_requested.set()
+        self.stop_btn.setEnabled(False)
 
     def _scroll_to_bottom_if_near(self):
         """Scroll to bottom only if user is near the bottom (within 80px)."""
@@ -733,21 +935,24 @@ class ChatWidget(QWidget):
     def _on_stream_chunk(self, chunk: str):
         """Append a streamed chunk to the assistant bubble."""
         if self._streaming_bubble is None:
-            self._streaming_bubble = MessageBubble("", is_user=False, is_dark=self.is_dark)
+            self._streaming_bubble = MessageBubble(
+                "", is_user=False, is_dark=self.is_dark, avatar_path=self._workspace_avatar_path
+            )
             self._streaming_bubble.speak_requested.connect(self._on_speak_requested)
             self.chat_layout.insertWidget(self.chat_layout.count() - 1, self._streaming_bubble)
         current = self._streaming_bubble.label.text()
         self._streaming_bubble.label.setText(current + chunk)
         QTimer.singleShot(0, self._scroll_to_bottom_if_near)
 
-    def on_message_ready(self, response_text):
+    def on_message_ready(self, response_text, was_stopped=False):
         """Handle completion of the response from the worker thread."""
         self._set_loading(False)
         if not (response_text or "").strip():
-            response_text = "I couldn't generate a response. Please check that your LLM provider (Ollama, LM Studio, etc.) is running and try again."
+            response_text = "Stopped." if was_stopped else "I couldn't generate a response. Please check that your LLM provider (Ollama, LM Studio, etc.) is running and try again."
         if self._streaming_bubble is not None:
             self._streaming_bubble.label.setText(response_text)
             self._streaming_bubble = None
+            self.message_added.emit(response_text, False, self._workspace_display_name)
         else:
             self.message_received.emit(response_text, False)
     
@@ -757,6 +962,7 @@ class ChatWidget(QWidget):
         if self._streaming_bubble is not None:
             self._streaming_bubble.label.setText(error_message)
             self._streaming_bubble = None
+            self.message_added.emit(error_message, False, self._workspace_display_name)
         else:
             self.message_received.emit(error_message, False)
     
@@ -820,20 +1026,25 @@ class ChatWidget(QWidget):
                 f"Could not export: {e}",
             )
 
-    def add_message(self, text, is_user=True):
+    def add_message(self, text, is_user=True, sender=None):
+        if sender is None:
+            sender = "You" if is_user else self._workspace_display_name
         self.empty_state.hide()
-        bubble = MessageBubble(text, is_user, is_dark=self.is_dark)
+        avatar = None if is_user else self._workspace_avatar_path
+        bubble = MessageBubble(text, is_user, is_dark=self.is_dark, avatar_path=avatar)
         if not is_user:
             bubble.speak_requested.connect(self._on_speak_requested)
         self.chat_layout.insertWidget(self.chat_layout.count() - 1, bubble)
-
+        self.message_added.emit(text, is_user, sender)
         # Scroll to bottom (smart scroll: only when user is near bottom)
         if getattr(self, "_user_near_bottom", True):
             QTimer.singleShot(50, self._scroll_to_bottom_if_near)
         return bubble
-    
-    def update_workspace_name(self, name: str, icon: str = "🤖"):
-        """Update chat header to show workspace name."""
+
+    def update_workspace_name(self, name: str, icon: str = "🤖", avatar_path: Optional[str] = None):
+        """Update chat header and workspace identity for messages."""
+        self._workspace_display_name = f"{icon} {name}" if name else "Assistant"
+        self._workspace_avatar_path = avatar_path or None
         if name:
             self.header_label.setText(f"Chat - {icon} {name}")
         else:
@@ -848,6 +1059,8 @@ class ChatWidget(QWidget):
     def update_theme(self, is_dark, border_color: str = None):
         """Update theme for all existing message bubbles"""
         self.is_dark = is_dark
+        if hasattr(self, "multi_agent_panel"):
+            self.multi_agent_panel.is_dark = is_dark
         if border_color:
             self.update_separator_colors(border_color)
         # Update input field style
@@ -921,7 +1134,7 @@ class SidebarWidget(QWidget):
         self.on_switch_workspace = switch_callback
 
     def refresh_workspace_buttons(self):
-        """Rebuild workspace switch buttons from current workspace list."""
+        """Rebuild workspace switch buttons (one button per workspace; click to switch)."""
         for btn in self.workspace_buttons:
             btn.deleteLater()
         self.workspace_buttons.clear()
@@ -934,7 +1147,7 @@ class SidebarWidget(QWidget):
 
         fg = self._theme_colors.get("fg", "#1C1C1E") if self._theme_colors else "#1C1C1E"
         accent = self._theme_colors.get("accent", "#007AFF") if self._theme_colors else "#007AFF"
-        hover = "rgba(255, 255, 255, 0.1)" if self._theme_colors and self._theme_colors.get("is_dark") else "rgba(0, 0, 0, 0.05)"
+        hover = "rgba(255, 255, 255, 0.1)" if (self._theme_colors and self._theme_colors.get("is_dark")) else "rgba(0, 0, 0, 0.05)"
         for ws in workspaces:
             btn = QPushButton(f"{ws.icon}  {ws.name}")
             btn.setProperty("workspace_id", ws.id)
@@ -1017,6 +1230,7 @@ class SidebarWidget(QWidget):
         self.scheduler_btn = self.create_nav_button("⏰", "Scheduler")
         self.browser_btn = self.create_nav_button("🌐", "Browser")
         self.sessions_btn = self.create_nav_button("👥", "Sessions")
+        self.usage_btn = self.create_nav_button("📊", "Usage")
         self.settings_btn = self.create_nav_button("⚙️", "Settings")
         
         layout.addWidget(self.chat_btn)
@@ -1030,6 +1244,8 @@ class SidebarWidget(QWidget):
         layout.addWidget(self.browser_btn)
         layout.addSpacing(4)
         layout.addWidget(self.sessions_btn)
+        layout.addSpacing(4)
+        layout.addWidget(self.usage_btn)
         layout.addSpacing(4)
         layout.addWidget(self.settings_btn)
 
@@ -1049,7 +1265,7 @@ class SidebarWidget(QWidget):
 
         layout.addSpacing(8)
 
-        # Workspace switch buttons
+        # Workspace switch buttons (one per workspace; click to switch active)
         workspace_section = QWidget()
         self.workspace_buttons_layout = QVBoxLayout(workspace_section)
         self.workspace_buttons_layout.setContentsMargins(0, 0, 0, 0)
@@ -1133,12 +1349,14 @@ class GrizzyClawApp(QMainWindow):
         super().__init__()
         # Load settings from config file if it exists (same path used for save)
         self.settings = Settings()
+        self._config_load_failed = False
         config_path = get_config_path()
         if config_path.exists():
             try:
                 self.settings = Settings.from_file(str(config_path))
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Failed to load config from %s: %s", config_path, e)
+                self._config_load_failed = True
         
         # Initialize workspace manager
         self.workspace_manager = WorkspaceManager()
@@ -1209,6 +1427,7 @@ class GrizzyClawApp(QMainWindow):
         self.sidebar.scheduler_btn.clicked.connect(self.show_scheduler)
         self.sidebar.browser_btn.clicked.connect(self.show_browser)
         self.sidebar.sessions_btn.clicked.connect(self.show_sessions)
+        self.sidebar.usage_btn.clicked.connect(self.show_usage_dashboard)
         self.sidebar.settings_btn.clicked.connect(self.show_settings)
         layout.addWidget(self.sidebar)
         
@@ -1243,7 +1462,10 @@ class GrizzyClawApp(QMainWindow):
             }
         """)
         self.setStatusBar(self.status_bar)
-        self.status_bar.showMessage("Ready")
+        if getattr(self, "_config_load_failed", False):
+            self.status_bar.showMessage("Config load failed (check logs). Using defaults.")
+        else:
+            self.status_bar.showMessage("Ready")
     
     def setup_menu(self):
         menubar = self.menuBar()
@@ -1294,6 +1516,9 @@ class GrizzyClawApp(QMainWindow):
         toggle_tray_action = QAction("Hide to Tray", self)
         toggle_tray_action.triggered.connect(self.hide_to_tray)
         view_menu.addAction(toggle_tray_action)
+        usage_action = QAction("Usage Dashboard", self)
+        usage_action.triggered.connect(self.show_usage_dashboard)
+        view_menu.addAction(usage_action)
         
         # Help menu
         help_menu = menubar.addMenu("Help")
@@ -1421,6 +1646,10 @@ class GrizzyClawApp(QMainWindow):
         dialog = SessionsDialog(self)
         dialog.exec()
 
+    def show_usage_dashboard(self):
+        dialog = UsageDashboardDialog(self.workspace_manager, self.settings, self)
+        dialog.exec()
+
     def show_workspaces(self):
         dialog = WorkspaceDialog(self.workspace_manager, self)
         dialog.workspace_changed.connect(self.on_workspace_changed)
@@ -1442,7 +1671,9 @@ class GrizzyClawApp(QMainWindow):
             workspace = self.workspace_manager.get_workspace(workspace_id)
             if workspace:
                 self.setWindowTitle(f"GrizzyClaw - {workspace.icon} {workspace.name}")
-                self.chat_widget.update_workspace_name(workspace.name, workspace.icon)
+                self.chat_widget.update_workspace_name(
+                    workspace.name, workspace.icon, getattr(workspace, "avatar_path", None)
+                )
             self.status_bar.showMessage(f"Switched to workspace: {workspace.name if workspace else workspace_id}")
             self.sidebar.refresh_workspace_buttons()
 
@@ -1865,7 +2096,7 @@ class GrizzyClawApp(QMainWindow):
         QMessageBox.about(
             self,
             "About GrizzyClaw",
-            "<h2>GrizzyClaw v0.1.0</h2>"
+            f"<h2>GrizzyClaw v{__version__}</h2>"
             "<p>A secure, multi-platform AI agent with local LLM support.</p>"
             "<p>Features:</p>"
             "<ul>"
@@ -1919,24 +2150,29 @@ class GrizzyClawApp(QMainWindow):
         QApplication.quit()
     
     def closeEvent(self, event):
-        event.ignore()
-        self.hide_to_tray()
+        # On macOS, Quit (Cmd+Q or app menu) and the red close button both trigger
+        # closeEvent. Previously we hid to tray for both, so Quit never exited.
+        # Now: close/Quit = actually quit. Use Esc or tray icon to minimize to tray.
+        event.accept()
+        self.quit_app()
 
 
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("GrizzyClaw")
-    app.setApplicationVersion("0.1.0")
+    app.setApplicationVersion(__version__)
     app.setStyle("Fusion")
     
     # Load settings to apply appearance before creating window
+    import logging
+    _log = logging.getLogger(__name__)
     settings = Settings()
     config_path = get_config_path()
     if config_path.exists():
         try:
             settings = Settings.from_file(str(config_path))
-        except Exception:
-            pass
+        except Exception as e:
+            _log.warning("Failed to load config from %s: %s", config_path, e)
     
     # Apply font settings
     font_family = settings.font_family

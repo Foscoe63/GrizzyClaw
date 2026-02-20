@@ -3,12 +3,15 @@
 import json
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+import asyncio
+from typing import Dict, List, Optional, Any, TYPE_CHECKING
 
 from grizzyclaw.config import Settings
-from grizzyclaw.agent.core import AgentCore
 from grizzyclaw.memory.sqlite_store import SQLiteMemoryStore
 from .workspace import Workspace, WorkspaceConfig, WORKSPACE_TEMPLATES
+
+if TYPE_CHECKING:
+    from grizzyclaw.agent.core import AgentCore
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +47,11 @@ class WorkspaceManager:
                     self.workspaces[workspace.id] = workspace
                 
                 self.active_workspace_id = data.get("active_workspace_id")
+                if not self.workspaces:
+                    self._create_default_workspace()
+                else:
+                    if not self.active_workspace_id or self.active_workspace_id not in self.workspaces:
+                        self.active_workspace_id = next(iter(self.workspaces.keys()))
                 logger.info(f"Loaded {len(self.workspaces)} workspaces")
                 
             except Exception as e:
@@ -104,6 +112,7 @@ class WorkspaceManager:
                 description=description or WORKSPACE_TEMPLATES[template].description,
                 icon=icon or WORKSPACE_TEMPLATES[template].icon,
                 color=color or WORKSPACE_TEMPLATES[template].color,
+                order=len(self.get_workspaces_sorted()),
                 config=WorkspaceConfig.from_dict(WORKSPACE_TEMPLATES[template].config.to_dict())
             )
         else:
@@ -112,6 +121,7 @@ class WorkspaceManager:
                 description=description,
                 icon=icon,
                 color=color,
+                order=len(self.get_workspaces_sorted()),
                 config=config or WorkspaceConfig()
             )
         
@@ -209,14 +219,29 @@ class WorkspaceManager:
             return True
         return False
     
+    def get_workspaces_sorted(self) -> List[Workspace]:
+        """Get workspaces sorted by order"""
+        return sorted(self.workspaces.values(), key=lambda ws: ws.order)
+
+    def reorder_workspaces(self, ordered_ids: List[str]) -> None:
+        """Reorder workspaces by the given list of workspace IDs (order = index)."""
+        for i, wid in enumerate(ordered_ids):
+            ws = self.workspaces.get(wid)
+            if ws is not None:
+                ws.order = i
+        self._save_workspaces()
+        logger.debug("Reordered workspaces: %s", ordered_ids)
+
     def list_workspaces(self) -> List[Workspace]:
-        """List all workspaces"""
-        return list(self.workspaces.values())
+        """List all workspaces. Ensures at least one (default) exists."""
+        if not self.workspaces:
+            self._create_default_workspace()
+        return self.get_workspaces_sorted()
     
     def get_workspace_stats(self) -> Dict[str, Any]:
         """Get statistics about workspaces"""
         return {
-            "total": len(self.workspaces),
+            "total": len(self.get_workspaces_sorted()),
             "active_id": self.active_workspace_id,
             "workspaces": [
                 {
@@ -227,8 +252,11 @@ class WorkspaceManager:
                     "is_default": ws.is_default,
                     "session_count": ws.session_count,
                     "message_count": ws.message_count,
+                    "avg_response_time_ms": round(ws.avg_response_time_ms, 1),
+                    "total_tokens": ws.total_tokens,
+                    "quality_score": round(ws.quality_score, 1),
                 }
-                for ws in self.workspaces.values()
+                for ws in self.get_workspaces_sorted()
             ]
         }
     
@@ -236,7 +264,7 @@ class WorkspaceManager:
         self, 
         workspace_id: str,
         base_settings: Optional[Settings] = None
-    ) -> Optional[AgentCore]:
+    ) -> "Optional[AgentCore]":
         """Create an agent configured for a specific workspace
         
         Args:
@@ -297,9 +325,13 @@ class WorkspaceManager:
         
         # Custom database path for workspace isolation
         settings.database_url = f"sqlite:///{workspace.get_memory_db_path()}"
-        
-        # Create and store agent
+
+        # Lazy import to avoid circular import: agent.core -> workspaces.workspace -> manager -> agent.core
+        from grizzyclaw.agent.core import AgentCore
         agent = AgentCore(settings)
+        agent.workspace_manager = self
+        agent.workspace_id = workspace_id
+        agent.workspace_config = config
         workspace.agent = agent
         
         logger.info(f"Created agent for workspace: {workspace.name}")
@@ -309,7 +341,7 @@ class WorkspaceManager:
         self, 
         workspace_id: str,
         base_settings: Optional[Settings] = None
-    ) -> Optional[AgentCore]:
+    ) -> "Optional[AgentCore]":
         """Get existing agent or create new one for workspace
         
         Args:
@@ -347,6 +379,7 @@ class WorkspaceManager:
             description=f"Copy of {source.name}",
             icon=source.icon,
             color=source.color,
+            order=len(self.get_workspaces_sorted()),
             config=WorkspaceConfig.from_dict(source.config.to_dict())
         )
         
@@ -391,3 +424,59 @@ class WorkspaceManager:
         except Exception as e:
             logger.error(f"Failed to import workspace: {e}")
             return None
+
+
+    def get_workspace_by_name(self, name: str) -> Optional[Workspace]:
+        """Get workspace by name (case-insensitive)"""
+        for ws in self.workspaces.values():
+            if ws.name.lower() == name.lower():
+                return ws
+        return None
+
+    def get_workspace_by_slug(self, slug: str) -> Optional[Workspace]:
+        """Get workspace by slug (name lowercased, spaces → underscores). E.g. 'code_assistant' → 'Code Assistant'."""
+        slug = slug.lower().strip()
+        for ws in self.workspaces.values():
+            ws_slug = ws.name.lower().replace(" ", "_").replace("-", "_")
+            if ws_slug == slug:
+                return ws
+        return None
+
+    async def send_message_to_workspace(
+        self,
+        from_id: str,
+        to_id_or_name: str,
+        message: str,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Send message from one workspace/agent to another"""
+        target = (
+            self.get_workspace(to_id_or_name)
+            or self.get_workspace_by_name(to_id_or_name)
+            or self.get_workspace_by_slug(to_id_or_name)
+        )
+        if not target:
+            return "Target workspace not found."
+        if not target.config.enable_inter_agent:
+            return f"Target workspace '{target.name}' has inter-agent chat disabled."
+        # If both sides use a channel, they must match
+        from_ws = self.get_workspace(from_id)
+        if from_ws and from_ws.config.inter_agent_channel and target.config.inter_agent_channel:
+            if from_ws.config.inter_agent_channel != target.config.inter_agent_channel:
+                return f"Target workspace is on channel '{target.config.inter_agent_channel}'; cannot message from '{from_ws.config.inter_agent_channel}'."
+        try:
+            agent = self.get_or_create_agent(target.id)
+            response = agent.process_message(
+                f"inter-agent-{from_id}", message, context=context
+            )
+            if hasattr(response, "__aiter__"):
+                chunks = []
+                async for chunk in response:
+                    chunks.append(chunk)
+                response = "".join(chunks)
+            elif hasattr(response, "__iter__"):
+                response = "".join(response)
+            return str(response)[:1000]  # Truncate long responses
+        except Exception as e:
+            logger.error(f"Inter-agent error: {e}")
+            return f"Error: {str(e)}"

@@ -1,271 +1,43 @@
+import ast
+import asyncio
+import json
 import logging
 import uuid
-from typing import Any, AsyncIterator, Dict, List, Optional, Callable, Tuple
+from pathlib import Path
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
+from grizzyclaw.automation import CronScheduler, PLAYWRIGHT_AVAILABLE
 from grizzyclaw.config import Settings
 from grizzyclaw.llm.router import LLMRouter
-from grizzyclaw.memory.sqlite_store import SQLiteMemoryStore
-from grizzyclaw.automation import CronScheduler, PLAYWRIGHT_AVAILABLE
 from grizzyclaw.mcp_client import call_mcp_tool, discover_tools
-from grizzyclaw.utils.vision import build_vision_content
+from grizzyclaw.memory.sqlite_store import SQLiteMemoryStore
 from grizzyclaw.media.transcribe import transcribe_audio, TranscriptionError
 from grizzyclaw.safety.content_filter import ContentFilter
-from pathlib import Path
-import ast
-import json
+from grizzyclaw.utils.vision import build_vision_content
+
+from .command_parsers import (
+    find_json_blocks,
+    find_json_blocks_fallback,
+    find_schedule_task_fallback,
+    normalize_llm_json,
+)
+from .context_utils import trim_session
+from grizzyclaw.workspaces.workspace import WorkspaceConfig
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from grizzyclaw.workspaces.manager import WorkspaceManager
+from .search_utils import (
+    correct_search_query,
+    simplify_search_query,
+    simplify_search_query_retry,
+)
 import re
-import asyncio
+import time
 
 logger = logging.getLogger(__name__)
 
 MAX_AGENTIC_ITERATIONS = 5  # Max tool-use rounds to prevent infinite loops
-
-# Markers for messages worth keeping when trimming context
-_CONTEXT_PRIORITY_MARKERS = (
-    "[Tool result",
-    "TOOL_CALL",
-    "BROWSER_ACTION",
-    "SCHEDULE_TASK",
-    "MEMORY_SAVE",
-    "\u2692",  # 🔧
-)
-
-
-def _correct_search_query(query: str) -> str:
-    """Fix common typos in search queries (e.g. pecs->specs for tech context)."""
-    if not query or len(query) < 3:
-        return query
-    q = query.lower()
-    # "pecs" often meant "specs" (specifications) when asking about tech/products
-    tech_indicators = (
-        "mac", "iphone", "ipad", "studio", "ultra", "pro", "max", "mini",
-        "specifications", "specs", "product", "release", "upcoming", "cpu",
-        "gpu", "ram", "storage", "chip", "processor", "apple", "computer",
-    )
-    if "pecs" in q and any(ind in q for ind in tech_indicators):
-        query = re.sub(r"\bpecs\b", "specs", query, flags=re.IGNORECASE)
-    return query
-
-
-def _simplify_search_query(query: str) -> str:
-    """Simplify queries to improve DuckDuckGo results (avoids bot detection, over-specificity)."""
-    if not query or len(query) <= 10:
-        return query
-    # Remove filler words that add length but not search value
-    filler = (
-        r"\b(the|latest|upcoming|on|for|what|are|going|to|be|and|see|if|you|can|get|"
-        r"information|about|look|search|internet|web)\b"
-    )
-    simplified = re.sub(filler, " ", query, flags=re.IGNORECASE)
-    simplified = re.sub(r"\s+", " ", simplified).strip()
-    # Prefer shorter if we got something reasonable
-    if simplified and len(simplified) < len(query) and len(simplified) >= 10:
-        return simplified
-    return query
-
-
-def _simplify_search_query_retry(query: str) -> str:
-    """More aggressive simplification for retry when first search returns no results."""
-    simplified = _simplify_search_query(query)
-    if len(simplified) <= 30:
-        return simplified
-    # For retry: try product name first (e.g. "Mac Studio M5 Ultra") - often works better
-    words = simplified.split()
-    # Prioritize product-like terms (contain numbers, or known product words)
-    product_words = []
-    for w in words:
-        if any(c.isdigit() for c in w) or w in ("Mac", "Studio", "Ultra", "Pro", "Max", "iPhone", "iPad"):
-            product_words.append(w)
-        elif product_words and not w.lower() in ("the", "and", "for"):
-            product_words.append(w)  # Continue product phrase
-    if product_words:
-        retry = " ".join(product_words)
-        if len(retry) >= 10:
-            return retry
-    # Fallback: just take first 4-5 significant words
-    significant = [w for w in words if len(w) > 2 and w.lower() not in ("the", "for", "and", "are")]
-    return " ".join(significant[:5]) if significant else simplified
-
-
-def _message_has_priority_content(msg: Dict[str, Any]) -> bool:
-    """True if message contains tool calls, results, or other high-value context."""
-    content = msg.get("content", "") or ""
-    if isinstance(content, list):
-        content = " ".join(
-            b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"
-        )
-    return any(m in content for m in _CONTEXT_PRIORITY_MARKERS)
-
-
-def _trim_session(
-    session: List[Dict[str, Any]], max_messages: int
-) -> List[Dict[str, Any]]:
-    """
-    Trim session to max_messages, prioritizing recent messages and those with
-    tool calls/results. Keeps the most recent messages and up to ~25% slots
-    for older high-value turns.
-    """
-    if len(session) <= max_messages:
-        return session
-
-    # Always keep the most recent messages
-    recent_count = max(max_messages - 4, max_messages // 2)
-    recent = session[-recent_count:]
-    older = session[:-recent_count]
-
-    # From older, keep messages with tool content (most recent first among them)
-    priority_slots = max_messages - len(recent)
-    if priority_slots <= 0:
-        return recent
-
-    priority_in_older = [m for m in older if _message_has_priority_content(m)]
-    kept_priority = priority_in_older[-priority_slots:]  # Most recent priority msgs
-
-    return kept_priority + recent
-
-
-def _strip_json_comments(s: str) -> str:
-    """Remove // and /* */ comments from a string so json.loads accepts LLM output that includes comments."""
-    # Remove // single-line comments (but not inside strings - rough pass: only when preceded by , or { or [ or :)
-    s = re.sub(r",?\s*//[^\n]*", "", s)
-    # Remove /* */ block comments
-    s = re.sub(r"/\*[\s\S]*?\*/", "", s)
-    return s
-
-
-def _extract_balanced_brace(s: str, start: int) -> Optional[tuple[int, int]]:
-    """From index of '{', return (start, end) of matching '}' (handles nesting)."""
-    if start < 0 or start >= len(s) or s[start] != "{":
-        return None
-    depth = 0
-    i = start
-    in_string = None  # '"' or "'" when inside string
-    escape = False
-    while i < len(s):
-        c = s[i]
-        if escape:
-            escape = False
-            i += 1
-            continue
-        if c == "\\" and in_string:
-            escape = True
-            i += 1
-            continue
-        if in_string:
-            if c == in_string:
-                in_string = None
-            i += 1
-            continue
-        if c in ('"', "'"):
-            in_string = c
-            i += 1
-            continue
-        if c == "{":
-            depth += 1
-        elif c == "}":
-            depth -= 1
-            if depth == 0:
-                return (start, i + 1)
-        i += 1
-    return None
-
-
-def _extract_balanced_brace_dumb(s: str, start: int) -> Optional[tuple[int, int]]:
-    """From index of '{', return (start, end) of matching '}' by counting braces only.
-    Use when string-aware extraction fails (e.g. LLM output has \\\" breaking string tracking).
-    """
-    if start < 0 or start >= len(s) or s[start] != "{":
-        return None
-    depth = 0
-    for i in range(start, len(s)):
-        if s[i] == "{":
-            depth += 1
-        elif s[i] == "}":
-            depth -= 1
-            if depth == 0:
-                return (start, i + 1)
-    return None
-
-
-def _find_json_blocks(text: str, prefix: str) -> list[str]:
-    """Find all PREFIX = [optional ```] { ... } with balanced braces."""
-    # Allow optional code fence between = and {
-    pattern = re.compile(
-        re.escape(prefix) + r"\s*=\s*(?:```(?:json)?\s*)?\{",
-        re.IGNORECASE,
-    )
-    blocks: list[str] = []
-    for m in pattern.finditer(text):
-        brace_start = m.end() - 1
-        pair = _extract_balanced_brace(text, brace_start)
-        if pair is None:
-            pair = _extract_balanced_brace_dumb(text, brace_start)
-        if pair:
-            blocks.append(text[pair[0] : pair[1]])
-    return blocks
-
-
-def _find_schedule_task_fallback(text: str) -> list[str]:
-    """Fallback: find SCHEDULE_TASK then = then { and extract balanced block."""
-    return _find_json_blocks_fallback(text, "SCHEDULE_TASK")
-
-
-def _find_json_blocks_fallback(text: str, prefix: str) -> list[str]:
-    """Fallback: find PREFIX = then { within 400 chars and extract balanced block."""
-    blocks: list[str] = []
-    idx = 0
-    pattern = re.compile(re.escape(prefix) + r"\s*=", re.IGNORECASE)
-    while True:
-        m = pattern.search(text[idx:])
-        if not m:
-            break
-        start = idx + m.end()
-        window = text[start : start + 400]
-        brace_in_window = window.find("{")
-        if brace_in_window == -1:
-            idx = start + 1
-            continue
-        brace = start + brace_in_window
-        pair = _extract_balanced_brace_dumb(text, brace)
-        if pair:
-            blocks.append(text[pair[0] : pair[1]])
-        idx = start + 1
-    return blocks
-
-
-def _strip_code_fence(s: str) -> str:
-    """Remove leading/trailing markdown code fence lines."""
-    s = s.strip()
-    if s.startswith("```"):
-        first = s.find("\n")
-        if first != -1:
-            s = s[first + 1 :]
-        else:
-            s = s[3:].strip()
-    if s.rstrip().endswith("```"):
-        s = s[: s.rfind("```")].rstrip()
-    return s.strip()
-
-
-def _normalize_llm_json(s: str) -> str:
-    """Fix common LLM JSON: backslashes before quotes, smart quotes, code fences."""
-    s = _strip_code_fence(s)
-    s = _strip_json_comments(s)
-    # Smart/curly quotes -> straight
-    s = s.replace("\u201c", '"').replace("\u201d", '"')
-    s = s.replace("\u2018", "'").replace("\u2019", "'")
-    # Key start: after { or , optional space then backslash(s) then " -> "
-    s = re.sub(r'([{,]\s*)\\+"', r'\1"', s)
-    s = re.sub(r'\\+":', '":', s)
-    s = re.sub(r'\\+",', '",', s)
-    s = re.sub(r'{\\+"', '{"', s)
-    s = re.sub(r'\\+"}', '"}', s)
-    s = re.sub(r'\\+"\s*}', '" }', s)
-    s = re.sub(r':\s*\\+"', ': "', s)
-    # Trailing comma before } or ] (invalid in JSON but common in LLM output)
-    s = re.sub(r',\s*}', '}', s)
-    s = re.sub(r',\s*]', ']', s)
-    return s
 
 
 # Browser automation - create fresh instance per request to avoid event loop issues
@@ -299,8 +71,18 @@ class AgentCore:
         )
         self.sessions: Dict[str, List[Dict[str, str]]] = {}
         self.scheduler = CronScheduler()
+        self.workspace_manager: Optional["WorkspaceManager"] = None
+        self.workspace_id: str = ""
+        self.workspace_config: Optional[WorkspaceConfig] = None
         self.scheduled_tasks_db: Dict[str, Dict] = {}  # Store task metadata
+        self._file_watcher = None
         self._load_scheduled_tasks()
+        if self.workspace_config and (
+            self.workspace_config.proactive_habits
+            or getattr(self.workspace_config, "proactive_screen", False)
+            or getattr(self.workspace_config, "proactive_file_triggers", False)
+        ):
+            asyncio.create_task(self._init_proactive_tasks())
 
     async def process_message(
         self,
@@ -322,9 +104,30 @@ class AgentCore:
             matching = get_matching_triggers("message", ctx)
             if matching:
                 await execute_trigger_actions(matching, ctx)
-        except Exception:
-            pass  # Don't block chat on trigger errors
-
+        except Exception as e:
+            logger.warning("Trigger execution failed (message=%r): %s", message[:50], e)
+        
+        # Check for inter-agent @mentions (e.g. @coding analyze this code or @research find X)
+        if self.workspace_manager and self.workspace_config and self.workspace_config.enable_inter_agent:
+            # Match @target optional_colon message (until next \n@ or end)
+            mentions = list(re.finditer(r"@([a-zA-Z0-9_]+)\s*:?\s*(.*?)(?=\n\s*@|\Z)", message, re.DOTALL))
+            forwarded_any = False
+            for match in mentions:
+                target_name = match.group(1)
+                forward_msg = match.group(2).strip()
+                if forward_msg:
+                    result = await self.workspace_manager.send_message_to_workspace(
+                        self.workspace_id, target_name, forward_msg
+                    )
+                    preview = (forward_msg[:50] + "…") if len(forward_msg) > 50 else forward_msg
+                    yield f"✅ Delegated to @{target_name}: {preview}\n"
+                    if result and not result.startswith("Target ") and not result.startswith("Error:"):
+                        yield f"@{target_name} replied: {result[:300]}{'…' if len(result) > 300 else ''}\n"
+                    forwarded_any = True
+            if forwarded_any:
+                yield "Swarm delegations done.\n"
+                return
+        
         # Transcribe audio if provided
         if audio_path or audio_base64:
             loop = asyncio.get_event_loop()
@@ -386,6 +189,14 @@ class AgentCore:
 
         # Build system prompt
         system_content = self.settings.system_prompt + """
+
+## ABOUT GRIZZYCLAW
+
+When users ask about GrizzyClaw's URLs or how to access it:
+- Web Chat (when daemon runs): http://localhost:18788/chat
+- Control UI: http://localhost:18788/control
+- WebSocket Gateway: ws://127.0.0.1:18789
+GrizzyClaw runs on HTTP by default (no built-in HTTPS). For HTTPS, use a reverse proxy or tunnel.
 
 ## VISION
 
@@ -475,6 +286,15 @@ Examples:
         # MCP & skills: always add when we have servers or skills (not tied to rules_file)
         skills_str = ", ".join(self.settings.enabled_skills) if self.settings.enabled_skills else "none"
         mcp_file = Path(self.settings.mcp_servers_file).expanduser()
+        
+        # Build skill list for prompt
+        skill_examples = ""
+        if self.settings.enabled_skills:
+            from grizzyclaw.skills.registry import get_skill
+            for s_id in self.settings.enabled_skills:
+                skill = get_skill(s_id)
+                if skill:
+                    skill_examples += f"- {skill.name}: {skill.description}\\n"
         mcp_list = []
         discovered_tools_map: Dict[str, List[Tuple[str, str]]] = {}
         if mcp_file.exists():
@@ -491,11 +311,15 @@ Examples:
                         args = server_data.get("args", [])
                         arg_str = (" ".join(str(a) for a in args[:6]) + "..." if len(args) > 6 else " ".join(str(a) for a in args)) if args else ""
                         mcp_list.append(f"- {name}: {cmd} {arg_str}".strip())
-                # Dynamic tool discovery: connect to each server and list tools
+                # Dynamic tool discovery: connect to each server and list tools (timeout so chat is never blocked)
                 try:
-                    discovered_tools_map = await discover_tools(mcp_file)
+                    discovered_tools_map = await asyncio.wait_for(
+                        discover_tools(mcp_file), timeout=5.0
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning("MCP tool discovery timed out (5s); continuing without tool list")
                 except Exception as e:
-                    logger.debug(f"Tool discovery failed: {e}")
+                    logger.info("MCP tool discovery failed: %s", e)
             except Exception as e:
                 logger.warning(f"Failed to load MCP file {mcp_file}: {e}")
         mcp_str = "\n".join(mcp_list) if mcp_list else "none"
@@ -517,6 +341,20 @@ Examples:
             system_content += f"""
 
 Enabled skills: {skills_str}
+
+{skill_examples.strip() if skill_examples else ""}
+
+## BUILT-IN SKILLS
+
+Use SKILL_ACTION = {{\"skill\": \"skill_id\", \"action\": \"action_name\", \"params\": {{...}}}}
+
+Examples:
+- calendar: list_events {{}} or {{\"timeMin\": \"...\", \"maxResults\": 10}}, create_event {{\"summary\": \"Meeting\", \"start\": \"2026-02-20T10:00\", \"end\": \"11:00\", \"timezone\": \"UTC\"}}
+- gmail: send_email {{\"to\": \"...\", \"subject\": \"...\", \"body\": \"...\"}}, reply {{\"thread_id\": \"...\", \"body\": \"...\"}}, list_messages {{\"q\": \"in:inbox\", \"maxResults\": 10}}
+- github: list_prs {{\"repo\": \"owner/repo\", \"state\": \"open\"}}, list_issues {{\"repo\": \"owner/repo\"}}, create_issue {{\"repo\": \"owner/repo\", \"title\": \"Bug\", \"body\": \"...\"}}, get_pr {{\"repo\": \"owner/repo\", \"number\": 1}}
+- mcp_marketplace: discover {{}} to list ClawHub MCP servers, install {{\"name\": \"playwright-mcp\"}} to add one
+
+Configure API keys/tokens in Settings → Integrations first.
 
 MCP servers:
 
@@ -559,6 +397,7 @@ When you receive tool results in a follow-up message, use them to continue your 
         accumulated_response = ""
         accumulated_tool_displays: List[str] = []  # For session storage
         current_messages = list(messages)
+        start_time = time.perf_counter()
         search_triggers = ("search", "internet", "web", "look for", "find information", "look on", "search the")
         msg_lower = message.lower().strip()
         wants_search = any(t in msg_lower for t in search_triggers)
@@ -585,9 +424,9 @@ When you receive tool results in a follow-up message, use them to continue your 
                 accumulated_response += response_text
 
                 # Parse MCP TOOL_CALLs
-                tool_call_matches = _find_json_blocks(response_text, "TOOL_CALL")
+                tool_call_matches = find_json_blocks(response_text, "TOOL_CALL")
                 if not tool_call_matches:
-                    tool_call_matches = _find_json_blocks_fallback(response_text, "TOOL_CALL")
+                    tool_call_matches = find_json_blocks_fallback(response_text, "TOOL_CALL")
 
                 # Proactive search fallback: empty response + user wants search
                 if wants_search and not tool_call_matches and len(response_text.strip()) < 50 and iteration == 0:
@@ -605,15 +444,15 @@ When you receive tool results in a follow-up message, use them to continue your 
                             break
                     if not query or len(query) < 2:
                         query = message.strip()[:100]
-                    query = _correct_search_query(query)
-                    query = _simplify_search_query(query)
+                    query = correct_search_query(query)
+                    query = simplify_search_query(query)
                     if mcp_file.exists():
                         try:
                             tool_result = await call_mcp_tool(mcp_file, "ddg-search", "search", {"query": query})
                             # Retry with shorter query if DuckDuckGo returned no results (bot detection / over-specific)
                             no_results = "no results" in (tool_result or "").lower() or "bot detection" in (tool_result or "").lower()
                             if no_results and len(query) > 25:
-                                alt_query = _simplify_search_query_retry(query)
+                                alt_query = simplify_search_query_retry(query)
                                 if alt_query != query:
                                     tool_result = await call_mcp_tool(mcp_file, "ddg-search", "search", {"query": alt_query})
                             result_display = f"Let me search for that.\n\n**🔧 ddg-search.search**\n{tool_result}\n"
@@ -641,7 +480,7 @@ When you receive tool results in a follow-up message, use them to continue your 
                 tool_result_parts: List[str] = []
                 for match_str in tool_call_matches:
                     try:
-                        normalized = _normalize_llm_json(match_str)
+                        normalized = normalize_llm_json(match_str)
                         tool_call = None
                         try:
                             tool_call = json.loads(normalized)
@@ -658,8 +497,8 @@ When you receive tool results in a follow-up message, use them to continue your 
 
                         # Correct and simplify search queries for better DuckDuckGo results
                         if mcp_name == "ddg-search" and tool_name == "search" and "query" in args:
-                            q = _correct_search_query(str(args["query"]))
-                            args["query"] = _simplify_search_query(q)
+                            q = correct_search_query(str(args["query"]))
+                            args["query"] = simplify_search_query(q)
 
                         tool_result = await call_mcp_tool(mcp_file, mcp_name, tool_name, args)
                         # Retry with shorter query if DuckDuckGo returned no results
@@ -667,7 +506,7 @@ When you receive tool results in a follow-up message, use them to continue your 
                             args["query"] and len(args["query"]) > 25):
                             no_results = "no results" in (tool_result or "").lower() or "bot detection" in (tool_result or "").lower()
                             if no_results:
-                                alt = _simplify_search_query_retry(args["query"])
+                                alt = simplify_search_query_retry(args["query"])
                                 if alt != args["query"]:
                                     tool_result = await call_mcp_tool(mcp_file, mcp_name, tool_name, {"query": alt})
                         result_display = f"\n\n**🔧 {mcp_name}.{tool_name}**\n{tool_result}\n"
@@ -693,13 +532,57 @@ When you receive tool results in a follow-up message, use them to continue your 
             if accumulated_tool_displays:
                 response_text += "\n" + "".join(accumulated_tool_displays)
 
+            # Swarm: leader response may contain @mentions — run delegations and optionally consensus
+            specialist_replies: List[Tuple[str, str]] = []
+            if (
+                self.workspace_manager
+                and self.workspace_config
+                and self.workspace_id
+                and getattr(self.workspace_config, "swarm_role", "") == "leader"
+                and getattr(self.workspace_config, "swarm_auto_delegate", False)
+            ):
+                leader_text = accumulated_response
+                mentions = list(re.finditer(r"@([a-zA-Z0-9_]+)\s*:?\s*(.*?)(?=\n\s*@|\Z)", leader_text, re.DOTALL))
+                for match in mentions:
+                    target_name = match.group(1)
+                    forward_msg = match.group(2).strip()
+                    if not forward_msg:
+                        continue
+                    result = await self.workspace_manager.send_message_to_workspace(
+                        self.workspace_id, target_name, forward_msg
+                    )
+                    if result and not result.startswith("Target ") and not result.startswith("Error:"):
+                        specialist_replies.append((target_name, result))
+                if specialist_replies:
+                    yield "\n\n--- **Swarm delegations** ---\n"
+                    for name, reply in specialist_replies:
+                        yield f"\n**@{name}:** {reply[:400]}{'…' if len(reply) > 400 else ''}\n"
+                    if getattr(self.workspace_config, "swarm_consensus", False) and specialist_replies:
+                        synthesis_system = "You are the swarm leader. Synthesize the specialist responses below into one clear recommendation for the user. Be concise; combine the best points; do not simply repeat each response."
+                        synthesis_user = f"User asked: {message}\n\nSpecialist responses:\n" + "\n\n".join(
+                            f"[{name}]: {reply}" for name, reply in specialist_replies
+                        )
+                        messages_synthesis = [
+                            {"role": "system", "content": synthesis_system},
+                            {"role": "user", "content": synthesis_user},
+                        ]
+                        consensus_chunks: List[str] = []
+                        async for chunk in self.llm_router.generate(
+                            messages_synthesis, temperature=0.5, max_tokens=1500
+                        ):
+                            consensus_chunks.append(chunk)
+                            yield chunk
+                        consensus_text = "".join(consensus_chunks)
+                        if consensus_text.strip():
+                            response_text += "\n\n--- Swarm consensus ---\n" + consensus_text
+
             # Parse and execute MEMORY_SAVE commands (balanced braces + normalize)
-            memory_save_matches = _find_json_blocks(response_text, "MEMORY_SAVE")
+            memory_save_matches = find_json_blocks(response_text, "MEMORY_SAVE")
             if not memory_save_matches:
-                memory_save_matches = _find_json_blocks_fallback(response_text, "MEMORY_SAVE")
+                memory_save_matches = find_json_blocks_fallback(response_text, "MEMORY_SAVE")
             for match_str in memory_save_matches:
                 try:
-                    normalized = _normalize_llm_json(match_str)
+                    normalized = normalize_llm_json(match_str)
                     mem_data = None
                     try:
                         mem_data = json.loads(normalized)
@@ -724,12 +607,12 @@ When you receive tool results in a follow-up message, use them to continue your 
                     logger.warning(f"Memory save error: {e}")
 
             # Parse and execute BROWSER_ACTION commands (balanced braces + normalize like SCHEDULE_TASK)
-            browser_matches = _find_json_blocks(response_text, "BROWSER_ACTION")
+            browser_matches = find_json_blocks(response_text, "BROWSER_ACTION")
             if not browser_matches:
-                browser_matches = _find_json_blocks_fallback(response_text, "BROWSER_ACTION")
+                browser_matches = find_json_blocks_fallback(response_text, "BROWSER_ACTION")
             for match_str in browser_matches:
                 try:
-                    normalized = _normalize_llm_json(match_str)
+                    normalized = normalize_llm_json(match_str)
                     browser_cmd = None
                     try:
                         browser_cmd = json.loads(normalized)
@@ -749,12 +632,12 @@ When you receive tool results in a follow-up message, use them to continue your 
                     yield f"**❌ Browser error: {str(e)}**\n\n"
 
             # Parse and execute SCHEDULE_TASK commands
-            schedule_matches = _find_json_blocks(response_text, "SCHEDULE_TASK")
+            schedule_matches = find_json_blocks(response_text, "SCHEDULE_TASK")
             if not schedule_matches:
-                schedule_matches = _find_schedule_task_fallback(response_text)
+                schedule_matches = find_schedule_task_fallback(response_text)
             for match_str in schedule_matches:
                 try:
-                    normalized = _normalize_llm_json(match_str)
+                    normalized = normalize_llm_json(match_str)
                     schedule_cmd = None
                     try:
                         schedule_cmd = json.loads(normalized)
@@ -774,6 +657,29 @@ When you receive tool results in a follow-up message, use them to continue your 
                     logger.exception("Scheduler action error")
                     yield f"**❌ Scheduler error: {str(e)}**\n\n"
 
+            # Parse SKILL_ACTION (calendar, gmail, github, mcp_marketplace)
+            skill_matches = find_json_blocks(response_text, "SKILL_ACTION")
+            if not skill_matches:
+                skill_matches = find_json_blocks_fallback(response_text, "SKILL_ACTION")
+            for match_str in skill_matches:
+                try:
+                    normalized = normalize_llm_json(match_str)
+                    skill_cmd = None
+                    try:
+                        skill_cmd = json.loads(normalized)
+                    except json.JSONDecodeError:
+                        try:
+                            skill_cmd = ast.literal_eval(normalized)
+                        except (ValueError, SyntaxError):
+                            pass
+                    if not skill_cmd or not isinstance(skill_cmd, dict):
+                        continue
+                    result = await self._execute_skill_action(skill_cmd)
+                    yield f"\n\n**🛠️ Skill**\n{result}\n"
+                except Exception as e:
+                    logger.exception("Skill action error")
+                    yield f"**❌ Skill error: {str(e)}**\n\n"
+
             await self.memory.add(
                 user_id=user_id,
                 content=f"User: {message}\nAssistant: {response_text}",
@@ -786,8 +692,29 @@ When you receive tool results in a follow-up message, use them to continue your 
 
             # Smart context management: trim with priority for tool-heavy messages
             max_messages = getattr(self.settings, "max_session_messages", 20)
-            session = _trim_session(session, max_messages)
+            session = trim_session(session, max_messages)
             self.sessions[user_id] = session
+
+            # Update metrics
+            delta_ms = (time.perf_counter() - start_time) * 1000
+            input_chars = sum(len(str(msg.get('content', ''))) for msg in messages)
+            output_chars = len(accumulated_response)
+            est_input_tokens = input_chars // 4
+            est_output_tokens = output_chars // 4
+            if self.workspace_manager and self.workspace_id:
+                ws = self.workspace_manager.get_workspace(self.workspace_id)
+                if ws:
+                    ws.message_count += 1
+                    ws.total_response_time_ms += delta_ms
+                    ws.total_input_tokens += est_input_tokens
+                    ws.total_output_tokens += est_output_tokens
+                    self.workspace_manager.update_workspace(
+                        self.workspace_id,
+                        message_count=ws.message_count,
+                        total_response_time_ms=ws.total_response_time_ms,
+                        total_input_tokens=ws.total_input_tokens,
+                        total_output_tokens=ws.total_output_tokens,
+                    )
 
         except Exception as e:
             logger.exception("Error generating response")
@@ -803,16 +730,19 @@ When you receive tool results in a follow-up message, use them to continue your 
 
     def get_user_memory_sync(self, user_id: str) -> Dict[str, Any]:
         """Synchronous wrapper for GUI"""
-        return asyncio.run(self.get_user_memory(user_id))
+        from grizzyclaw.utils.async_runner import run_async
+        return run_async(self.get_user_memory(user_id))
 
     def list_memories_sync(self, user_id: str, limit: int = 50) -> list[dict]:
         """Synchronous list of memories as dicts for GUI"""
-        memories = asyncio.run(self.memory.retrieve(user_id, "", limit))
+        from grizzyclaw.utils.async_runner import run_async
+        memories = run_async(self.memory.retrieve(user_id, "", limit))
         return [vars(mem) for mem in memories]
 
     def delete_memory_sync(self, item_id: str) -> bool:
         """Synchronous delete"""
-        return asyncio.run(self.memory.delete(item_id))
+        from grizzyclaw.utils.async_runner import run_async
+        return run_async(self.memory.delete(item_id))
 
     async def _execute_browser_action(self, action: str, params: Dict[str, Any]) -> str:
         """Execute a browser automation action"""
@@ -986,6 +916,44 @@ When you receive tool results in a follow-up message, use them to continue your 
         else:
             return f"❌ Unknown scheduler action: {action}. Use: create, list, delete, enable, disable"
 
+    async def _execute_skill_action(self, skill_cmd: Dict[str, Any]) -> str:
+        """Execute built-in skill: calendar, gmail, github, mcp_marketplace."""
+        skill_id = (skill_cmd.get("skill") or skill_cmd.get("skill_id") or "").strip().lower()
+        action = (skill_cmd.get("action") or "").strip().lower()
+        params = skill_cmd.get("params") or skill_cmd
+        if isinstance(params, dict):
+            params = {k: v for k, v in params.items() if k not in ("skill", "skill_id", "action")}
+        else:
+            params = {}
+        loop = asyncio.get_event_loop()
+        try:
+            from grizzyclaw.skills.executors import (
+                execute_calendar,
+                execute_gmail,
+                execute_github,
+                execute_mcp_marketplace,
+            )
+            if skill_id == "calendar":
+                return await loop.run_in_executor(
+                    None, lambda: execute_calendar(action, params, self.settings)
+                )
+            if skill_id == "gmail":
+                return await loop.run_in_executor(
+                    None, lambda: execute_gmail(action, params, self.settings)
+                )
+            if skill_id == "github":
+                return await loop.run_in_executor(
+                    None, lambda: execute_github(action, params, self.settings)
+                )
+            if skill_id == "mcp_marketplace":
+                return await loop.run_in_executor(
+                    None, lambda: execute_mcp_marketplace(action, params, self.settings)
+                )
+            return f"❌ Unknown skill: {skill_id}. Use calendar, gmail, github, or mcp_marketplace."
+        except Exception as e:
+            logger.exception("Skill execution error")
+            return f"❌ Skill error: {e}"
+
     def get_scheduled_tasks(self) -> List[Dict]:
         """Get list of scheduled tasks for GUI"""
         return self.scheduler.get_stats()["tasks"]
@@ -1056,3 +1024,174 @@ When you receive tool results in a follow-up message, use them to continue your 
                 json.dump({"tasks": tasks}, f, indent=2)
         except Exception as e:
             logger.warning(f"Could not save scheduled tasks to {path}: {e}")
+
+    async def _init_proactive_tasks(self):
+        """Initialize proactive scheduled tasks."""
+        if "habit_daily" not in self.scheduler.tasks:
+            self.scheduler.schedule(
+                "habit_daily",
+                "Daily Habit Analyzer",
+                "0 9 * * *",  # Daily at 9am
+                self._habit_analyzer
+            )
+            logger.info("Scheduled daily habit analyzer")
+        if self.workspace_config.proactive_screen:
+            if "screen_analyze" not in self.scheduler.tasks:
+                self.scheduler.schedule(
+                    "screen_analyze",
+                    "Screen Context Analyzer (every 30min)",
+                    "*/30 * * * *",
+                    self._screen_analyzer
+                )
+                logger.info("Scheduled screen analyzer")
+        if getattr(self.workspace_config, "proactive_file_triggers", False):
+            try:
+                from grizzyclaw.automation.file_watcher import FileWatcher
+                from grizzyclaw.automation.triggers import get_matching_triggers, execute_trigger_actions
+                loop = asyncio.get_running_loop()
+
+                async def _on_file_or_git(ctx: dict) -> None:
+                    event = ctx.get("event", "file_change")
+                    rules = get_matching_triggers(event, ctx)
+                    if not rules:
+                        return
+                    async def _inject(msg: str) -> None:
+                        try:
+                            async for _ in self.process_message("file_trigger", msg):
+                                pass
+                        except Exception as e:
+                            logger.debug("Trigger agent message: %s", e)
+                    await execute_trigger_actions(rules, ctx, agent_callback=_inject)
+
+                self._file_watcher = FileWatcher(loop, _on_file_or_git)
+                if self._file_watcher.start():
+                    logger.info("File/Git watcher started for triggers")
+            except Exception as e:
+                logger.warning("Could not start file watcher: %s", e)
+
+    async def _habit_analyzer(self):
+        """Analyze memory patterns (memuBot-style) and auto-schedule habit-based actions."""
+        logger.info("Running habit analyzer...")
+        user_id = "proactive_user"
+        # 1) Fallback: coding-related memories → prep env
+        coding_memories = await self.memory.retrieve(user_id, "code OR git OR python OR program", limit=30)
+        if len(coding_memories) >= 8 and "prep_coding" not in self.scheduler.tasks:
+            self.scheduler.schedule(
+                "prep_coding",
+                "Prep Coding Environment (Mon-Fri)",
+                "0 8 * * 1-5",
+                self._prep_coding_handler,
+            )
+            logger.info("Detected coding habit, scheduled prep task")
+        # 2) LLM-based habit learning: recent memories → suggest schedules
+        try:
+            recent = await self.memory.retrieve(user_id, "", limit=50)
+            if len(recent) < 5:
+                return
+            lines = []
+            for m in recent[:40]:
+                ts = m.created_at.strftime("%Y-%m-%d %H:%M") if m.created_at else "?"
+                lines.append(f"- [{ts}] [{m.category or 'general'}] {m.content[:200]}")
+            summary = "\n".join(lines)
+            prompt = f"""Based on these recent memory entries, identify at most 3 recurring habits (e.g. "User codes weekdays", "User checks email mornings"). For each habit, suggest one scheduled action.
+Output only a JSON array. Each item: {{"habit": "short description", "cron": "0 H * * D" (cron: minute hour day month weekday), "message": "reminder or action text"}}
+Examples: "0 8 * * 1-5" = 8am Mon-Fri, "0 9 * * *" = 9am daily. No other text.
+
+Memories:
+{summary}"""
+            messages = [
+                {"role": "system", "content": "You output only valid JSON arrays. No markdown, no explanation."},
+                {"role": "user", "content": prompt},
+            ]
+            out_chunks = []
+            async for ch in self.llm_router.generate(messages, temperature=0.2, max_tokens=500):
+                out_chunks.append(ch)
+            raw = "".join(out_chunks).strip()
+            # Strip markdown code block if present
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+            raw = raw.strip()
+            suggestions = json.loads(raw)
+            if not isinstance(suggestions, list):
+                return
+            for i, s in enumerate(suggestions[:3]):
+                if not isinstance(s, dict) or "cron" not in s or "message" not in s:
+                    continue
+                habit = s.get("habit", "")[:80]
+                cron = str(s.get("cron", ""))[:32]
+                message = str(s.get("message", ""))[:200]
+                task_id = f"habit_learned_{hash(habit + cron) % 10**8}"
+                if task_id in self.scheduler.tasks:
+                    continue
+                try:
+                    def _make_handler(msg: str):
+                        async def _run():
+                            await self._habit_learned_handler(msg)
+                        return _run
+                    self.scheduler.schedule(
+                        task_id,
+                        habit or "Habit-based reminder",
+                        cron,
+                        _make_handler(message),
+                    )
+                    logger.info("Habit learning: scheduled %s at %s", habit, cron)
+                except Exception as e:
+                    logger.debug("Habit schedule skip: %s", e)
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            logger.debug("Habit learning parse skipped: %s", e)
+        except Exception as e:
+            logger.warning("Habit learning failed: %s", e)
+
+    async def _prep_coding_handler(self):
+        """Handler for coding prep action."""
+        logger.info("🛠️ Prepping coding environment...")
+        await self.memory.add("proactive_user", "Prepped coding env: opened projects dir.", category="tasks")
+
+    async def _habit_learned_handler(self, message: str):
+        """Handler for LLM-suggested habit reminders."""
+        logger.info("📋 Habit reminder: %s", message)
+        await self.memory.add("proactive_user", f"Habit reminder: {message}", category="reminders")
+
+    async def _screen_analyzer(self):
+        """Screen awareness: VL model on screenshot for desktop context (memuBot-style). Stores summary in memory when enabled."""
+        import os
+        import subprocess
+        import tempfile
+
+        logger.info("Running screen awareness analysis...")
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+                temp_path = f.name
+            subprocess.run(["screencapture", "-x", temp_path], check=True, capture_output=True, timeout=5)
+            message = (
+                "Analyze this screenshot of the user's desktop. Describe: which apps/windows are open, "
+                "what the user is likely working on, and 1–2 proactive suggestions (e.g. reminder to save, "
+                "suggest a break, or offer to help with the visible task). Be brief."
+            )
+            chunks = []
+            async for chunk in self.process_message("screen_analyzer", message, images=[temp_path]):
+                chunks.append(chunk)
+                logger.info("%s", chunk.strip() or "")
+            summary = "".join(chunks).strip()
+            if summary and getattr(self.workspace_config, "proactive_screen", False):
+                await self.memory.add(
+                    "proactive_user",
+                    f"Screen context: {summary[:500]}",
+                    category="notes",
+                    source="screen_analyzer",
+                )
+        except FileNotFoundError:
+            logger.debug("screencapture not found (non-macOS or no GUI)")
+        except subprocess.TimeoutExpired:
+            logger.warning("Screen capture timed out")
+        except Exception as e:
+            logger.warning("Screen analysis failed: %s", e)
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass

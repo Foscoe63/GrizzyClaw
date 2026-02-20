@@ -6,6 +6,7 @@ import logging
 import sys
 from pathlib import Path
 
+from grizzyclaw import __version__
 from grizzyclaw.daemon.manager import ServiceManager
 from grizzyclaw.daemon.ipc import IPCClient
 from grizzyclaw.daemon.service import DaemonService
@@ -132,7 +133,7 @@ def main():
     if args.command == "daemon":
         daemon_command(args)
     elif args.command == "version":
-        print("GrizzyClaw v0.1.0")
+        print(f"GrizzyClaw v{__version__}")
     else:
         # Default to GUI if no command specified
         gui_command(args)

@@ -3,18 +3,22 @@
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import json
 import re
 
 logger = logging.getLogger(__name__)
 
+# Supported events: "message", "webhook", "schedule", "file_change", "git_event"
+FILE_CHANGE_EVENT = "file_change"
+GIT_EVENT = "git_event"
+
 
 @dataclass
 class TriggerCondition:
     """Condition for when a trigger fires."""
-    type: str  # "contains", "matches", "equals", "cron"
+    type: str  # "contains", "matches", "equals", "cron", "path_matches" (for file_change/git_event)
     value: Any  # pattern, regex, or cron expr
 
 
@@ -100,16 +104,24 @@ def evaluate_condition(condition: TriggerCondition, context: Dict[str, Any]) -> 
     """Check if condition matches context."""
     if not condition:
         return True
-    text = str(context.get("message", context.get("text", "")))
     value = condition.value
+    if condition.type == "path_matches":
+        path = str(context.get("path", context.get("file_path", "")))
+        try:
+            return bool(re.search(value, path))
+        except re.error:
+            return False
     if condition.type == "contains":
+        text = str(context.get("message", context.get("text", "")))
         return value.lower() in text.lower()
     if condition.type == "matches":
+        text = str(context.get("message", context.get("text", "")))
         try:
             return bool(re.search(value, text, re.IGNORECASE))
         except re.error:
             return False
     if condition.type == "equals":
+        text = str(context.get("message", context.get("text", "")))
         return text.strip().lower() == str(value).strip().lower()
     return False
 
@@ -133,8 +145,9 @@ def get_matching_triggers(
 async def execute_trigger_actions(
     rules: List[TriggerRule],
     context: Dict[str, Any],
+    agent_callback: Optional[Callable[[str], Awaitable[None]]] = None,
 ) -> None:
-    """Execute actions for matching triggers (e.g. fire webhooks). Non-blocking."""
+    """Execute actions for matching triggers (webhooks, notify, or send message to agent)."""
     import asyncio
 
     for rule in rules:
@@ -144,8 +157,27 @@ async def execute_trigger_actions(
                 asyncio.create_task(_fire_webhook(url, context))
         elif rule.action.type == "notify":
             logger.info(
-                f"Trigger '{rule.name}' matched: {context.get('message', '')[:50]}..."
+                "Trigger '%s' matched: %s",
+                rule.name,
+                (context.get("message") or context.get("path") or "")[:50],
             )
+        elif rule.action.type == "agent_message" and agent_callback:
+            template = rule.action.config.get("message_template") or "Event: {event}. Path: {path}."
+            try:
+                message = template.format(**context)
+            except KeyError:
+                message = template + " " + str(context)
+            asyncio.create_task(_run_agent_callback(agent_callback, message))
+
+
+async def _run_agent_callback(
+    agent_callback: Callable[[str], Awaitable[None]], message: str
+) -> None:
+    """Run agent callback (e.g. inject message into agent)."""
+    try:
+        await agent_callback(message)
+    except Exception as e:
+        logger.warning("Agent trigger callback failed: %s", e)
 
 
 async def _fire_webhook(url: str, context: Dict[str, Any]) -> None:
@@ -157,6 +189,9 @@ async def _fire_webhook(url: str, context: Dict[str, Any]) -> None:
             "message": context.get("message", ""),
             "session_id": context.get("session_id", "default"),
             "user_id": context.get("user_id", ""),
+            "path": context.get("path", ""),
+            "event": context.get("event", ""),
+            "change_type": context.get("change_type", ""),
         }
         async with aiohttp.ClientSession() as session:
             async with session.post(

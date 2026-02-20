@@ -1,7 +1,11 @@
+import logging
+
 import aiohttp
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 from . import LLMProvider, LLMError, LLMProviderNotAvailable
+
+logger = logging.getLogger(__name__)
 
 
 def _parse_data_url(data_url: str) -> Optional[str]:
@@ -102,7 +106,8 @@ class OllamaProvider(LLMProvider):
             async with aiohttp.ClientSession() as session:
                 async with session.get(f"{self.base_url}/api/tags") as response:
                     return response.status == 200
-        except:
+        except Exception as e:
+            logger.debug("Ollama health check failed: %s", e)
             return False
 
     async def list_models(self) -> List[Dict[str, Any]]:
@@ -114,7 +119,8 @@ class OllamaProvider(LLMProvider):
                         {"id": m["name"], "name": m["name"]}
                         for m in data.get("models", [])
                     ]
-        except:
+        except Exception as e:
+            logger.debug("Ollama list_models failed: %s", e)
             return []
 
     async def pull_model(self, model: str) -> bool:
@@ -125,5 +131,6 @@ class OllamaProvider(LLMProvider):
             async with aiohttp.ClientSession() as session:
                 async with session.post(url, json=payload) as response:
                     return response.status == 200
-        except:
+        except Exception as e:
+            logger.debug("Ollama pull_model failed: %s", e)
             return False

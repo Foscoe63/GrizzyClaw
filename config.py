@@ -82,6 +82,13 @@ class Settings(BaseSettings):
         default=None, alias="GMAIL_PUBSUB_AUDIENCE"
     )  # Push endpoint URL for JWT verification (e.g. https://your-host/gmail)
 
+    # Google APIs (Calendar, Gmail)
+    google_client_id: Optional[str] = Field(default=None, alias="GOOGLE_CLIENT_ID")
+    google_client_secret: Optional[str] = Field(default=None, alias="GOOGLE_CLIENT_SECRET")
+
+    # GitHub
+    github_token: Optional[str] = Field(default=None, alias="GITHUB_TOKEN")
+
     # Prompts & Rules
     system_prompt: str = Field(default="You are GrizzyClaw, a helpful AI assistant with memory. You can remember previous conversations and use that context to help the user.", alias="SYSTEM_PROMPT")
     rules_file: Optional[str] = Field(default=None, alias="RULES_FILE")
@@ -90,6 +97,7 @@ class Settings(BaseSettings):
     hf_token: Optional[str] = Field(default=None, alias="HF_TOKEN")
     enabled_skills: list[str] = Field(default_factory=list, alias="ENABLED_SKILLS")
     mcp_servers_file: str = Field(default="~/.grizzyclaw/grizzyclaw.json", alias="MCP_SERVERS_FILE")
+    mcp_marketplace_url: Optional[str] = Field(default=None, alias="MCP_MARKETPLACE_URL")
 
     # Security
     jwt_secret: str = Field(default="your-jwt-secret", alias="JWT_SECRET")

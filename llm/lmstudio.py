@@ -1,7 +1,11 @@
+import logging
+
 import aiohttp
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 from . import LLMProvider, LLMError, LLMProviderNotAvailable
+
+logger = logging.getLogger(__name__)
 
 
 def _normalize_lmstudio_url(url: str) -> str:
@@ -79,7 +83,8 @@ class LMStudioProvider(LLMProvider):
             async with aiohttp.ClientSession() as session:
                 async with session.get(f"{self.base_url}/models") as response:
                     return response.status == 200
-        except:
+        except Exception as e:
+            logger.debug("LM Studio health check failed: %s", e)
             return False
 
     async def list_models(self) -> List[Dict[str, Any]]:
@@ -91,5 +96,6 @@ class LMStudioProvider(LLMProvider):
                         {"id": m["id"], "name": m.get("id", m["id"])}
                         for m in data.get("data", [])
                     ]
-        except:
+        except Exception as e:
+            logger.debug("LM Studio list_models failed: %s", e)
             return []

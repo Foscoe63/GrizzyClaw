@@ -43,6 +43,15 @@ class WorkspaceConfig:
     safety_policy: Optional[Dict[str, Any]] = None  # SafetyPolicy as dict
     safety_content_filter: bool = True
     safety_pii_redact_logs: bool = True
+    enable_inter_agent: bool = False
+    inter_agent_channel: Optional[str] = None  # Optional channel; only workspaces on same channel can message each other
+    proactive_habits: bool = False
+    proactive_screen: bool = False
+    proactive_file_triggers: bool = False  # Trigger on file changes / Git events (see triggers.json)
+    use_shared_memory: bool = False
+    swarm_role: str = "none"
+    swarm_auto_delegate: bool = False  # Leader: parse response for @mentions and run delegations
+    swarm_consensus: bool = False      # Leader: after delegations, synthesize specialist replies into one
 
     # Channels (which channels this workspace responds to)
     telegram_enabled: bool = False
@@ -66,7 +75,9 @@ class Workspace:
     description: str = ""
     icon: str = "🤖"
     color: str = "#007AFF"
-    
+    order: int = field(default=0)
+    avatar_path: Optional[str] = None  # Custom or VL-generated avatar image path/URL
+
     config: WorkspaceConfig = field(default_factory=WorkspaceConfig)
     
     # Metadata
@@ -74,12 +85,30 @@ class Workspace:
     updated_at: datetime = field(default_factory=datetime.now)
     is_active: bool = True
     is_default: bool = False
-    
-    # Runtime state (not persisted)
-    agent: Any = field(default=None, repr=False)
     session_count: int = 0
     message_count: int = 0
-    
+    total_response_time_ms: float = 0.0
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    feedback_up: int = 0
+    feedback_down: int = 0
+
+    # Runtime state (not persisted)
+    agent: Any = field(default=None, repr=False)
+
+    @property
+    def avg_response_time_ms(self) -> float:
+        return self.total_response_time_ms / self.message_count if self.message_count > 0 else 0.0
+
+    @property
+    def total_tokens(self) -> int:
+        return self.total_input_tokens + self.total_output_tokens
+
+    @property
+    def quality_score(self) -> float:
+        total_feedback = self.feedback_up + self.feedback_down
+        return (self.feedback_up / total_feedback * 100) if total_feedback > 0 else 0.0
+
     def __post_init__(self):
         if isinstance(self.config, dict):
             self.config = WorkspaceConfig.from_dict(self.config)
@@ -96,20 +125,33 @@ class Workspace:
             "description": self.description,
             "icon": self.icon,
             "color": self.color,
-            "config": self.config.to_dict(),
+            "order": self.order,
+            "avatar_path": self.avatar_path,
+            "config": self.config.to_dict(), 
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
             "is_active": self.is_active,
             "is_default": self.is_default,
+            "session_count": self.session_count,
+            "message_count": self.message_count,
+            "total_response_time_ms": self.total_response_time_ms,
+            "total_input_tokens": self.total_input_tokens,
+            "total_output_tokens": self.total_output_tokens,
+            "feedback_up": self.feedback_up,
+            "feedback_down": self.feedback_down,
         }
     
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "Workspace":
         """Create from dictionary"""
-        return cls(**data)
+        data = dict(data)
+        data.setdefault("avatar_path", None)
+        return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
     
     def get_memory_db_path(self) -> str:
         """Get the memory database path for this workspace"""
+        if self.config.use_shared_memory:
+            return "shared_inter_agent.db"
         if self.config.memory_file:
             return self.config.memory_file
         # Default: separate DB per workspace
@@ -131,7 +173,13 @@ WORKSPACE_TEMPLATES = {
         icon="🤖",
         color="#007AFF",
         config=WorkspaceConfig(
-            system_prompt="You are GrizzyClaw, a helpful AI assistant with memory. You can remember previous conversations and use that context to help the user."
+            system_prompt="You are GrizzyClaw, a helpful AI assistant with memory. You can remember previous conversations and use that context to help the user.\n\n## SWARM LEADER\nBreak complex tasks into subtasks. Delegate by writing lines like:\n@research Research X.\n@coding Code Y.\n@personal Plan Z.\nUse workspace slugs: @research, @coding, @personal, @writing, or @code_assistant etc. Your delegations are executed automatically; specialist replies are then synthesized into one answer when consensus is on. Use shared memory to recall context.",
+            enable_inter_agent=True,
+            use_shared_memory=True,
+            swarm_role="leader",
+            swarm_auto_delegate=True,
+            swarm_consensus=True,
+            proactive_habits=True
         )
     ),
     "coding": Workspace(
@@ -140,9 +188,13 @@ WORKSPACE_TEMPLATES = {
         icon="💻",
         color="#34C759",
         config=WorkspaceConfig(
-            system_prompt="You are a senior software engineer assistant. Help with coding, debugging, code review, and software architecture. Be precise and provide working code examples.",
+            system_prompt="You are a senior software engineer assistant. Help with coding, debugging, code review, and software architecture. Be precise and provide working code examples.\n\n## SPECIALIST_CODING\nFocus on coding tasks. Respond concisely. If needed, @leader with summary.",
             temperature=0.3,
             max_tokens=4000,
+            enable_inter_agent=True,
+            use_shared_memory=True,
+            swarm_role="specialist_coding",
+            proactive_habits=False
         )
     ),
     "writing": Workspace(
@@ -151,8 +203,12 @@ WORKSPACE_TEMPLATES = {
         icon="✍️",
         color="#FF9500",
         config=WorkspaceConfig(
-            system_prompt="You are a professional writing assistant. Help with creative writing, editing, proofreading, and content creation. Be articulate and suggest improvements.",
+            system_prompt="You are a professional writing assistant. Help with creative writing, editing, proofreading, and content creation. Be articulate and suggest improvements.\n\n## SPECIALIST_WRITING\nFocus on writing tasks. Respond concisely. If needed, @leader with summary.",
             temperature=0.8,
+            enable_inter_agent=True,
+            use_shared_memory=True,
+            swarm_role="specialist_writing",
+            proactive_habits=False
         )
     ),
     "research": Workspace(
@@ -161,9 +217,13 @@ WORKSPACE_TEMPLATES = {
         icon="🔬",
         color="#5856D6",
         config=WorkspaceConfig(
-            system_prompt="You are a research assistant. Help gather information, summarize findings, analyze data, and provide well-sourced insights. Be thorough and cite sources when possible.",
+            system_prompt="You are a research assistant. Help gather information, summarize findings, analyze data, and provide well-sourced insights. Be thorough and cite sources when possible.\n\n## SPECIALIST_RESEARCH\nFocus on research tasks. Respond concisely. If needed, @leader with summary.",
             temperature=0.5,
             enabled_skills=["web_search"],
+            enable_inter_agent=True,
+            use_shared_memory=True,
+            swarm_role="specialist_research",
+            proactive_habits=False
         )
     ),
     "personal": Workspace(
@@ -172,8 +232,12 @@ WORKSPACE_TEMPLATES = {
         icon="📋",
         color="#FF2D55",
         config=WorkspaceConfig(
-            system_prompt="You are a personal assistant. Help with scheduling, reminders, task management, and daily planning. Be organized and proactive.",
+            system_prompt="You are a personal assistant. Help with scheduling, reminders, task management, and daily planning. Be organized and proactive.\n\n## SPECIALIST_PERSONAL\nFocus on personal tasks. Respond concisely. If needed, @leader with summary.",
             enabled_skills=["scheduler"],
+            enable_inter_agent=True,
+            use_shared_memory=True,
+            swarm_role="specialist_personal",
+            proactive_habits=True
         )
     ),
 }

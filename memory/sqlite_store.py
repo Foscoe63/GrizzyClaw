@@ -4,7 +4,7 @@ import os
 import sqlite3
 import struct
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -29,7 +29,8 @@ class SQLiteMemoryStore(MemoryStore):
         use_semantic: bool = True,
     ):
         # Use absolute path in user's home directory for app data
-        if not os.path.isabs(db_path):
+        # Special case: :memory: for in-memory DB (e.g. tests)
+        if db_path != ":memory:" and not os.path.isabs(db_path):
             app_data_dir = Path.home() / ".grizzyclaw"
             app_data_dir.mkdir(exist_ok=True)
             db_path = str(app_data_dir / db_path)
@@ -103,7 +104,7 @@ class SQLiteMemoryStore(MemoryStore):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> MemoryItem:
         item_id = str(uuid.uuid4())
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
 
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(
@@ -248,11 +249,17 @@ class SQLiteMemoryStore(MemoryStore):
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             if query.strip():
-                pattern = f"%{query}%"
+                # Escape LIKE special chars (% _ \) to prevent unintended wildcard matching
+                escaped = (
+                    query.replace("\\", "\\\\")
+                    .replace("%", "\\%")
+                    .replace("_", "\\_")
+                )
+                pattern = f"%{escaped}%"
                 rows = conn.execute(
                     """
                     SELECT * FROM memory_items
-                    WHERE user_id = ? AND content LIKE ?
+                    WHERE user_id = ? AND content LIKE ? ESCAPE '\\'
                     ORDER BY created_at DESC
                     LIMIT ?
                     """,
@@ -286,25 +293,26 @@ class SQLiteMemoryStore(MemoryStore):
         ]
 
     async def get_categories(self, user_id: str) -> List[MemoryCategory]:
+        """Derive categories from memory_items (category column)."""
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
 
             rows = conn.execute(
                 """
-                SELECT c.*, COUNT(i.id) as item_count
-                FROM memory_categories c
-                LEFT JOIN memory_items i ON c.id = i.category
-                WHERE c.user_id = ?
-                GROUP BY c.id
+                SELECT COALESCE(category, 'general') as category, COUNT(*) as item_count
+                FROM memory_items
+                WHERE user_id = ?
+                GROUP BY category
+                ORDER BY item_count DESC
                 """,
                 (user_id,),
             ).fetchall()
 
         return [
             MemoryCategory(
-                id=row["id"],
-                name=row["name"],
-                description=row["description"],
+                id=row["category"],
+                name=row["category"],
+                description=None,
                 item_count=row["item_count"],
             )
             for row in rows

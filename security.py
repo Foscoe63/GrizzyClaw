@@ -4,7 +4,7 @@ import base64
 import hashlib
 import hmac
 import secrets
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from cryptography.fernet import Fernet
 from jose import jwt, JWTError
@@ -49,9 +49,9 @@ class SecurityManager:
         to_encode = data.copy()
 
         if expires_delta:
-            expire = datetime.utcnow() + expires_delta
+            expire = datetime.now(timezone.utc) + expires_delta
         else:
-            expire = datetime.utcnow() + timedelta(hours=24)
+            expire = datetime.now(timezone.utc) + timedelta(hours=24)
 
         to_encode.update({"exp": expire})
         return jwt.encode(to_encode, self.secret_key, algorithm="HS256")
@@ -91,7 +91,7 @@ class RateLimiter:
 
     def is_allowed(self, key: str) -> bool:
         """Check if request is allowed under rate limit"""
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
 
         if key not in self._requests:
             self._requests[key] = []

@@ -237,7 +237,8 @@ class SchedulerDialog(QDialog):
                     },
                 )
 
-            result = asyncio.run(create())
+            from grizzyclaw.utils.async_runner import run_async
+            result = run_async(create())
 
             if "✅" in result:
                 QMessageBox.information(self, "Task Created", result)
@@ -275,7 +276,8 @@ class SchedulerDialog(QDialog):
                         "gui_user", {"action": "delete", "task_id": task_id}
                     )
 
-                result = asyncio.run(delete())
+                from grizzyclaw.utils.async_runner import run_async
+                result = run_async(delete())
 
                 if "✅" in result:
                     QMessageBox.information(self, "Deleted", result)

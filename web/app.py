@@ -6,6 +6,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depe
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
 
+from grizzyclaw import __version__
 from grizzyclaw.config import Settings
 from grizzyclaw.agent.core import AgentCore
 from grizzyclaw.security import SecurityManager, RateLimiter
@@ -159,7 +160,7 @@ HTML_TEMPLATE = """
 
 
 def create_app(settings: Settings) -> FastAPI:
-    app = FastAPI(title="GrizzyClaw", version="0.1.0")
+        app = FastAPI(title="GrizzyClaw", version=__version__)
     agent = AgentCore(settings)
     security = SecurityManager(settings.secret_key)
     rate_limiter = RateLimiter(settings.rate_limit_requests, settings.rate_limit_window)

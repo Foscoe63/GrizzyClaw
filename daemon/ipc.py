@@ -168,5 +168,6 @@ class IPCClient:
             sock.connect(self.socket_path)
             sock.close()
             return True
-        except:
+        except Exception as e:
+            logger.debug("IPC connection check failed: %s", e)
             return False

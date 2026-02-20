@@ -87,8 +87,8 @@ class WhatsAppChannel(Channel):
         if self.client:
             try:
                 await self.client.logout()
-            except:
-                pass
+            except Exception as e:
+                logger.debug("WhatsApp logout failed: %s", e)
 
         self.status = ChannelStatus.DISCONNECTED
         await self.emit("disconnected")

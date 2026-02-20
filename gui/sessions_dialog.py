@@ -9,15 +9,16 @@ from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QDialog,
-    QVBoxLayout,
     QHBoxLayout,
     QLabel,
     QListWidget,
     QListWidgetItem,
-    QPushButton,
-    QTextEdit,
     QMessageBox,
+    QPushButton,
     QSplitter,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
 )
 
 logger = logging.getLogger(__name__)
@@ -108,27 +109,31 @@ class SessionsDialog(QDialog):
             import websockets
         except ImportError:
             QMessageBox.warning(self, "Error", "websockets package required for sessions.")
+            self.session_list.clear()
+            self.session_list.addItem(QListWidgetItem("websockets package required for sessions."))
             return
-        asyncio.run(self._fetch_sessions())
+        from grizzyclaw.utils.async_runner import run_async
+        sessions = run_async(self._fetch_sessions())
+        self.session_list.clear()
+        if sessions is None:
+            self.session_list.addItem(QListWidgetItem("(Daemon not running or unreachable)"))
+        else:
+            self._populate_sessions(sessions)
 
     async def _fetch_sessions(self):
         try:
-            import websockets
             async with websockets.connect(GATEWAY_WS, close_timeout=5) as ws:
                 await ws.send(json.dumps({"type": "get_sessions"}))
                 for _ in range(5):
                     msg = await asyncio.wait_for(ws.recv(), timeout=5)
                     data = json.loads(msg)
                     if data.get("type") == "sessions":
-                        self._populate_sessions(data.get("sessions", []))
-                        return
+                        return data.get("sessions", [])
                     if data.get("type") == "error":
-                        break
-                self.session_list.clear()
-        except Exception as e:
-            logger.debug(f"Could not fetch sessions: {e}")
-            self.session_list.clear()
-            self.session_list.addItem(QListWidgetItem("(Daemon not running or unreachable)"))
+                        return None
+                return []
+        except Exception:
+            return None
 
     def _populate_sessions(self, sessions: list):
         self.session_list.clear()
@@ -145,7 +150,9 @@ class SessionsDialog(QDialog):
             return
         sid = current.data(Qt.ItemDataRole.UserRole)
         if sid:
-            asyncio.run(self._fetch_history(sid))
+            from grizzyclaw.utils.async_runner import run_async
+            history_text = run_async(self._fetch_history(sid))
+            self.history_text.setText(history_text)
 
     async def _fetch_history(self, session_id: str):
         try:
@@ -162,14 +169,12 @@ class SessionsDialog(QDialog):
                             role = h.get("role", "?")
                             content = (h.get("content", "") or "")[:500]
                             lines.append(f"{role}: {content}")
-                        self.history_text.setText("\n\n".join(lines) if lines else "No history")
-                        return
+                        return "\n\n".join(lines) if lines else "No history"
                     if data.get("type") == "error":
-                        self.history_text.setText(data.get("error", "Error"))
-                        return
-                self.history_text.setText("No response")
-        except Exception as e:
-            self.history_text.setText(f"Error: {e}")
+                        return data.get("error", "Error")
+                return "No response"
+        except Exception:
+            return "Error: Could not connect to daemon"
 
     def _send_message(self):
         current = self.session_list.currentItem()
@@ -181,7 +186,8 @@ class SessionsDialog(QDialog):
         if not msg:
             return
         try:
-            asyncio.run(self._do_send(sid, msg))
+            from grizzyclaw.utils.async_runner import run_async
+            run_async(self._do_send(sid, msg))
             self.message_input.clear()
             self._on_session_selected()
         except Exception as e:

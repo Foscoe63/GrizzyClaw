@@ -43,7 +43,8 @@ class BrowserWorker(QThread):
             async def execute():
                 return await self.agent._execute_browser_action(self.action, self.params)
             
-            result = asyncio.run(execute())
+            from grizzyclaw.utils.async_runner import run_async
+            result = run_async(execute())
             self.result_ready.emit(self.action, str(result))
         except Exception as e:
             self.error_occurred.emit(self.action, str(e))

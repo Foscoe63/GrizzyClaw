@@ -1,3 +1,5 @@
+import logging
+
 import aiohttp
 from typing import Any, AsyncIterator, Dict, List, Optional
 
@@ -8,6 +10,8 @@ from . import (
     LLMAuthenticationError,
     LLMRateLimitError,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class OpenAIProvider(LLMProvider):
@@ -73,7 +77,8 @@ class OpenAIProvider(LLMProvider):
                     headers={"Authorization": f"Bearer {self.api_key}"},
                 ) as response:
                     return response.status == 200
-        except:
+        except Exception as e:
+            logger.debug("OpenAI health check failed: %s", e)
             return False
 
     async def list_models(self) -> List[Dict[str, Any]]:
@@ -88,5 +93,6 @@ class OpenAIProvider(LLMProvider):
                         {"id": m["id"], "name": m.get("name", m["id"])}
                         for m in data.get("data", [])
                     ]
-        except:
+        except Exception as e:
+            logger.debug("OpenAI list_models failed: %s", e)
             return []

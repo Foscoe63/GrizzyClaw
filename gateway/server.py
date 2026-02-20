@@ -9,6 +9,7 @@ from pathlib import Path
 import websockets
 from websockets.server import WebSocketServerProtocol
 
+from grizzyclaw import __version__
 from grizzyclaw.config import Settings
 from grizzyclaw.security import RateLimiter
 from .session import SessionManager
@@ -132,7 +133,7 @@ class GatewayServer:
             await self._send_to_client(websocket, {
                 "type": "welcome",
                 "message": "Connected to GrizzyClaw Gateway",
-                "version": "0.1.0"
+                "version": __version__
             })
             await self._emit_client_connected(websocket)
 
@@ -347,6 +348,11 @@ class GatewayServer:
             response_text = ""
             async for chunk in self.agent.process_message(user_id, message):
                 response_text += chunk
+                await self._send_to_client(websocket, {
+                    "type": "chat_chunk",
+                    "session_id": session_id,
+                    "chunk": chunk,
+                })
             self.session_manager.record_message(session_id, "assistant", response_text)
             await self.event_bus.emit(Event(
                 type="message_sent",
@@ -439,10 +445,20 @@ class GatewayServer:
                     response_text = ""
                     async for chunk in process_fn(session_id, user_id, message):
                         response_text += chunk
+                        await self._broadcast_to_session(session_id, {
+                            "type": "chat_chunk",
+                            "session_id": session_id,
+                            "chunk": chunk,
+                        })
                 else:
                     response_text = ""
                     async for chunk in self.agent.process_message(user_id, message):
                         response_text += chunk
+                        await self._broadcast_to_session(session_id, {
+                            "type": "chat_chunk",
+                            "session_id": session_id,
+                            "chunk": chunk,
+                        })
                 session = self.session_manager.get_or_create(session_id, user_id)
                 self.session_manager.record_message(session_id, "assistant", response_text)
                 await self.event_bus.emit(Event(

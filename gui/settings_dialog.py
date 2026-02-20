@@ -864,7 +864,7 @@ class SkillsTab(SettingsTab):
         skills_card = self._create_card("⚡ ClawHub - Skills Registry", "Discover and install AI capabilities from the built-in registry")
         skills_layout = skills_card.layout()
 
-        skills_hint = QLabel("Skills: web_search, filesystem, documentation, browser, memory, scheduler")
+        skills_hint = QLabel("Skills: web_search, filesystem, documentation, browser, memory, scheduler, calendar, gmail, github, mcp_marketplace")
         skills_hint.setStyleSheet(f"color: {self.secondary_text}; font-size: 12px;")
         skills_layout.addWidget(skills_hint)
 
@@ -892,6 +892,18 @@ class SkillsTab(SettingsTab):
         # ===== MCP Servers Section =====
         mcp_card = self._create_card("🔌 MCP Servers", "Model Context Protocol servers for extended tools")
         mcp_layout = mcp_card.layout()
+        
+        mcp_marketplace_row = QHBoxLayout()
+        mcp_marketplace_row.addWidget(QLabel("MCP Marketplace URL:"))
+        self.mcp_marketplace_url = QLineEdit(getattr(self.settings, "mcp_marketplace_url", None) or "")
+        self.mcp_marketplace_url.setPlaceholderText("Optional: JSON URL to auto-discover ClawHub MCP servers")
+        self.mcp_marketplace_url.setStyleSheet(self._input_style())
+        self.mcp_marketplace_url.setFixedHeight(32)
+        mcp_marketplace_row.addWidget(self.mcp_marketplace_url)
+        mcp_layout.addLayout(mcp_marketplace_row)
+        mcp_marketplace_hint = QLabel("Leave empty to use built-in list. In chat, use skill mcp_marketplace → discover / install.")
+        mcp_marketplace_hint.setStyleSheet(f"color: {self.secondary_text}; font-size: 11px;")
+        mcp_layout.addWidget(mcp_marketplace_hint)
         
         # Server list with better styling
         self.mcp_servers_tree = QTreeWidget()
@@ -1146,10 +1158,22 @@ Names: {names_str}"""
         QMessageBox.information(self, "Test MCP", msg)
     
     def add_skill(self):
+        _prompt = (
+            "Enter a skill id to enable (e.g. web_search, calendar, gmail, filesystem, memory, "
+            "scheduler, browser, documentation, github, mcp_marketplace):"
+        )
         try:
             from grizzyclaw.skills.registry import get_available_skills
             skills = get_available_skills()
             items = [f"{s.icon} {s.name} ({s.id})" for s in skills]
+            if not items:
+                skill, ok = QInputDialog.getText(self, "Add Skill", _prompt)
+                if ok and skill.strip():
+                    sid = skill.strip()
+                    if sid not in [self.skills_list.item(i).text() for i in range(self.skills_list.count())]:
+                        self.skills_list.addItem(sid)
+                        QMessageBox.information(self, "Add Skill", f"Added \"{sid}\". The skill is now enabled. Some skills need API keys or other setup in Settings → Integrations.")
+                return
             skill_id, ok = QInputDialog.getItem(
                 self, "Add Skill", "Select a skill from the ecosystem:",
                 items, 0, False
@@ -1159,10 +1183,15 @@ Names: {names_str}"""
                 sid = skill_id.split("(")[-1].rstrip(")")
                 if sid and sid not in [self.skills_list.item(i).text() for i in range(self.skills_list.count())]:
                     self.skills_list.addItem(sid)
-        except ImportError:
-            skill, ok = QInputDialog.getText(self, "Add Skill", "Enter skill name:")
+                    QMessageBox.information(self, "Add Skill", f"Added \"{sid}\". The skill is now enabled. Some skills (e.g. calendar, gmail) need credentials in Settings → Integrations.")
+        except Exception:
+            # Fallback on any error (ImportError, empty list, Qt issues)
+            skill, ok = QInputDialog.getText(self, "Add Skill", _prompt)
             if ok and skill.strip():
-                self.skills_list.addItem(skill.strip())
+                sid = skill.strip()
+                if sid not in [self.skills_list.item(i).text() for i in range(self.skills_list.count())]:
+                    self.skills_list.addItem(sid)
+                    QMessageBox.information(self, "Add Skill", f"Added \"{sid}\". The skill is now enabled. Some skills need API keys or other setup in Settings → Integrations.")
 
     def remove_skill(self):
         row = self.skills_list.currentRow()
@@ -1624,6 +1653,7 @@ Names: {names_str}"""
         return {
             "hf_token": self.hf_token.text() or None,
             "enabled_skills": skills,
+            "mcp_marketplace_url": self.mcp_marketplace_url.text().strip() or None,
         }
 
     def _load_mcp_data(self):
@@ -2614,8 +2644,9 @@ class SettingsDialog(QDialog):
         
         layout.addWidget(self.header)
         
-        # Tabs
+        # Tabs: vertical on the left so the window doesn't need to be very wide
         self.tabs = QTabWidget()
+        self.tabs.setTabPosition(QTabWidget.TabPosition.West)
         
         self.general_tab = GeneralTab(self.settings)
         self.llm_tab = LLMTab(self.settings)

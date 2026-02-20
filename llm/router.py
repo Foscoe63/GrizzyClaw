@@ -188,8 +188,8 @@ class LLMRouter:
                 for m in models:
                     m["provider"] = name
                 all_models.extend(models)
-            except:
-                pass
+            except Exception as e:
+                logger.debug("Failed to list models for %s: %s", name, e)
         return all_models
 
     async def test_connections(self):
