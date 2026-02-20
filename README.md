@@ -1,10 +1,10 @@
 # GrizzyClaw
 
-A secure, multi-platform AI agent combining OpenClaw's multi-channel messaging with memuBot's proactive memory system. Supports local LLMs (LM Studio, Ollama) with built-in web chatbot, Telegram integration, voice chat, live visual canvas, skills/MCP, hooks and triggers, browser automation, scheduled tasks, daemon mode, and multi-agent workspaces.
+A secure, multi-platform AI agent combining OpenClaw's multi-channel messaging with memuBot's proactive memory system. Supports local LLMs (LM Studio, Ollama) with built-in web chatbot, Telegram and WhatsApp, voice chat, live visual canvas, skills/MCP, hooks and triggers, swarm (agent-to-agent delegation with leader/specialist roles), browser automation, scheduled tasks, daemon mode, and multi-agent workspaces.
 
 ## Features
 
-🤖 **Multi-Platform**: Desktop app (macOS) + Telegram bot
+🤖 **Multi-Platform**: Desktop app (macOS) + Telegram + WhatsApp
 🧠 **Memory System**: Persistent conversation memory inspired by memuBot
 🔒 **Security-First**: Encryption, JWT auth, rate limiting
 ⚡ **Local LLMs**: Native support for Ollama and LM Studio
@@ -18,6 +18,12 @@ A secure, multi-platform AI agent combining OpenClaw's multi-channel messaging w
 🔔 **Advanced Automation**: Gmail Pub/Sub integration and event-driven triggers
 🔄 **Daemon Mode**: Run as 24/7 background service (launchd/systemd)
 🗂️ **Multi-Agent Workspaces**: Isolated agent configurations with different LLMs, prompts, and memory
+🐝 **Swarm**: Agent-to-agent delegation with leader and specialist roles; use @workspace to delegate tasks
+📷 **Image Attachments**: Attach images to chat for vision-capable models
+📋 **Memory Browser**: View, search, and manage conversation memories
+👥 **Gateway Sessions**: When daemon runs, connect external clients via WebSocket; manage sessions from the GUI
+📤 **Export**: Export conversations to Markdown or plain text
+🎨 **Themed UI**: Customize theme, font, and appearance
 📱 **Responsive UI**: Clean, modern macOS desktop interface
 
 ## Quick Start
@@ -49,8 +55,10 @@ python -m grizzyclaw daemon run
 
 ### 4. Access the Interface
 
-- **Desktop GUI**: Launches the PyQt6 app with chat, voice input, live canvas, and workspaces
+- **Desktop GUI**: Launches the PyQt6 app with chat, voice input, live canvas, memory, scheduler, browser, sessions, and workspaces
 - **Web UI** (when daemon runs): http://localhost:18788/chat
+- **Control UI** (when daemon runs): http://localhost:18788/control
+- **WebSocket Gateway**: ws://localhost:18789 for external clients
 - **Telegram**: Message your bot (when daemon runs with `TELEGRAM_BOT_TOKEN`)
 
 ## Voice Input & Media
@@ -65,7 +73,7 @@ GrizzyClaw supports voice messages in the desktop GUI. Record your message, and 
 If voice works from the terminal but not from the bundled app, select your microphone explicitly in **Settings → Integrations → Media & Transcription → Microphone**.
 
 ### Text-to-Speech
-Click the 🔊 button on assistant messages to hear the response. Configure TTS provider (ElevenLabs, pyttsx3, or system `say`) in Settings → Integrations.
+Click the 🔊 button on assistant messages to hear the response. Configure TTS provider in Settings → Integrations: **ElevenLabs** (high quality), **pyttsx3** (offline), or system **say** (macOS).
 
 ## Live Canvas
 
@@ -133,9 +141,12 @@ See `.env.example` for environment variables. The GUI saves settings to `config.
 ### Optional Settings
 
 - `TELEGRAM_BOT_TOKEN`: Get from @BotFather
+- `WHATSAPP_SESSION_PATH`: For WhatsApp channel (optional)
 - `DATABASE_URL`: Defaults to SQLite
 - `TRANSCRIPTION_PROVIDER`: `openai` or `local` for voice input
 - `INPUT_DEVICE_NAME`: Microphone name (e.g. for bundled app compatibility)
+- `CUSTOM_PROVIDER_URL`, `CUSTOM_PROVIDER_API_KEY`, `CUSTOM_PROVIDER_MODEL`: Custom OpenAI-compatible API
+- `RULES_FILE`: Path to YAML file with custom rules per workspace
 
 ## Building the macOS App
 
@@ -266,8 +277,10 @@ grizzyclaw daemon run
 
 ### Daemon Features
 - Automatic restart on crash
-- WebSocket gateway for external clients
+- WebSocket gateway (ws://127.0.0.1:18789) for external clients
+- HTTP server for Web Chat and Control UI (http://127.0.0.1:18788)
 - IPC server for CLI/GUI communication
+- Sessions management via GUI when daemon runs
 - Logs at `~/.grizzyclaw/daemon.log`
 
 ## Multi-Agent Workspaces
@@ -285,10 +298,11 @@ Click the **🗂️ Workspaces** button in the sidebar to:
 ### Workspace Features
 | Feature | Description |
 |---------|-------------|
-| **Isolated Memory** | Each workspace has its own SQLite database |
+| **Isolated Memory** | Each workspace has its own SQLite database (or shared for swarm) |
 | **Custom LLM** | Different provider/model per workspace |
 | **System Prompt** | Specialized prompts for different tasks |
 | **API Keys** | Override global keys per workspace |
+| **Swarm** | Leader + specialist roles; agent-to-agent delegation via @mentions |
 | **Templates** | Pre-built configurations for common use cases |
 
 ### Templates
@@ -301,6 +315,40 @@ Click the **🗂️ Workspaces** button in the sidebar to:
 ### Workspace Storage
 Workspaces are stored in `~/.grizzyclaw/workspaces.json`
 Each workspace memory is stored in `~/.grizzyclaw/workspace_<id>.db`
+
+### Rules File
+Workspaces can use a custom `RULES_FILE` (YAML) for domain-specific instructions. Configure in the workspace editor.
+
+### Swarm (Agent-to-Agent & Leader)
+
+Workspaces can form a **swarm** where one agent acts as **leader** and others as **specialists**. Configure in **Workspaces → Swarm** tab.
+
+**Agent-to-agent delegation**
+- Enable "Inter-agent chat" so workspaces can message each other
+- In chat, use `@workspace_slug` or `@Workspace Name` to delegate (e.g. `@code_assistant analyze this code`)
+- Optional **inter-agent channel** (e.g. `swarm1`) so only workspaces on the same channel can message each other
+- **Shared memory**: Workspaces on the same channel can share a memory DB for swarm context
+
+**Leader role**
+- Set a workspace as **leader** (e.g. Default template)
+- **Auto-delegate**: When the leader replies with lines like `@research Research X.` or `@coding Code Y.`, those delegations are executed automatically
+- Specialist workspaces receive the task and reply
+- **Consensus**: Enable "synthesize specialist replies" to have the leader combine specialist responses into one unified answer
+
+**Specialist roles**
+- Workspaces can be `specialist_coding`, `specialist_writing`, `specialist_research`, `specialist_personal`
+- Specialists focus on their domain and respond concisely
+- The Default template is pre-configured as a swarm leader; Coding, Writing, Research, and Personal templates are specialists
+
+## Additional Capabilities
+
+- **Custom LLM Provider**: Add your own OpenAI-compatible API endpoint in Settings → LLM Providers.
+- **Device Actions** (macOS): Camera capture, screen capture, and local notifications via device_actions.
+- **Memory Browser**: Click 🧠 Memory in the sidebar to view, search, and manage stored memories.
+- **Sessions**: When the daemon runs, click 👥 Sessions to view Gateway sessions and send messages to connected clients.
+- **Usage Dashboard**: Click 📊 Usage for LLM token usage and metrics (when observability is enabled).
+- **Export Conversation**: Use File → Export (Ctrl+E) to save the current chat as Markdown or plain text.
+- **Safety**: Content filtering and PII redaction in logs (configurable in Settings).
 
 ## Architecture
 
@@ -317,7 +365,10 @@ grizzyclaw/
 ├── media/         # Transcription, media lifecycle
 ├── utils/         # Audio recording, TTS, vision
 ├── web/           # Web interface
-└── workspaces/    # Multi-agent workspace management
+├── workspaces/    # Multi-agent workspace management
+├── safety/        # Content filtering, PII redaction
+├── observability/ # Metrics, tracing, logging
+└── device_actions/# Camera, screen capture, notifications (macOS)
 ```
 
 ## Inspired By
