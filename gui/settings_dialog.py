@@ -8,9 +8,9 @@ from PyQt6.QtWidgets import (
     QApplication, QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QTabWidget, QWidget, QFormLayout, QCheckBox,
     QSpinBox, QComboBox, QGroupBox, QMessageBox, QScrollArea,
-    QFrame, QFileDialog
+    QFrame, QFileDialog, QGridLayout, QButtonGroup,
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QFont
 
 from grizzyclaw.config import Settings, get_config_path
@@ -1867,7 +1867,39 @@ class SecurityTab(SettingsTab):
         self.rate_limit.setValue(self.settings.rate_limit_requests)
         self.rate_limit.setFixedHeight(32)
         form.addRow("Rate Limit:", self.rate_limit)
-        
+
+        # Allow shell commands (OpenClaw-style exec with approval)
+        self.exec_commands_enabled = QCheckBox("Allow shell commands")
+        self.exec_commands_enabled.setChecked(getattr(self.settings, "exec_commands_enabled", False))
+        self.exec_commands_enabled.setToolTip(
+            "Let the agent run shell commands. Each command requires your approval in a dialog. "
+            "Similar to OpenClaw's exec capability."
+        )
+        form.addRow("", self.exec_commands_enabled)
+
+        self.exec_safe_commands_skip_approval = QCheckBox("Skip approval for safe commands (ls, df, pwd, whoami, date, etc.)")
+        self.exec_safe_commands_skip_approval.setChecked(
+            getattr(self.settings, "exec_safe_commands_skip_approval", True)
+        )
+        self.exec_safe_commands_skip_approval.setToolTip(
+            "Read-only commands like ls, df, pwd run immediately without approval."
+        )
+        form.addRow("", self.exec_safe_commands_skip_approval)
+
+        self.exec_sandbox_enabled = QCheckBox("Run approved commands in sandbox (restricted PATH)")
+        self.exec_sandbox_enabled.setChecked(getattr(self.settings, "exec_sandbox_enabled", False))
+        self.exec_sandbox_enabled.setToolTip(
+            "When enabled, approved commands run with PATH=/usr/bin:/bin only. Best-effort restriction."
+        )
+        form.addRow("", self.exec_sandbox_enabled)
+
+        self.pre_send_health_check = QCheckBox("Check LLM provider before sending")
+        self.pre_send_health_check.setChecked(getattr(self.settings, "pre_send_health_check", False))
+        self.pre_send_health_check.setToolTip(
+            "Ping the default LLM (e.g. Ollama) before sending; warn if unreachable and offer to send anyway."
+        )
+        form.addRow("", self.pre_send_health_check)
+
         layout.addLayout(form)
         
         # Generate button
@@ -1899,6 +1931,10 @@ class SecurityTab(SettingsTab):
             "secret_key": self.secret_key.text(),
             "jwt_secret": self.jwt_secret.text(),
             "rate_limit_requests": self.rate_limit.value(),
+            "exec_commands_enabled": self.exec_commands_enabled.isChecked(),
+            "exec_safe_commands_skip_approval": self.exec_safe_commands_skip_approval.isChecked(),
+            "exec_sandbox_enabled": self.exec_sandbox_enabled.isChecked(),
+            "pre_send_health_check": self.pre_send_health_check.isChecked(),
         }
 
 
@@ -2542,7 +2578,9 @@ class AppearanceTab(SettingsTab):
 
 
 class SettingsDialog(QDialog):
-    def __init__(self, settings, parent=None):
+    settings_saved = pyqtSignal()
+
+    def __init__(self, settings, parent=None, theme_colors=None):
         super().__init__(parent)
         self.settings = settings
         self.is_dark = False
@@ -2550,8 +2588,11 @@ class SettingsDialog(QDialog):
         self.setMinimumSize(700, 550)
         self.resize(750, 600)
         self.setup_ui()
-        # Apply initial theme
-        self.apply_theme_preview(self.settings.theme)
+        # Apply theme to match main window
+        if theme_colors:
+            self.apply_theme_from_colors(theme_colors)
+        else:
+            self.apply_theme_preview(self.settings.theme)
     
     def setup_ui(self):
         self.setStyleSheet("""
@@ -2650,9 +2691,10 @@ class SettingsDialog(QDialog):
         
         layout.addWidget(self.header)
         
-        # Tabs: vertical on the left so the window doesn't need to be very wide
+        # Tabs: horizontal at top, 2 rows
         self.tabs = QTabWidget()
-        self.tabs.setTabPosition(QTabWidget.TabPosition.West)
+        self.tabs.tabBar().hide()
+        self.tabs.setDocumentMode(True)
         
         self.general_tab = GeneralTab(self.settings)
         self.llm_tab = LLMTab(self.settings)
@@ -2665,18 +2707,83 @@ class SettingsDialog(QDialog):
         self.daemon_tab = DaemonTab(self.settings)
         self.appearance_tab = AppearanceTab(self.settings)
         
-        self.tabs.addTab(self.general_tab, "General")
-        self.tabs.addTab(self.llm_tab, "LLM Providers")
-        self.tabs.addTab(self.telegram_tab, "Telegram")
-        self.tabs.addTab(self.whatsapp_tab, "WhatsApp")
-        self.tabs.addTab(self.prompts_tab, "Prompts & Rules")
-        self.tabs.addTab(self.skills_tab, "ClawHub & MCP")
-        self.tabs.addTab(self.security_tab, "Security")
-        self.tabs.addTab(self.integrations_tab, "Integrations")
-        self.tabs.addTab(self.daemon_tab, "Daemon")
-        self.tabs.addTab(self.appearance_tab, "Appearance")
+        tab_items = [
+            ("General", self.general_tab),
+            ("LLM Providers", self.llm_tab),
+            ("Telegram", self.telegram_tab),
+            ("WhatsApp", self.whatsapp_tab),
+            ("Prompts & Rules", self.prompts_tab),
+            ("ClawHub & MCP", self.skills_tab),
+            ("Security", self.security_tab),
+            ("Integrations", self.integrations_tab),
+            ("Daemon", self.daemon_tab),
+            ("Appearance", self.appearance_tab),
+        ]
+        for label, widget in tab_items:
+            self.tabs.addTab(widget, label)
         
+        # Custom tab bar: 2 rows of buttons
+        self.tab_bar = QWidget()
+        self.tab_bar.setStyleSheet("background: #F5F5F7; border-bottom: 1px solid #E5E5EA;")
+        tab_bar_layout = QGridLayout(self.tab_bar)
+        tab_bar_layout.setContentsMargins(16, 8, 16, 8)
+        tab_bar_layout.setSpacing(6)
+        self._tab_btn_style_light = """
+            QPushButton {
+                padding: 8px 14px;
+                border: none;
+                background: transparent;
+                color: #3C3C43;
+                font-size: 13px;
+                font-weight: 500;
+                border-radius: 6px;
+            }
+            QPushButton:hover {
+                background: rgba(0,122,255,0.08);
+            }
+            QPushButton:checked {
+                background: rgba(0,122,255,0.12);
+                color: #007AFF;
+            }
+        """
+        self._tab_btn_style_dark = """
+            QPushButton {
+                padding: 8px 14px;
+                border: none;
+                background: transparent;
+                color: #E5E5EA;
+                font-size: 13px;
+                font-weight: 500;
+                border-radius: 6px;
+            }
+            QPushButton:hover {
+                background: rgba(10,132,255,0.12);
+            }
+            QPushButton:checked {
+                background: rgba(10,132,255,0.2);
+                color: #0A84FF;
+            }
+        """
+        tab_btn_style = self._tab_btn_style_dark if self.is_dark else self._tab_btn_style_light
+        tab_btn_group = QButtonGroup(self.tab_bar)
+        tab_btn_group.setExclusive(True)
+        self._tab_buttons = []
+        for i, (label, _) in enumerate(tab_items):
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.setStyleSheet(tab_btn_style)
+            btn.clicked.connect(lambda checked, idx=i: self.tabs.setCurrentIndex(idx))
+            tab_btn_group.addButton(btn)
+            self._tab_buttons.append(btn)
+            row, col = divmod(i, 5)
+            tab_bar_layout.addWidget(btn, row, col)
+        tab_bar_layout.setColumnStretch(4, 1)
+        layout.addWidget(self.tab_bar)
         layout.addWidget(self.tabs, 1)
+        self._tab_buttons[0].setChecked(True)
+        self.tabs.currentChanged.connect(
+            lambda idx: self._tab_buttons[idx].setChecked(True) if 0 <= idx < len(self._tab_buttons) else None
+        )
         
         # Buttons
         self.btn_bar = QWidget()
@@ -2685,9 +2792,9 @@ class SettingsDialog(QDialog):
         btn_layout.setContentsMargins(24, 16, 24, 16)
         btn_layout.addStretch()
         
-        self.cancel_btn = QPushButton("Cancel")
-        self.cancel_btn.setFixedWidth(80)
-        self.cancel_btn.setStyleSheet("""
+        self.close_btn = QPushButton("Close")
+        self.close_btn.setFixedWidth(80)
+        self.close_btn.setStyleSheet("""
             QPushButton {
                 background: transparent;
                 color: #007AFF;
@@ -2697,20 +2804,21 @@ class SettingsDialog(QDialog):
                 background: rgba(0,122,255,0.1);
             }
         """)
-        self.cancel_btn.clicked.connect(self.reject)
+        self.close_btn.clicked.connect(self._save_and_close)
         
         self.save_btn = QPushButton("Save")
         self.save_btn.setFixedWidth(80)
         self.save_btn.setDefault(True)
         self.save_btn.clicked.connect(self.save_settings)
         
-        btn_layout.addWidget(self.cancel_btn)
+        btn_layout.addWidget(self.close_btn)
         btn_layout.addSpacing(8)
         btn_layout.addWidget(self.save_btn)
         
         layout.addWidget(self.btn_bar)
     
-    def save_settings(self):
+    def _collect_and_apply_settings(self):
+        """Gather settings from all tabs and apply to self.settings (in memory)."""
         new_settings = {}
         new_settings.update(self.general_tab.get_settings())
         new_settings.update(self.llm_tab.get_settings())
@@ -2722,24 +2830,175 @@ class SettingsDialog(QDialog):
         new_settings.update(self.integrations_tab.get_settings())
         new_settings.update(self.daemon_tab.get_settings())
         new_settings.update(self.appearance_tab.get_settings())
-        
         for key, value in new_settings.items():
             setattr(self.settings, key, value)
-        
+        return new_settings
+
+    def _save_to_file(self) -> bool:
+        """Persist current settings to disk. Returns True on success."""
+        self._collect_and_apply_settings()
         try:
-            # Save to same path used when loading (so default provider and other prefs persist)
             config_path = get_config_path()
             self.settings.to_file(str(config_path))
-            self.accept()
+            return True
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save: {e}")
+            return False
+
+    def save_settings(self):
+        """Save to disk and stay open. Shows brief 'Saved' feedback."""
+        if self._save_to_file():
+            orig = self.save_btn.text()
+            self.save_btn.setText("Saved!")
+            QTimer.singleShot(1200, lambda: self.save_btn.setText(orig))
+            self.apply_theme_preview(self.settings.theme)
+            self.settings_saved.emit()
+
+    def _save_and_close(self):
+        """Save to disk and close. Main window will apply on accept()."""
+        if self._save_to_file():
+            self.accept()
+
+    def closeEvent(self, event):
+        """On X: save and close (same as Close button)."""
+        if self._save_to_file():
+            self.accept()
+        event.accept()
+
+    def reject(self):
+        """On Escape: save and close (same as Close button)."""
+        self._save_and_close()
     
     def get_settings(self):
         return self.settings
-    
+
+    def apply_theme_from_colors(self, theme_colors: dict):
+        """Apply theme using the same color dict as the main window."""
+        self.is_dark = theme_colors.get("is_dark", False)
+        bg = theme_colors.get("bg", "#FFFFFF")
+        fg = theme_colors.get("fg", "#1C1C1E")
+        sidebar_bg = theme_colors.get("sidebar_bg", "#F5F5F7")
+        border = theme_colors.get("border", "#E5E5EA")
+        input_bg = theme_colors.get("input_bg", "#FFFFFF")
+        input_border = theme_colors.get("input_border", "#D1D1D6")
+        accent = theme_colors.get("accent", "#007AFF")
+        secondary = theme_colors.get("secondary", "#8E8E93")
+
+        self.setStyleSheet(f"""
+            QDialog {{ background: {bg}; }}
+            QWidget {{ background: {bg}; }}
+            QLineEdit, QComboBox, QSpinBox {{
+                padding: 4px 8px;
+                border: 1px solid {input_border};
+                border-radius: 4px;
+                background: {input_bg};
+                color: {fg};
+            }}
+            QLineEdit:focus, QComboBox:focus, QSpinBox:focus {{
+                border: 2px solid {accent};
+                padding: 3px 7px;
+            }}
+            QComboBox::drop-down {{
+                subcontrol-origin: padding;
+                subcontrol-position: top right;
+                width: 20px;
+                border-left: 1px solid {input_border};
+                background: {input_bg};
+            }}
+            QComboBox::down-arrow {{
+                image: none;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-top: 5px solid {fg};
+                width: 0px;
+                height: 0px;
+                margin-right: 6px;
+            }}
+            QComboBox QAbstractItemView {{
+                background: {input_bg};
+                color: {fg};
+                border: 1px solid {input_border};
+                selection-background-color: {accent};
+                selection-color: white;
+                outline: none;
+            }}
+            QGroupBox {{
+                font-weight: 600;
+                background: {sidebar_bg};
+                border: 1px solid {border};
+                color: {fg};
+            }}
+            QLabel {{ color: {fg}; background: transparent; }}
+            QFormLayout QLabel {{ color: {fg}; }}
+            QPushButton {{
+                padding: 6px 16px;
+                border: none;
+                border-radius: 4px;
+                background: {accent};
+                color: white;
+                font-weight: 500;
+            }}
+            QPushButton:hover {{ opacity: 0.9; }}
+            QPushButton:pressed {{ opacity: 0.8; }}
+            QTabWidget::pane {{ border: none; background: {bg}; }}
+            QTabBar::tab {{
+                padding: 12px 14px;
+                min-width: 56px;
+                border: none;
+                background: transparent;
+                color: {secondary};
+                font-size: 15px;
+                font-weight: bold;
+            }}
+            QTabBar::tab:selected {{ color: {accent}; border-right: 3px solid {accent}; }}
+            QTabBar::tab:hover:!selected {{ background: rgba(128,128,128,0.1); }}
+            QCheckBox {{ color: {fg}; }}
+            QCheckBox::indicator {{ border: 1px solid {input_border}; background: {input_bg}; border-radius: 3px; }}
+            QCheckBox::indicator:checked {{ background: {accent}; border: 1px solid {accent}; }}
+            QScrollArea {{ border: none; background: {bg}; }}
+            QScrollArea > QWidget > QWidget {{ background: {bg}; }}
+        """)
+        self.update_group_styles()
+        self.header.setStyleSheet(f"background: {sidebar_bg}; border-bottom: 1px solid {border};")
+        self.title_label.setStyleSheet(f"color: {fg};")
+        self.tab_bar.setStyleSheet(f"background: {sidebar_bg}; border-bottom: 1px solid {border};")
+        self.btn_bar.setStyleSheet(f"background: {sidebar_bg}; border-top: 1px solid {border};")
+        tab_btn_fg = fg
+        tab_btn_accent = accent
+        tab_btn_style = f"""
+            QPushButton {{
+                padding: 8px 14px;
+                border: none;
+                background: transparent;
+                color: {tab_btn_fg};
+                font-size: 13px;
+                font-weight: 500;
+                border-radius: 6px;
+            }}
+            QPushButton:hover {{ background: rgba(128,128,128,0.15); }}
+            QPushButton:checked {{ background: rgba(128,128,128,0.2); color: {tab_btn_accent}; }}
+        """
+        if hasattr(self, "_tab_buttons"):
+            for btn in self._tab_buttons:
+                btn.setStyleSheet(tab_btn_style)
+        self.close_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent;
+                color: {accent};
+                border: 1px solid {input_border};
+            }}
+            QPushButton:hover {{ background: rgba(128,128,128,0.1); }}
+        """)
+
     def apply_theme_preview(self, theme):
-        """Apply theme to the preferences dialog itself"""
-        # Determine if dark mode based on theme
+        """Apply theme to the preferences dialog. Uses parent's get_theme_colors when available."""
+        parent = self.parent()
+        if parent and hasattr(parent, "get_theme_colors"):
+            resolved = getattr(parent, "_resolve_theme", lambda t: t)(theme)
+            theme_colors = parent.get_theme_colors(resolved)
+            self.apply_theme_from_colors(theme_colors)
+            return
+        # Fallback: binary dark/light when no parent theme support
         dark_themes = [
             "Dark",
             "High Contrast Dark",
@@ -2955,12 +3214,16 @@ class SettingsDialog(QDialog):
         # Refresh all group boxes to apply new theme
         self.update_group_styles()
         
-        # Update header and button bar
+        # Update header, tab bar, and button bar
         if self.is_dark:
             self.header.setStyleSheet("background: #2D2D2D; border-bottom: 1px solid #3A3A3C;")
             self.title_label.setStyleSheet("color: #FFFFFF;")
+            self.tab_bar.setStyleSheet("background: #2D2D2D; border-bottom: 1px solid #3A3A3C;")
             self.btn_bar.setStyleSheet("background: #2D2D2D; border-top: 1px solid #3A3A3C;")
-            self.cancel_btn.setStyleSheet("""
+            if hasattr(self, "_tab_buttons"):
+                for btn in self._tab_buttons:
+                    btn.setStyleSheet(self._tab_btn_style_dark)
+            self.close_btn.setStyleSheet("""
                 QPushButton {
                     background: transparent;
                     color: #0A84FF;
@@ -2973,8 +3236,12 @@ class SettingsDialog(QDialog):
         else:
             self.header.setStyleSheet("background: #F5F5F7; border-bottom: 1px solid #E5E5EA;")
             self.title_label.setStyleSheet("color: #1C1C1E;")
+            self.tab_bar.setStyleSheet("background: #F5F5F7; border-bottom: 1px solid #E5E5EA;")
             self.btn_bar.setStyleSheet("background: #F5F5F7; border-top: 1px solid #E5E5EA;")
-            self.cancel_btn.setStyleSheet("""
+            if hasattr(self, "_tab_buttons"):
+                for btn in self._tab_buttons:
+                    btn.setStyleSheet(self._tab_btn_style_light)
+            self.close_btn.setStyleSheet("""
                 QPushButton {
                     background: transparent;
                     color: #007AFF;

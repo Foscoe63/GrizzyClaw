@@ -21,9 +21,10 @@ class WorkspaceDialog(QDialog):
     workspace_changed = pyqtSignal(str)  # Emitted when active workspace changes
     workspace_config_saved = pyqtSignal(str)  # Emitted when a workspace's config is saved (so chat can use new provider)
     
-    def __init__(self, workspace_manager: WorkspaceManager, parent=None):
+    def __init__(self, workspace_manager: WorkspaceManager, parent=None, llm_router=None):
         super().__init__(parent)
         self.manager = workspace_manager
+        self._llm_router = llm_router
         self.is_dark = False
         self.setWindowTitle("🗂️ Workspaces")
         self.setMinimumSize(800, 600)
@@ -382,9 +383,10 @@ class WorkspaceDialog(QDialog):
         
         metrics_layout.addWidget(metrics_group)
         
-        benchmark_btn = QPushButton("🚀 Run Benchmark (5 prompts)")
-        benchmark_btn.clicked.connect(self.run_benchmark)
-        metrics_layout.addWidget(benchmark_btn)
+        self.benchmark_btn = QPushButton("🚀 Run Benchmark (5 prompts)")
+        self.benchmark_btn.setObjectName("benchmark_btn")
+        self.benchmark_btn.clicked.connect(self.run_benchmark)
+        metrics_layout.addWidget(self.benchmark_btn)
         
         self.tabs.addTab(metrics_tab, "Metrics")
         
@@ -719,9 +721,86 @@ class WorkspaceDialog(QDialog):
                 self.refresh_list()
     
     def run_benchmark(self):
-        """Run benchmark test"""
-        QMessageBox.information(self, "Benchmark", "Benchmark runs 5 standard prompts to measure speed.\nMetrics update live with real chats too!")
-        # TODO: Implement full benchmark thread\n        pass
+        """Run benchmark test: 5 short prompts, report latencies and compare providers."""
+        router = getattr(self, "_llm_router", None)
+        if not router or not getattr(router, "providers", None):
+            QMessageBox.warning(
+                self, "Benchmark",
+                "No LLM router available. Open Workspaces from the main window after chat is ready."
+            )
+            return
+        btn = getattr(self, "benchmark_btn", None)
+        if btn:
+            btn.setEnabled(False)
+            btn.setText("Running…")
+
+        class BenchmarkWorker(QThread):
+            result_ready = pyqtSignal(list, float, str)  # (list of (prompt, sec), total_sec, error_msg)
+
+            def __init__(self, router_ref):
+                super().__init__()
+                self.router_ref = router_ref
+
+            def run(self):
+                import time
+                import asyncio
+                prompts = [
+                    "Reply with exactly: OK",
+                    "What is 2+2? Answer in one number.",
+                    "Say hello in one word.",
+                    "Name one fruit.",
+                    "Reply with the word done.",
+                ]
+                results = []
+                total = 0.0
+                err_msg = ""
+                try:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    try:
+                        for p in prompts:
+                            t0 = time.perf_counter()
+                            try:
+                                buf = []
+                                async def consume():
+                                    async for ch in self.router_ref.generate(
+                                        [{"role": "user", "content": p}],
+                                        max_tokens=50,
+                                    ):
+                                        buf.append(ch)
+                                loop.run_until_complete(consume())
+                                elapsed = time.perf_counter() - t0
+                                results.append((p[:40] + ("…" if len(p) > 40 else ""), round(elapsed, 2)))
+                                total += elapsed
+                            except Exception as e:
+                                err_msg = str(e)
+                                results.append((p[:40] + "…", f"Error: {e}"))
+                                break
+                    finally:
+                        loop.close()
+                except Exception as e:
+                    err_msg = str(e)
+                self.result_ready.emit(results, total, err_msg)
+
+        def on_done(results, total, err_msg):
+            btn = getattr(self, "benchmark_btn", None)
+            if btn:
+                btn.setEnabled(True)
+                btn.setText("🚀 Run Benchmark (5 prompts)")
+            lines = []
+            for prompt, sec in results:
+                lines.append(f"• {prompt}: {sec}" + ("s" if isinstance(sec, (int, float)) else ""))
+            if total and not err_msg:
+                lines.append(f"\nTotal: {round(total, 2)}s")
+            msg = "\n".join(lines) if lines else "No runs completed."
+            if err_msg:
+                msg += f"\n\nError: {err_msg}"
+            QMessageBox.information(self, "Benchmark", msg)
+
+        worker = BenchmarkWorker(router)
+        worker.result_ready.connect(on_done)
+        worker.start()
+        worker.finished.connect(lambda: worker.deleteLater())
     
     def duplicate_workspace(self):
         """Duplicate the selected workspace"""

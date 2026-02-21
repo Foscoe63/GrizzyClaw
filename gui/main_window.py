@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (
     QTextEdit, QLineEdit, QPlainTextEdit, QPushButton, QLabel, QSystemTrayIcon,
     QMenu, QMenuBar, QMessageBox, QSplitter, QListWidget, QListWidgetItem,
     QFrame, QScrollArea, QToolBar, QStatusBar, QSizePolicy,
-    QFileDialog, QStackedWidget,
+    QFileDialog, QStackedWidget, QDialog,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QMimeData
 from PyQt6.QtGui import QAction, QIcon, QFont, QPalette, QColor, QKeySequence, QShortcut, QDragEnterEvent, QDropEvent, QKeyEvent
@@ -101,6 +101,113 @@ class RecordVoiceWorker(QThread):
             self.finished.emit(None)
 
 
+class HealthCheckWorker(QThread):
+    """Quick health check for the default LLM provider; emits (ok, provider_name)."""
+    result_ready = pyqtSignal(bool, str)
+
+    def __init__(self, router, parent=None):
+        super().__init__(parent)
+        self.router = router
+
+    def run(self):
+        try:
+            import asyncio
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                provider = getattr(self.router, "default_provider", None) or ""
+                if not provider or provider not in getattr(self.router, "providers", {}):
+                    self.result_ready.emit(False, provider or "none")
+                    return
+                health = loop.run_until_complete(
+                    asyncio.wait_for(self.router.health_check(), timeout=4.0)
+                )
+                ok = health.get(provider, False)
+                self.result_ready.emit(ok, provider)
+            finally:
+                loop.close()
+        except Exception:
+            provider = getattr(self.router, "default_provider", None) or "unknown"
+            self.result_ready.emit(False, provider)
+
+
+def _risky_command_warnings(command: str) -> list:
+    """Return list of warning strings for risky patterns in the command."""
+    import re
+    warnings = []
+    cmd = (command or "").strip()
+    if not cmd:
+        return warnings
+    # rm -rf or rm -fr
+    if re.search(r"\brm\s+(-[rf]*|\s)*\s*-[rf]|\brm\s+-[rf]\s", cmd) or "rm -rf" in cmd or "rm -fr" in cmd:
+        warnings.append("rm -rf / recursive delete")
+    if re.search(r"\bsudo\b", cmd):
+        warnings.append("sudo (elevated privileges)")
+    # curl | bash / sh
+    if re.search(r"curl\s+[^|]*\s*\|\s*(bash|sh)\b", cmd, re.IGNORECASE):
+        warnings.append("curl piped to shell")
+    if re.search(r"wget\s+[^|]*\s*\|\s*(bash|sh)\b", cmd, re.IGNORECASE):
+        warnings.append("wget piped to shell")
+    if re.search(r"\|\s*(bash|sh)\s*$", cmd):
+        warnings.append("piping to shell")
+    return warnings
+
+
+class ExecApprovalDialog(QDialog):
+    """Dialog to approve or reject a shell command before execution."""
+    def __init__(self, command: str, cwd=None, history=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Approve Shell Command")
+        self.setMinimumWidth(450)
+        self.setMinimumHeight(340)
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.addWidget(QLabel("The agent wants to run this command:"))
+        display_cmd = command
+        if cwd:
+            display_cmd = f"{command}\n# cwd: {cwd}"
+        self.cmd_edit = QPlainTextEdit(display_cmd)
+        self.cmd_edit.setReadOnly(True)
+        self.cmd_edit.setMinimumHeight(100)
+        self.cmd_edit.setMaximumHeight(160)
+        layout.addWidget(self.cmd_edit)
+        risks = _risky_command_warnings(command)
+        if risks:
+            risk_label = QLabel("⚠ Risky patterns: " + "; ".join(risks))
+            risk_label.setWordWrap(True)
+            risk_label.setStyleSheet("color: #C00; font-weight: bold; font-size: 12px;")
+            layout.addWidget(risk_label)
+        if history:
+            recent = [h.get("command", "") for h in history[-5:] if h.get("command")]
+            if recent:
+                layout.addWidget(QLabel("Recent commands:"))
+                hist_label = QLabel(" • ".join(recent[-3:]))  # Last 3
+                hist_label.setWordWrap(True)
+                hist_label.setStyleSheet("color: #8E8E93; font-size: 11px;")
+                layout.addWidget(hist_label)
+        layout.addWidget(QLabel("Only approve commands you trust. Rejected commands will not run."))
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        self.reject_btn = QPushButton("Reject")
+        self.reject_btn.clicked.connect(self.reject)
+        self.approve_btn = QPushButton("Approve")
+        self.approve_btn.setDefault(True)
+        self.approve_btn.clicked.connect(self.accept)
+        btn_layout.addWidget(self.reject_btn)
+        btn_layout.addWidget(self.approve_btn)
+        layout.addLayout(btn_layout)
+        self._approved = False
+
+    def accept(self):
+        self._approved = True
+        super().accept()
+
+    @property
+    def approved(self) -> bool:
+        return self._approved
+
+
 class MessageWorker(QThread):
     """Worker thread to handle async agent processing."""
     message_ready = pyqtSignal(str, bool)  # (response_text, was_stopped)
@@ -108,6 +215,7 @@ class MessageWorker(QThread):
     transcript_ready = pyqtSignal(str)
     error_occurred = pyqtSignal(str)
     provider_fallback = pyqtSignal(str)  # (fallback_provider_name) when LLM falls back to another provider
+    exec_approval_requested = pyqtSignal(str, object, object, object)  # (command, cwd, future, loop)
 
     def __init__(self, agent, user_id, message, images=None, audio_path=None, stop_requested=None):
         super().__init__()
@@ -175,6 +283,16 @@ class MessageWorker(QThread):
             self.provider_fallback.emit(provider_name)
 
         kwargs["on_fallback"] = _on_fallback
+
+        if getattr(self.agent.settings, "exec_commands_enabled", False):
+            loop = asyncio.get_event_loop()
+
+            async def _exec_approval_callback(command: str, cwd=None):
+                future = loop.create_future()
+                self.exec_approval_requested.emit(command, cwd, future, loop)
+                return await future
+
+            kwargs["exec_approval_callback"] = _exec_approval_callback
 
         async def stream_consumer():
             nonlocal response_text
@@ -433,11 +551,12 @@ class ChatWidget(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(30, 20, 30, 20)
         layout.setSpacing(0)
-        
+        self._main_layout = layout
         # Header with Chat / Multi-Agent tabs
         header_container = QWidget()
         header_layout = QHBoxLayout(header_container)
         header_layout.setContentsMargins(0, 0, 0, 16)
+        self._header_layout = header_layout
         
         self.chat_tab_btn = QPushButton("Chat")
         self.chat_tab_btn.setCheckable(True)
@@ -723,6 +842,7 @@ class ChatWidget(QWidget):
         layout.addWidget(self.attached_label)
 
         layout.addWidget(input_container)
+        self._apply_compact_mode_from_settings()
 
     def _switch_view(self, index: int):
         self.chat_stack.setCurrentIndex(index)
@@ -910,8 +1030,49 @@ class ChatWidget(QWidget):
         if not text and not images and not audio_path:
             return
 
+        settings = getattr(self, "_settings", None)
+        do_health_check = getattr(settings, "pre_send_health_check", False) and getattr(
+            self.agent, "llm_router", None
+        )
+        if do_health_check:
+            self._pending_send = (text, images, audio_path)
+            self._set_loading(True)
+            mw = self.window()
+            if mw and hasattr(mw, "status_bar"):
+                mw.status_bar.showMessage("Checking LLM provider…")
+            self._health_worker = HealthCheckWorker(self.agent.llm_router)
+            self._health_worker.result_ready.connect(self._on_health_check_done)
+            self._health_worker.start()
+            return
+
+        self._do_send_message(text, images, audio_path)
+
+    def _on_health_check_done(self, ok: bool, provider_name: str):
+        self._set_loading(False)
+        mw = self.window()
+        if mw and hasattr(mw, "status_bar"):
+            mw.status_bar.clearMessage()
+        pending = getattr(self, "_pending_send", None)
+        self._pending_send = None
+        if not pending:
+            return
+        text, images, audio_path = pending
+        if ok:
+            self._do_send_message(text, images, audio_path)
+            return
+        reply = QMessageBox.question(
+            mw or self,
+            "LLM unreachable",
+            f"{provider_name or 'The LLM provider'} doesn't seem to be running or reachable. Send anyway?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self._do_send_message(text, images, audio_path)
+
+    def _do_send_message(self, text: str, images: list, audio_path=None):
+        """Actually send: clear input, add user bubble, start MessageWorker."""
         self._set_loading(True)
-        # Show which provider/model chat is using (helps debug "Ollama not getting requests")
         mw = self.window()
         if mw and hasattr(mw, "status_bar") and self.agent and getattr(self.agent, "llm_router", None):
             r = self.agent.llm_router
@@ -945,6 +1106,7 @@ class ChatWidget(QWidget):
         self.worker.message_ready.connect(self.on_message_ready)
         self.worker.error_occurred.connect(self.on_error)
         self.worker.provider_fallback.connect(self._on_provider_fallback)
+        self.worker.exec_approval_requested.connect(self._on_exec_approval_requested)
         if audio_path and user_bubble:
             prefix = text if text else ""
             def _on_transcript(transcript: str):
@@ -952,6 +1114,159 @@ class ChatWidget(QWidget):
                 QTimer.singleShot(0, self._scroll_to_bottom_if_near)
             self.worker.transcript_ready.connect(_on_transcript)
         self.worker.start()
+
+    def _apply_compact_mode_from_settings(self):
+        compact = getattr(self._settings, "compact_mode", False)
+        self.apply_compact_mode(compact)
+
+    def _clear_chat_ui_only(self):
+        """Remove all message bubbles and show empty state (does not clear agent session)."""
+        for i in range(self.chat_layout.count() - 1, -1, -1):
+            item = self.chat_layout.itemAt(i)
+            if not item:
+                continue
+            w = item.widget()
+            if w and isinstance(w, MessageBubble):
+                w.deleteLater()
+        self.conversation_cleared.emit()
+        if hasattr(self, "empty_state") and self.empty_state:
+            self.empty_state.show()
+
+    def restore_session_from_agent(self):
+        """Load persisted session from agent and show messages in chat (e.g. after workspace switch or startup)."""
+        if not self.agent:
+            return
+        self._clear_chat_ui_only()
+        session = getattr(self.agent, "get_persisted_session", lambda uid: [])(self.user_id)
+        if not session:
+            return
+        # Remove empty-state placeholder so we can add real messages
+        if hasattr(self, "empty_state") and self.empty_state and self.chat_layout.indexOf(self.empty_state) >= 0:
+            self.chat_layout.removeWidget(self.empty_state)
+            self.empty_state.hide()
+        for msg in session:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if not content.strip():
+                continue
+            is_user = role == "user"
+            sender = "You" if is_user else self._workspace_display_name
+            self.add_message(content, is_user=is_user, sender=sender)
+        QTimer.singleShot(0, self._scroll_to_bottom_if_near)
+
+    def apply_compact_mode(self, compact: bool):
+        """Apply compact UI density: smaller margins, spacing, and fonts."""
+        layout = getattr(self, "_main_layout", None)
+        header_layout = getattr(self, "_header_layout", None)
+        if layout is None:
+            return
+        if compact:
+            layout.setContentsMargins(16, 10, 16, 10)
+            layout.setSpacing(4)
+            if header_layout is not None:
+                header_layout.setContentsMargins(0, 0, 0, 8)
+            if hasattr(self, "chat_layout"):
+                self.chat_layout.setSpacing(4)
+                self.chat_layout.setContentsMargins(0, 0, 8, 0)
+            if hasattr(self, "header_label"):
+                self.header_label.setFont(QFont("-apple-system", 20, QFont.Weight.Bold))
+            if hasattr(self, "input_field"):
+                self.input_field.setFont(QFont("-apple-system", 13))
+                self.input_field.setMinimumHeight(36)
+                self.input_field.setMaximumHeight(100)
+            for attr in ("new_chat_btn", "export_btn", "attach_btn", "mic_btn", "send_btn", "stop_btn"):
+                w = getattr(self, attr, None)
+                if w is not None:
+                    w.setFont(QFont("-apple-system", 13))
+            if hasattr(self, "empty_state"):
+                self.empty_state.setFont(QFont("-apple-system", 13))
+                self.empty_state.setStyleSheet("color: #8E8E93; padding: 20px;")
+        else:
+            layout.setContentsMargins(30, 20, 30, 20)
+            layout.setSpacing(0)
+            if header_layout is not None:
+                header_layout.setContentsMargins(0, 0, 0, 16)
+            if hasattr(self, "chat_layout"):
+                self.chat_layout.setSpacing(8)
+                self.chat_layout.setContentsMargins(0, 0, 12, 0)
+            if hasattr(self, "header_label"):
+                self.header_label.setFont(QFont("-apple-system", 24, QFont.Weight.Bold))
+            if hasattr(self, "input_field"):
+                self.input_field.setFont(QFont("-apple-system", 14))
+                self.input_field.setMinimumHeight(44)
+                self.input_field.setMaximumHeight(120)
+            for attr in ("new_chat_btn", "export_btn", "attach_btn", "mic_btn", "send_btn", "stop_btn"):
+                w = getattr(self, attr, None)
+                if w is not None:
+                    w.setFont(QFont("-apple-system", 14) if attr in ("attach_btn", "mic_btn", "send_btn", "stop_btn") else QFont("-apple-system", 13))
+            if hasattr(self, "empty_state"):
+                self.empty_state.setFont(QFont("-apple-system", 15))
+                self.empty_state.setStyleSheet("color: #8E8E93; padding: 40px;")
+
+    def _on_exec_approval_requested(self, command: str, cwd, future, loop):
+        """Show approval dialog; run command if approved, set future result."""
+        import subprocess
+        from grizzyclaw.automation.exec_utils import add_to_history, get_history
+
+        mw = self.window()
+        history = get_history()
+        dialog = ExecApprovalDialog(command, cwd=cwd, history=history, parent=mw)
+        dialog.raise_()
+        dialog.activateWindow()
+        if mw:
+            mw.raise_()
+            mw.activateWindow()
+            try:
+                QApplication.alert(mw, 0)
+            except Exception:
+                pass
+        if dialog.exec() and dialog.approved:
+            setattr(self, "_exec_command_running", True)
+            if mw and hasattr(mw, "status_bar"):
+                mw.status_bar.showMessage("Running command…")
+            sandbox = getattr(self.agent.settings, "exec_sandbox_enabled", False)
+            def _run_and_set():
+                try:
+                    cwd_path = Path(cwd).expanduser() if cwd else Path.home()
+                    if not cwd_path.exists():
+                        cwd_path = Path.home()
+                    run_env = None
+                    if sandbox:
+                        import os
+                        run_env = {**os.environ, "PATH": "/usr/bin:/bin"}
+                    result = subprocess.run(
+                        command,
+                        shell=True,
+                        capture_output=True,
+                        text=True,
+                        timeout=60,
+                        cwd=str(cwd_path),
+                        env=run_env,
+                    )
+                    out = result.stdout or ""
+                    err = result.stderr or ""
+                    combined = (out + "\n" + err).strip() if err else out
+                    if result.returncode != 0:
+                        combined = f"(exit {result.returncode})\n{combined}"
+                    add_to_history(command, cwd)
+                    loop.call_soon_threadsafe(future.set_result, (True, combined or "(no output)"))
+                except subprocess.TimeoutExpired:
+                    loop.call_soon_threadsafe(
+                        future.set_result,
+                        (True, "Command timed out after 60 seconds"),
+                    )
+                except Exception as e:
+                    loop.call_soon_threadsafe(
+                        future.set_result,
+                        (True, f"Error: {e}"),
+                    )
+            import threading
+            threading.Thread(target=_run_and_set, daemon=True).start()
+        else:
+            loop.call_soon_threadsafe(
+                future.set_result,
+                (False, "User rejected"),
+            )
 
     def _on_stop_chat(self):
         """Stop the current LLM response (works even when the LLM is not sending)."""
@@ -982,6 +1297,11 @@ class ChatWidget(QWidget):
 
     def _on_stream_chunk(self, chunk: str):
         """Append a streamed chunk to the assistant bubble."""
+        if getattr(self, "_exec_command_running", False):
+            self._exec_command_running = False
+            mw = self.window()
+            if mw and hasattr(mw, "status_bar"):
+                mw.status_bar.clearMessage()
         if self._streaming_bubble is None:
             self._streaming_bubble = MessageBubble(
                 "", is_user=False, is_dark=self.is_dark, avatar_path=self._workspace_avatar_path
@@ -997,7 +1317,16 @@ class ChatWidget(QWidget):
         """Handle completion of the response from the worker thread."""
         self._set_loading(False)
         if not (response_text or "").strip():
-            response_text = "Stopped." if was_stopped else "I couldn't generate a response. Please check that your LLM provider (Ollama, LM Studio, etc.) is running and try again."
+            if was_stopped:
+                response_text = "Stopped."
+            else:
+                response_text = (
+                    "The model returned no response. This often happens when:\n"
+                    "• **Ollama** is still loading the model — try again in a moment or run `ollama run <model>` first\n"
+                    "• **LM Studio** isn’t running or no model is loaded\n"
+                    "• The request timed out — try a shorter message or check your network\n\n"
+                    "Check that your chosen provider is running and the model is loaded, then try again."
+                )
         if self._streaming_bubble is not None:
             self._streaming_bubble.label.setText(response_text)
             self._streaming_bubble = None
@@ -1195,17 +1524,58 @@ class SidebarWidget(QWidget):
         self.setup_ui()
 
     def set_theme_colors(self, theme_colors: dict):
-        """Store theme colors for use when refreshing workspace buttons."""
+        """Store theme colors for use when refreshing workspace buttons and nav."""
         self._theme_colors = theme_colors
         fg = theme_colors.get("fg", "#1C1C1E")
         accent = theme_colors.get("accent", "#007AFF")
+        is_dark = theme_colors.get("is_dark", False)
+        hover = "rgba(255, 255, 255, 0.1)" if is_dark else "rgba(0, 0, 0, 0.05)"
         if hasattr(self, "logo_text"):
             self.logo_text.setStyleSheet(f"color: {fg};")
         if hasattr(self, "logo_text2"):
             self.logo_text2.setStyleSheet(f"color: {accent};")
         if hasattr(self, "sep_settings"):
             self.sep_settings.setStyleSheet(f"background-color: {theme_colors.get('border', '#E5E5EA')}; max-height: 1px;")
+        if hasattr(self, "nav_label"):
+            self.nav_label.setStyleSheet(f"color: {fg};")
+        self._refresh_nav_button_styles(fg, accent, hover)
         self.refresh_workspace_buttons()
+
+    def _refresh_nav_button_styles(self, fg: str, accent: str, hover: str):
+        """Apply theme colors to nav buttons (Chat=active, others=inactive)."""
+        active_style = f"""
+            QPushButton {{
+                padding: 0 16px;
+                background-color: {accent};
+                color: white;
+                border: none;
+                border-radius: 10px;
+                text-align: left;
+            }}
+        """
+        inactive_style = f"""
+            QPushButton {{
+                padding: 0 16px;
+                background-color: transparent;
+                color: {fg};
+                border: none;
+                border-radius: 10px;
+                text-align: left;
+            }}
+            QPushButton:hover {{
+                background-color: {hover};
+            }}
+        """
+        nav_buttons = [
+            getattr(self, name, None)
+            for name in (
+                "chat_btn", "workspaces_btn", "memory_btn", "scheduler_btn",
+                "browser_btn", "sessions_btn", "usage_btn", "settings_btn",
+            )
+        ]
+        for btn in nav_buttons:
+            if btn is not None:
+                btn.setStyleSheet(active_style if btn is self.chat_btn else inactive_style)
 
     def set_workspace_manager(self, manager, switch_callback):
         """Set workspace manager and callback for switching. Call refresh_workspace_buttons after."""
@@ -1294,11 +1664,11 @@ class SidebarWidget(QWidget):
         layout.addSpacing(30)
         
         # Section label
-        nav_label = QLabel("MENU")
-        nav_label.setFont(QFont("-apple-system", 11, QFont.Weight.Medium))
-        nav_label.setStyleSheet("color: #8E8E93;")
-        nav_label.setContentsMargins(12, 0, 0, 0)
-        layout.addWidget(nav_label)
+        self.nav_label = QLabel("MENU")
+        self.nav_label.setFont(QFont("-apple-system", 11, QFont.Weight.Medium))
+        self.nav_label.setStyleSheet("color: #8E8E93;")
+        self.nav_label.setContentsMargins(12, 0, 0, 0)
+        layout.addWidget(self.nav_label)
         
         layout.addSpacing(8)
         
@@ -1521,6 +1891,7 @@ class GrizzyClawApp(QMainWindow):
         self.chat_widget = ChatWidget(
             self.agent, settings=self.settings, workspace_manager=self.workspace_manager
         )
+        self.chat_widget.restore_session_from_agent()
         self.canvas_widget = CanvasWidget()
         self.main_splitter.addWidget(self.chat_widget)
         self.main_splitter.addWidget(self.canvas_widget)
@@ -1732,7 +2103,10 @@ class GrizzyClawApp(QMainWindow):
         dialog.exec()
 
     def show_workspaces(self):
-        dialog = WorkspaceDialog(self.workspace_manager, self)
+        dialog = WorkspaceDialog(
+            self.workspace_manager, self,
+            llm_router=getattr(self.agent, "llm_router", None) if getattr(self, "agent", None) else None,
+        )
         dialog.workspace_changed.connect(self.on_workspace_changed)
         dialog.workspace_config_saved.connect(self.on_workspace_config_saved)
         dialog.exec()
@@ -1746,8 +2120,9 @@ class GrizzyClawApp(QMainWindow):
         )
         if new_agent:
             self.agent = new_agent
-            # Update chat widget with new agent
+            # Update chat widget with new agent and restore this workspace's session
             self.chat_widget.agent = new_agent
+            self.chat_widget.restore_session_from_agent()
             # Update window title and chat header with workspace name
             workspace = self.workspace_manager.get_workspace(workspace_id)
             if workspace:
@@ -1770,7 +2145,15 @@ class GrizzyClawApp(QMainWindow):
             self.status_bar.showMessage("Workspace saved. Chat now uses this workspace's provider and model.")
     
     def show_settings(self):
-        dialog = SettingsDialog(self.settings, self)
+        resolved = self._resolve_theme(self.settings.theme)
+        theme_colors = self.get_theme_colors(resolved)
+        dialog = SettingsDialog(self.settings, self, theme_colors=theme_colors)
+
+        def on_settings_saved():
+            self.settings = dialog.get_settings()
+            self.apply_appearance_settings()
+
+        dialog.settings_saved.connect(on_settings_saved)
         if dialog.exec():
             self.settings = dialog.get_settings()
             self.apply_appearance_settings()
@@ -2172,6 +2555,9 @@ class GrizzyClawApp(QMainWindow):
             self.chat_widget.update_separator_colors(theme_colors["border"])
             # Update sidebar theme
             self.sidebar.set_theme_colors(theme_colors)
+
+        # Compact mode (applies to both themes)
+        self.chat_widget.apply_compact_mode(self.settings.compact_mode)
     
     def show_about(self):
         QMessageBox.about(

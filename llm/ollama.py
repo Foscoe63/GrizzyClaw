@@ -76,7 +76,9 @@ class OllamaProvider(LLMProvider):
             payload["options"]["num_predict"] = max_tokens
 
         try:
-            async with aiohttp.ClientSession() as session:
+            # Allow long responses; Ollama can be slow with larger models
+            timeout = aiohttp.ClientTimeout(total=300, connect=30)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(url, json=payload) as response:
                     if response.status != 200:
                         body = ""
@@ -95,7 +97,10 @@ class OllamaProvider(LLMProvider):
                         if line:
                             import json
 
-                            data = json.loads(line)
+                            try:
+                                data = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
                             if "message" in data and "content" in data["message"]:
                                 yield data["message"]["content"]
         except aiohttp.ClientError as e:

@@ -68,6 +68,9 @@ class Settings(BaseSettings):
     default_llm_provider: str = Field(default="ollama", alias="DEFAULT_LLM_PROVIDER")
     default_model: str = Field(default="llama3.2", alias="DEFAULT_MODEL")
     max_tokens: int = Field(default=2000, alias="MAX_TOKENS")  # Per-response limit; workspace overrides
+    # Model routing: use a smaller/faster model for simple tasks (e.g. list files, short Q&A)
+    simple_task_provider: Optional[str] = Field(default=None, alias="SIMPLE_TASK_PROVIDER")
+    simple_task_model: Optional[str] = Field(default=None, alias="SIMPLE_TASK_MODEL")
 
     # Channels
     telegram_bot_token: Optional[str] = Field(default=None, alias="TELEGRAM_BOT_TOKEN")
@@ -145,11 +148,30 @@ class Settings(BaseSettings):
     max_context_length: int = 4000
     max_session_messages: int = 20
     memory_retrieval_limit: int = 10
+    session_persistence: bool = Field(
+        default=True, alias="SESSION_PERSISTENCE"
+    )  # Persist chat sessions to disk across restarts
 
     # Safety
     safety_content_filter: bool = True
     safety_pii_redact_logs: bool = True
     safety_policy: Optional[Dict] = None  # Per-workspace policy dict
+    exec_commands_enabled: bool = Field(
+        default=False, alias="EXEC_COMMANDS_ENABLED"
+    )  # Allow agent to run shell commands (requires approval in GUI)
+    exec_safe_commands_skip_approval: bool = Field(
+        default=True, alias="EXEC_SAFE_COMMANDS_SKIP_APPROVAL"
+    )  # Skip approval for ls, df, pwd, etc.
+    exec_safe_commands: List[str] = Field(
+        default_factory=lambda: ["ls", "df", "pwd", "whoami", "date", "uptime", "echo", "which", "type"],
+        alias="EXEC_SAFE_COMMANDS",
+    )  # Commands that can skip approval when above is True
+    exec_sandbox_enabled: bool = Field(
+        default=False, alias="EXEC_SANDBOX_ENABLED"
+    )  # Run approved commands in restricted env (limited PATH, no network when possible)
+    pre_send_health_check: bool = Field(
+        default=False, alias="PRE_SEND_HEALTH_CHECK"
+    )  # Ping LLM provider before sending; warn if unreachable
 
     # Logging & Observability
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")

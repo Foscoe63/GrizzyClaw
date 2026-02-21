@@ -64,6 +64,20 @@ def _scheduled_tasks_path() -> Path:
     return Path.home() / ".grizzyclaw" / "scheduled_tasks.json"
 
 
+def _sessions_dir() -> Path:
+    """Directory for per-workspace chat session persistence."""
+    d = Path.home() / ".grizzyclaw" / "sessions"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _session_filename(workspace_id: str, user_id: str) -> str:
+    """Safe filename for workspace + user session."""
+    safe_ws = (workspace_id or "default").replace("/", "_").replace("\\", "_")[:64]
+    safe_user = (user_id or "user").replace("/", "_").replace("\\", "_")[:64]
+    return f"{safe_ws}_{safe_user}.json"
+
+
 class AgentCore:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -100,6 +114,7 @@ class AgentCore:
         **kwargs: Any,
     ) -> AsyncIterator[str]:
         on_fallback = kwargs.pop("on_fallback", None)
+        exec_approval_callback = kwargs.pop("exec_approval_callback", None)
         # Evaluate automation triggers (fire webhooks, etc.)
         try:
             from grizzyclaw.automation.triggers import (
@@ -113,7 +128,33 @@ class AgentCore:
                 await execute_trigger_actions(matching, ctx)
         except Exception as e:
             logger.warning("Trigger execution failed (message=%r): %s", message[:50], e)
-        
+
+        # Remote exec approval: "approve" / "reject" for pending command (Telegram, Web)
+        if getattr(self.settings, "exec_commands_enabled", False):
+            from grizzyclaw.automation.exec_utils import (
+                get_and_clear_pending,
+                run_shell_command,
+                add_to_history,
+            )
+            msg_stripped = (message or "").strip().lower()
+            if msg_stripped in ("approve", "yes", "run it", "execute"):
+                pending = get_and_clear_pending(user_id)
+                if pending:
+                    cmd = pending.get("command", "")
+                    cwd = pending.get("cwd")
+                    loop = asyncio.get_event_loop()
+                    output = await loop.run_in_executor(
+                        None, lambda: run_shell_command(cmd, cwd)
+                    )
+                    add_to_history(cmd, cwd)
+                    yield f"✅ **Command executed:**\n```\n{output}\n```\n"
+                    return
+            elif msg_stripped in ("reject", "no", "cancel"):
+                pending = get_and_clear_pending(user_id)
+                if pending:
+                    yield "Command cancelled.\n"
+                    return
+
         # Check for inter-agent @mentions (e.g. @coding analyze this code or @research find X)
         if self.workspace_manager and self.workspace_config and self.workspace_config.enable_inter_agent:
             # Match @target optional_colon message (until next \n@ or end)
@@ -180,9 +221,9 @@ class AgentCore:
                 if debug_path and debug_path.exists():
                     hint += f" Recording saved to Desktop as grizzyclaw_last_voice.wav — play it to verify the mic captured your voice."
                 raise TranscriptionError(f"Transcription failed. {hint}")
-        # Get or create session
+        # Get or create session (load from disk if persistence enabled)
         if user_id not in self.sessions:
-            self.sessions[user_id] = []
+            self.sessions[user_id] = self._load_session(user_id)
 
         session = self.sessions[user_id]
 
@@ -311,6 +352,26 @@ SCHEDULE_TASK = { "action": "delete", "task_id": "task-id-here" }
 Examples:
 - "Remind me to check email every morning at 9" -> SCHEDULE_TASK = { "action": "create", "task": { "name": "Check Email Reminder", "cron": "0 9 * * *", "message": "Time to check your email!" } }
 - "What tasks do I have scheduled?" -> SCHEDULE_TASK = { "action": "list" }
+"""
+        if getattr(self.settings, "exec_commands_enabled", False):
+            system_content += """
+## SHELL COMMANDS (requires user approval)
+
+You can run shell commands on the user's computer. Output EXEC_COMMAND directly—do NOT ask "May I proceed?" in chat. The system shows an approval dialog automatically.
+
+Use this format:
+EXEC_COMMAND = { "command": "shell command here" }
+Optional: EXEC_COMMAND = { "command": "...", "cwd": "/path/to/dir" } to run in a specific directory.
+
+Examples:
+- "List files in my Documents" -> EXEC_COMMAND = { "command": "ls -la ~/Documents" }
+- "Create a folder on my desktop named Test" -> EXEC_COMMAND = { "command": "mkdir -p ~/Desktop/Test" }
+- "List files in /tmp" -> EXEC_COMMAND = { "command": "ls -la", "cwd": "/tmp" }
+- "Check disk space" -> EXEC_COMMAND = { "command": "df -h" }
+- "Show running processes" -> EXEC_COMMAND = { "command": "ps aux | head -20" }
+- "Get Python version" -> EXEC_COMMAND = { "command": "python3 --version" }
+
+Output EXEC_COMMAND in your first response. Default cwd is home directory. Safe commands (ls, df, pwd, whoami, date) may run without approval.
 """
         if self.settings.rules_file:
             try:
@@ -480,10 +541,10 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
         search_triggers = ("search", "internet", "web", "look for", "find information", "look on", "search the")
         msg_lower = message.lower().strip()
         wants_search = any(t in msg_lower for t in search_triggers)
+        use_simple_model = self._is_simple_task(message, images)
 
         try:
             for iteration in range(MAX_AGENTIC_ITERATIONS):
-                response_chunks: List[str] = []
                 content_filter = None
                 if getattr(self.settings, "safety_content_filter", True):
                     policy = getattr(self.settings, "safety_policy", None)
@@ -498,19 +559,41 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
                 )
                 if _temperature is None:
                     _temperature = 0.7
-                async for chunk in self.llm_router.generate(
-                    current_messages,
-                    temperature=_temperature,
-                    max_tokens=_max_tokens,
-                    on_fallback=on_fallback,
-                ):
-                    response_chunks.append(chunk)
-                    out = chunk
-                    if content_filter:
-                        out, _ = content_filter.filter(out)
-                    yield out
+                empty_retry = 0
+                gen_provider = None
+                gen_model = None
+                if use_simple_model and getattr(self.settings, "simple_task_provider", None) and getattr(self.settings, "simple_task_model", None):
+                    gen_provider = self.settings.simple_task_provider
+                    gen_model = self.settings.simple_task_model
+                while empty_retry < 2:
+                    response_chunks = []
+                    async for chunk in self.llm_router.generate(
+                        current_messages,
+                        provider=gen_provider,
+                        model=gen_model,
+                        temperature=_temperature,
+                        max_tokens=_max_tokens,
+                        on_fallback=on_fallback,
+                    ):
+                        response_chunks.append(chunk)
+                        out = chunk
+                        if content_filter:
+                            out, _ = content_filter.filter(out)
+                        yield out
 
-                response_text = "".join(response_chunks)
+                    response_text = "".join(response_chunks)
+                    if response_text.strip() or empty_retry > 0:
+                        break
+                    empty_retry += 1
+                    logger.warning("Empty LLM response, retrying (%s/1)", empty_retry)
+
+                if not response_text.strip() and iteration == 0:
+                    yield (
+                        "The model returned no response. Ollama may still be loading the model—try again in a moment, "
+                        "or run `ollama run <model>` to preload. If using LM Studio, ensure a model is loaded."
+                    )
+                    return
+
                 accumulated_response += response_text
 
                 # Parse MCP TOOL_CALLs
@@ -850,6 +933,37 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
                     logger.exception("Skill action error")
                     yield f"**❌ Skill error: {str(e)}**\n\n"
 
+            # Parse EXEC_COMMAND (shell commands - requires approval when exec_commands_enabled)
+            if getattr(self.settings, "exec_commands_enabled", False):
+                exec_matches = find_json_blocks(response_text, "EXEC_COMMAND")
+                if not exec_matches:
+                    exec_matches = find_json_blocks_fallback(response_text, "EXEC_COMMAND")
+                for match_str in exec_matches:
+                    try:
+                        normalized = normalize_llm_json(match_str)
+                        exec_cmd = None
+                        try:
+                            exec_cmd = json.loads(normalized)
+                        except json.JSONDecodeError:
+                            try:
+                                exec_cmd = ast.literal_eval(normalized)
+                            except (ValueError, SyntaxError):
+                                pass
+                        if not exec_cmd or not isinstance(exec_cmd, dict):
+                            continue
+                        command = (exec_cmd.get("command") or exec_cmd.get("cmd") or "").strip()
+                        if not command:
+                            yield "**❌ EXEC_COMMAND requires a 'command' field.**\n\n"
+                            continue
+                        cwd = (exec_cmd.get("cwd") or "").strip() or None
+                        result = await self._execute_exec_command(
+                            command, cwd, user_id, exec_approval_callback
+                        )
+                        yield f"\n\n**⌘ Shell**\n{result}\n"
+                    except Exception as e:
+                        logger.exception("Exec command error")
+                        yield f"**❌ Exec error: {str(e)}**\n\n"
+
             await self.memory.add(
                 user_id=user_id,
                 content=f"User: {message}\nAssistant: {response_text}",
@@ -864,6 +978,7 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
             max_messages = getattr(self.settings, "max_session_messages", 20)
             session = trim_session(session, max_messages)
             self.sessions[user_id] = session
+            self._save_session(user_id)
 
             # Update metrics
             delta_ms = (time.perf_counter() - start_time) * 1000
@@ -891,9 +1006,71 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
             err_msg = str(e).strip() or "Unknown error"
             yield f"Sorry, I encountered an error. {err_msg}"
 
+    def _session_path(self, user_id: str) -> Path:
+        return _sessions_dir() / _session_filename(self.workspace_id or "default", user_id)
+
+    def _load_session(self, user_id: str) -> List[Dict[str, str]]:
+        """Load session from disk; returns [] if disabled or file missing/invalid."""
+        if not getattr(self.settings, "session_persistence", True):
+            return []
+        path = self._session_path(user_id)
+        if not path.exists():
+            return []
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return [{"role": str(m.get("role", "user")), "content": str(m.get("content", ""))} for m in data]
+            return []
+        except (json.JSONDecodeError, OSError) as e:
+            logger.debug("Could not load session from %s: %s", path, e)
+            return []
+
+    def _save_session(self, user_id: str) -> None:
+        """Persist session to disk."""
+        if not getattr(self.settings, "session_persistence", True):
+            return
+        if user_id not in self.sessions:
+            return
+        path = self._session_path(user_id)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self.sessions[user_id], f, indent=0, ensure_ascii=False)
+        except OSError as e:
+            logger.debug("Could not save session to %s: %s", path, e)
+
+    def get_persisted_session(self, user_id: str) -> List[Dict[str, str]]:
+        """Load session from disk and populate in-memory session (for GUI restore)."""
+        session = self._load_session(user_id)
+        if session:
+            self.sessions[user_id] = session
+        return session
+
+    def _is_simple_task(self, message: str, images: Optional[List[str]] = None) -> bool:
+        """Heuristic: True if the request looks like a simple task (list files, short Q&A) for model routing."""
+        if not message or not isinstance(message, str):
+            return False
+        if images and len(images) > 0:
+            return False
+        msg = message.strip()
+        if len(msg) > 220:
+            return False
+        simple_triggers = (
+            "list files", "list the files", "what's in", "whats in", "show me the files",
+            "files in", "ls ", " ls", "directory of", "contents of", "pwd", " whoami", "date",
+            "uptime", "list directory", "show directory", "what is in this folder",
+        )
+        return any(t in msg.lower() for t in simple_triggers)
+
     async def clear_session(self, user_id: str):
         if user_id in self.sessions:
             del self.sessions[user_id]
+        path = self._session_path(user_id)
+        if path.exists():
+            try:
+                path.unlink()
+            except OSError:
+                pass
 
     async def get_user_memory(self, user_id: str) -> Dict[str, Any]:
         return await self.memory.get_user_memory(user_id)
@@ -1123,6 +1300,49 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
         except Exception as e:
             logger.exception("Skill execution error")
             return f"❌ Skill error: {e}"
+
+    async def _execute_exec_command(
+        self,
+        command: str,
+        cwd: Optional[str],
+        user_id: str,
+        approval_callback: Optional[Any],
+    ) -> str:
+        """Run a shell command. Supports allowlist (skip approval), GUI approval, or remote approve/reject."""
+        if not getattr(self.settings, "exec_commands_enabled", False):
+            return "❌ Shell commands are disabled. Enable in Settings → Security → Allow shell commands."
+        from grizzyclaw.automation.exec_utils import (
+            is_safe_command,
+            run_shell_command,
+            set_pending,
+            add_to_history,
+        )
+        allowlist = getattr(self.settings, "exec_safe_commands", None)
+        skip_approval = getattr(self.settings, "exec_safe_commands_skip_approval", True)
+        if skip_approval and is_safe_command(command, allowlist):
+            loop = asyncio.get_event_loop()
+            output = await loop.run_in_executor(
+                None, lambda: run_shell_command(command, cwd)
+            )
+            add_to_history(command, cwd)
+            return output or "(no output)"
+        if approval_callback is not None:
+            try:
+                approved, output = await approval_callback(command, cwd)
+                if not approved:
+                    return f"User rejected command: {command}"
+                add_to_history(command, cwd)
+                return output or "(no output)"
+            except Exception as e:
+                logger.exception("Exec command error")
+                return f"❌ Exec error: {e}"
+        # Remote: no GUI, store pending and ask for approve/reject
+        set_pending(user_id, command, cwd)
+        cwd_hint = f" (in {cwd})" if cwd else ""
+        return (
+            f"⏳ **Command pending approval:** `{command}`{cwd_hint}\n\n"
+            "Reply **approve** to run, or **reject** to cancel."
+        )
 
     def get_scheduled_tasks(self) -> List[Dict]:
         """Get list of scheduled tasks for GUI"""

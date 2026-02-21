@@ -8,6 +8,7 @@ CONTEXT_PRIORITY_MARKERS = (
     "BROWSER_ACTION",
     "SCHEDULE_TASK",
     "MEMORY_SAVE",
+    "EXEC_COMMAND",
     "\u2692",  # 🔧
 )
 
