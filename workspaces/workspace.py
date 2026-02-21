@@ -16,7 +16,7 @@ class WorkspaceConfig:
     llm_provider: str = "ollama"
     llm_model: str = "llama3.2"
     temperature: float = 0.7
-    max_tokens: int = 2000
+    max_tokens: int = 131072
     
     # API Keys (optional override per workspace)
     openai_api_key: Optional[str] = None
@@ -31,6 +31,8 @@ class WorkspaceConfig:
     # Behavior
     system_prompt: str = "You are a helpful AI assistant."
     rules_file: Optional[str] = None
+    use_agents_sdk: bool = False  # Use OpenAI Agents SDK + LiteLLM for improved coding (multi-provider)
+    agents_sdk_max_turns: int = 25  # Max agent turns when use_agents_sdk (tool-call iterations)
     enabled_skills: List[str] = field(default_factory=list)
     
     # Memory
@@ -173,7 +175,8 @@ WORKSPACE_TEMPLATES = {
         icon="🤖",
         color="#007AFF",
         config=WorkspaceConfig(
-            system_prompt="You are GrizzyClaw, a helpful AI assistant with memory. You can remember previous conversations and use that context to help the user.\n\n## SWARM LEADER\nBreak complex tasks into subtasks. Delegate by writing lines like:\n@research Research X.\n@coding Code Y.\n@personal Plan Z.\nUse workspace slugs: @research, @coding, @personal, @writing, or @code_assistant etc. Your delegations are executed automatically; specialist replies are then synthesized into one answer when consensus is on. Use shared memory to recall context.",
+            max_tokens=131072,
+            system_prompt="You are GrizzyClaw, a helpful AI assistant with memory. You can remember previous conversations and use that context to help the user.\n\n## SWARM LEADER\nBreak complex tasks into subtasks. Delegate by writing lines like:\n@research Research X.\n@coding Code Y.\n@personal Plan Z.\nUse workspace slugs: @research, @coding, @personal, @writing, @planning, or @code_assistant etc. Your delegations are executed automatically; specialist replies are then synthesized into one answer when consensus is on. Use shared memory to recall context.",
             enable_inter_agent=True,
             use_shared_memory=True,
             swarm_role="leader",
@@ -188,9 +191,9 @@ WORKSPACE_TEMPLATES = {
         icon="💻",
         color="#34C759",
         config=WorkspaceConfig(
-            system_prompt="You are a senior software engineer assistant. Help with coding, debugging, code review, and software architecture. Be precise and provide working code examples.\n\n## SPECIALIST_CODING\nFocus on coding tasks. Respond concisely. If needed, @leader with summary.",
-            temperature=0.3,
-            max_tokens=4000,
+            system_prompt="You are a senior software engineer assistant. Help with coding, debugging, code review, and software architecture. Be precise and provide working code examples.\n\n## CREATING FILES / APPS\nWhen asked to build, create, or write an app or files: use TOOL_CALL with fast-filesystem. The tool is \"fast_write_file\" (path, content). First call fast_list_allowed_directories to see writable paths. The path the user gives is the TARGET FOLDER—write files directly into it (e.g. /Users/ewg/ZZZZ/TodoApp.swift). Use the existing folder or it will be created. Do NOT add a subfolder with the same name (e.g. not ZZZZ/ZZZZ/). Output TOOL_CALL for each file. NEVER just describe—actually create them. If you cannot output TOOL_CALL, output each file as: ### Filename.swift then ```swift\\n<full source>\\n```.\n\n## FAST-FILESYSTEM (exact names, copy exactly)\n- fast_list_allowed_directories (NOT fast_list_allowed_DIRECTORIES)\n- fast_write_file\n- fast_create_directory (NOT fast_make_dir, fast_make_directories, fast_createdirectory—use underscore between create and directory)\n- fast_list_directory, fast_get_directory_tree\n- recursive: use boolean true or false, NEVER the string \"true\" or \"false\"\n- Paths: on macOS use /Users/ (capital U), never /users/. Example: /Users/ewg/ToDo\n\nMatch the user's scope: if they ask for robust, feature-rich, feature-filled, professional, or beautiful—implement many features, a polished UI, preferences/settings, and do not default to minimal implementations. Honor adjectives like \"do not scrimp\" or \"plenty of features.\"\n\nWhen given a detailed plan, phased implementation, or step-by-step guide: implement the FULL plan. Create ALL files specified. Output MULTIPLE TOOL_CALLs in the same response—one per file. Do NOT stop after one file.\n\n## SPECIALIST_CODING\nFocus on coding tasks. If needed, @leader with summary.",
+            temperature=0.55,
+            max_tokens=131072,
             enable_inter_agent=True,
             use_shared_memory=True,
             swarm_role="specialist_coding",
@@ -203,6 +206,7 @@ WORKSPACE_TEMPLATES = {
         icon="✍️",
         color="#FF9500",
         config=WorkspaceConfig(
+            max_tokens=131072,
             system_prompt="You are a professional writing assistant. Help with creative writing, editing, proofreading, and content creation. Be articulate and suggest improvements.\n\n## SPECIALIST_WRITING\nFocus on writing tasks. Respond concisely. If needed, @leader with summary.",
             temperature=0.8,
             enable_inter_agent=True,
@@ -217,6 +221,7 @@ WORKSPACE_TEMPLATES = {
         icon="🔬",
         color="#5856D6",
         config=WorkspaceConfig(
+            max_tokens=131072,
             system_prompt="You are a research assistant. Help gather information, summarize findings, analyze data, and provide well-sourced insights. Be thorough and cite sources when possible.\n\n## SPECIALIST_RESEARCH\nFocus on research tasks. Respond concisely. If needed, @leader with summary.",
             temperature=0.5,
             enabled_skills=["web_search"],
@@ -232,12 +237,28 @@ WORKSPACE_TEMPLATES = {
         icon="📋",
         color="#FF2D55",
         config=WorkspaceConfig(
+            max_tokens=131072,
             system_prompt="You are a personal assistant. Help with scheduling, reminders, task management, and daily planning. Be organized and proactive.\n\n## SPECIALIST_PERSONAL\nFocus on personal tasks. Respond concisely. If needed, @leader with summary.",
             enabled_skills=["scheduler"],
             enable_inter_agent=True,
             use_shared_memory=True,
             swarm_role="specialist_personal",
             proactive_habits=True
+        )
+    ),
+    "planning": Workspace(
+        name="Planning Assistant",
+        description="Project planning, roadmaps, and strategy",
+        icon="🗺️",
+        color="#00C7BE",
+        config=WorkspaceConfig(
+            max_tokens=131072,
+            system_prompt="You are a planning assistant. Help with project planning, roadmaps, milestones, task breakdown, sprint planning, resource allocation, and decision frameworks. Structure ideas into clear phases, dependencies, and timelines. Be thorough and methodical.\n\n## SPECIALIST_PLANNING\nFocus on planning tasks. Break down complex goals into actionable steps. If needed, @leader with summary.",
+            temperature=0.5,
+            enable_inter_agent=True,
+            use_shared_memory=True,
+            swarm_role="specialist_planning",
+            proactive_habits=False
         )
     ),
 }

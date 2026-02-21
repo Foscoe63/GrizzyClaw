@@ -206,7 +206,11 @@ async def _call_tool_http(
                     return "\n".join(parts) if parts else "(No output)"
     except Exception as e:
         logger.exception(f"MCP HTTP tool call failed: {tool_name}")
-        return f"**❌ Tool error:** {str(e)}"
+        err_msg = str(e)
+        if hasattr(e, "exceptions") and e.exceptions:
+            sub = e.exceptions[0]
+            err_msg = f"{type(sub).__name__}: {sub}"
+        return f"**❌ Tool error:** {err_msg}"
 
 
 async def discover_tools(mcp_file: Path) -> Dict[str, List[Tuple[str, str]]]:
@@ -296,4 +300,9 @@ async def call_mcp_tool(
         return f"**❌ Command not found:** {cmd}. Ensure it's installed and in PATH."
     except Exception as e:
         logger.exception(f"MCP tool call failed: {mcp_name}.{tool_name}")
-        return f"**❌ Tool error:** {str(e)}"
+        # Unwrap ExceptionGroup (Python 3.11+) to show the actual cause
+        err_msg = str(e)
+        if hasattr(e, "exceptions") and e.exceptions:
+            sub = e.exceptions[0]
+            err_msg = f"{type(sub).__name__}: {sub}"
+        return f"**❌ Tool error:** {err_msg}"

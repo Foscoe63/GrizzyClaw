@@ -129,7 +129,10 @@ class UsageDashboardDialog(QDialog):
                 self.ws_table.setItem(row, 1, QTableWidgetItem(str(ws.get("message_count", 0))))
                 self.ws_table.setItem(row, 2, QTableWidgetItem(f"{ws.get('avg_response_time_ms', 0):.0f}"))
                 self.ws_table.setItem(row, 3, QTableWidgetItem(f"{ws.get('total_tokens', 0):,}"))
-                self.ws_table.setItem(row, 4, QTableWidgetItem(f"{ws.get('quality_score', 0):.1f}"))
+                q = ws.get("quality_score", 0)
+                total_fb = ws.get("feedback_up", 0) + ws.get("feedback_down", 0)
+                q_str = f"{q:.1f}%" if total_fb > 0 else "N/A"
+                self.ws_table.setItem(row, 4, QTableWidgetItem(q_str))
         else:
             self.ws_table.setRowCount(0)
 

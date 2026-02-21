@@ -10,13 +10,13 @@ logger = logging.getLogger(__name__)
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QTextEdit, QLineEdit, QPushButton, QLabel, QSystemTrayIcon,
+    QTextEdit, QLineEdit, QPlainTextEdit, QPushButton, QLabel, QSystemTrayIcon,
     QMenu, QMenuBar, QMessageBox, QSplitter, QListWidget, QListWidgetItem,
     QFrame, QScrollArea, QToolBar, QStatusBar, QSizePolicy,
     QFileDialog, QStackedWidget,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QMimeData
-from PyQt6.QtGui import QAction, QIcon, QFont, QPalette, QColor, QKeySequence, QShortcut, QDragEnterEvent, QDropEvent
+from PyQt6.QtGui import QAction, QIcon, QFont, QPalette, QColor, QKeySequence, QShortcut, QDragEnterEvent, QDropEvent, QKeyEvent
 
 
 from grizzyclaw import __version__
@@ -107,6 +107,7 @@ class MessageWorker(QThread):
     chunk_ready = pyqtSignal(str)
     transcript_ready = pyqtSignal(str)
     error_occurred = pyqtSignal(str)
+    provider_fallback = pyqtSignal(str)  # (fallback_provider_name) when LLM falls back to another provider
 
     def __init__(self, agent, user_id, message, images=None, audio_path=None, stop_requested=None):
         super().__init__()
@@ -170,6 +171,11 @@ class MessageWorker(QThread):
         if audio_path:
             kwargs["audio_path"] = audio_path
 
+        def _on_fallback(provider_name: str) -> None:
+            self.provider_fallback.emit(provider_name)
+
+        kwargs["on_fallback"] = _on_fallback
+
         async def stream_consumer():
             nonlocal response_text
             async for chunk in self.agent.process_message(
@@ -213,6 +219,8 @@ class MessageWorker(QThread):
 
 class MessageBubble(QFrame):
     speak_requested = pyqtSignal(str)
+    feedback_up_requested = pyqtSignal()
+    feedback_down_requested = pyqtSignal()
 
     def __init__(self, text, is_user=True, parent=None, is_dark=False, avatar_path: Optional[str] = None):
         super().__init__(parent)
@@ -263,6 +271,26 @@ class MessageBubble(QFrame):
             """)
             self.speak_btn.clicked.connect(lambda: self.speak_requested.emit(self.label.text()))
             layout.addWidget(self.speak_btn, alignment=Qt.AlignmentFlag.AlignLeft)
+            self.feedback_up_btn = QPushButton("👍")
+            self.feedback_up_btn.setToolTip("Good response")
+            self.feedback_up_btn.setFixedSize(28, 28)
+            self.feedback_up_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.feedback_up_btn.setStyleSheet("""
+                QPushButton { background: transparent; border: none; border-radius: 14px; }
+                QPushButton:hover { background: rgba(0,0,0,0.1); }
+            """)
+            self.feedback_up_btn.clicked.connect(self.feedback_up_requested.emit)
+            layout.addWidget(self.feedback_up_btn, alignment=Qt.AlignmentFlag.AlignLeft)
+            self.feedback_down_btn = QPushButton("👎")
+            self.feedback_down_btn.setToolTip("Poor response")
+            self.feedback_down_btn.setFixedSize(28, 28)
+            self.feedback_down_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.feedback_down_btn.setStyleSheet("""
+                QPushButton { background: transparent; border: none; border-radius: 14px; }
+                QPushButton:hover { background: rgba(0,0,0,0.1); }
+            """)
+            self.feedback_down_btn.clicked.connect(self.feedback_down_requested.emit)
+            layout.addWidget(self.feedback_down_btn, alignment=Qt.AlignmentFlag.AlignLeft)
             layout.addStretch()
 
         self.setMaximumWidth(750)
@@ -361,16 +389,34 @@ class MultiAgentPanel(QWidget):
                 item.widget().deleteLater()
 
 
+class ChatInput(QPlainTextEdit):
+    """Multi-line chat input: Enter sends, Shift+Enter inserts newline."""
+    return_pressed = pyqtSignal()
+
+    def keyPressEvent(self, event: QKeyEvent):
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                # Shift+Enter: insert newline
+                super().keyPressEvent(event)
+            else:
+                # Enter: send message
+                self.return_pressed.emit()
+                event.accept()
+        else:
+            super().keyPressEvent(event)
+
+
 class ChatWidget(QWidget):
     message_received = pyqtSignal(str, bool)
     message_added = pyqtSignal(str, bool, str)  # text, is_user, sender
     conversation_cleared = pyqtSignal()
     image_attached = pyqtSignal(str)  # path to display in canvas
 
-    def __init__(self, agent, parent=None, settings=None):
+    def __init__(self, agent, parent=None, settings=None, workspace_manager=None):
         super().__init__(parent)
         self.agent = agent
         self._settings = settings
+        self._workspace_manager = workspace_manager
         self.user_id = "gui_user"
         self.current_conversation = []
         self._workspace_display_name = "Assistant"
@@ -546,27 +592,28 @@ class ChatWidget(QWidget):
         self.pending_images: list[str] = []
         self.pending_audio: Optional[str] = None
 
-        self.input_field = QLineEdit()
-        self.input_field.setPlaceholderText("Type your message… Use @workspace to delegate (e.g. @code_assistant analyze this).")
+        self.input_field = ChatInput()
+        self.input_field.setPlaceholderText("Type your message… Use @workspace to delegate (e.g. @code_assistant analyze this). Shift+Enter for new line.")
         self.input_field.setFont(QFont("-apple-system", 14))
-        self.input_field.setFixedHeight(44)
+        self.input_field.setMinimumHeight(44)
+        self.input_field.setMaximumHeight(120)
         self.input_field.setStyleSheet("""
-            QLineEdit {
-                padding: 0 16px;
+            QPlainTextEdit {
+                padding: 10px 16px;
                 border: 1px solid #D1D1D6;
                 border-radius: 22px;
                 background: #FFFFFF;
                 color: #1C1C1E;
             }
-            QLineEdit:focus {
+            QPlainTextEdit:focus {
                 border-color: #007AFF;
                 border-width: 2px;
             }
-            QLineEdit::placeholder {
+            QPlainTextEdit::placeholder {
                 color: #8E8E93;
             }
         """)
-        self.input_field.returnPressed.connect(self.send_message)
+        self.input_field.return_pressed.connect(self.send_message)
         self.input_field.setAcceptDrops(True)
         self.input_field.dragEnterEvent = self._input_drag_enter
         self.input_field.dropEvent = self._input_drop
@@ -857,7 +904,7 @@ class ChatWidget(QWidget):
             self.send_btn.show()
 
     def send_message(self):
-        text = self.input_field.text().strip()
+        text = self.input_field.toPlainText().strip()
         images = list(self.pending_images)
         audio_path = self.pending_audio
         if not text and not images and not audio_path:
@@ -897,6 +944,7 @@ class ChatWidget(QWidget):
         self.worker.chunk_ready.connect(self._on_stream_chunk)
         self.worker.message_ready.connect(self.on_message_ready)
         self.worker.error_occurred.connect(self.on_error)
+        self.worker.provider_fallback.connect(self._on_provider_fallback)
         if audio_path and user_bubble:
             prefix = text if text else ""
             def _on_transcript(transcript: str):
@@ -939,6 +987,7 @@ class ChatWidget(QWidget):
                 "", is_user=False, is_dark=self.is_dark, avatar_path=self._workspace_avatar_path
             )
             self._streaming_bubble.speak_requested.connect(self._on_speak_requested)
+            self._connect_feedback(self._streaming_bubble)
             self.chat_layout.insertWidget(self.chat_layout.count() - 1, self._streaming_bubble)
         current = self._streaming_bubble.label.text()
         self._streaming_bubble.label.setText(current + chunk)
@@ -965,7 +1014,13 @@ class ChatWidget(QWidget):
             self.message_added.emit(error_message, False, self._workspace_display_name)
         else:
             self.message_received.emit(error_message, False)
-    
+
+    def _on_provider_fallback(self, fallback_provider: str):
+        """Update status bar when LLM falls back to another provider (e.g. OpenAI failed -> LM Studio)."""
+        mw = self.window()
+        if mw and hasattr(mw, "status_bar"):
+            mw.status_bar.showMessage(f"Primary provider failed, using {fallback_provider}...")
+
     def _export_conversation(self):
         """Export current conversation to a file (Markdown or plain text)."""
         messages = []
@@ -1026,6 +1081,29 @@ class ChatWidget(QWidget):
                 f"Could not export: {e}",
             )
 
+    def _connect_feedback(self, bubble: "MessageBubble"):
+        """Connect feedback signals to record thumbs up/down on active workspace."""
+        if not self._workspace_manager:
+            return
+        active = self._workspace_manager.get_active_workspace()
+        if not active:
+            return
+
+        def on_up():
+            self._workspace_manager.record_feedback(active.id, up=True)
+            mw = self.window()
+            if mw and hasattr(mw, "status_bar"):
+                mw.status_bar.showMessage("Thanks for your feedback!", 2000)
+
+        def on_down():
+            self._workspace_manager.record_feedback(active.id, up=False)
+            mw = self.window()
+            if mw and hasattr(mw, "status_bar"):
+                mw.status_bar.showMessage("Thanks for your feedback.", 2000)
+
+        bubble.feedback_up_requested.connect(on_up)
+        bubble.feedback_down_requested.connect(on_down)
+
     def add_message(self, text, is_user=True, sender=None):
         if sender is None:
             sender = "You" if is_user else self._workspace_display_name
@@ -1034,6 +1112,7 @@ class ChatWidget(QWidget):
         bubble = MessageBubble(text, is_user, is_dark=self.is_dark, avatar_path=avatar)
         if not is_user:
             bubble.speak_requested.connect(self._on_speak_requested)
+            self._connect_feedback(bubble)
         self.chat_layout.insertWidget(self.chat_layout.count() - 1, bubble)
         self.message_added.emit(text, is_user, sender)
         # Scroll to bottom (smart scroll: only when user is near bottom)
@@ -1066,35 +1145,35 @@ class ChatWidget(QWidget):
         # Update input field style
         if is_dark:
             self.input_field.setStyleSheet("""
-                QLineEdit {
-                    padding: 0 16px;
+                QPlainTextEdit {
+                    padding: 10px 16px;
                     border: 1px solid #48484A;
                     border-radius: 22px;
                     background: #3A3A3C;
                     color: #FFFFFF;
                 }
-                QLineEdit:focus {
+                QPlainTextEdit:focus {
                     border-color: #0A84FF;
                     border-width: 2px;
                 }
-                QLineEdit::placeholder {
+                QPlainTextEdit::placeholder {
                     color: #8E8E93;
                 }
             """)
         else:
             self.input_field.setStyleSheet("""
-                QLineEdit {
-                    padding: 0 16px;
+                QPlainTextEdit {
+                    padding: 10px 16px;
                     border: 1px solid #D1D1D6;
                     border-radius: 22px;
                     background: #FFFFFF;
                     color: #1C1C1E;
                 }
-                QLineEdit:focus {
+                QPlainTextEdit:focus {
                     border-color: #007AFF;
                     border-width: 2px;
                 }
-                QLineEdit::placeholder {
+                QPlainTextEdit::placeholder {
                     color: #8E8E93;
                 }
             """)
@@ -1439,7 +1518,9 @@ class GrizzyClawApp(QMainWindow):
         self.content_layout.setSpacing(0)
 
         self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
-        self.chat_widget = ChatWidget(self.agent, settings=self.settings)
+        self.chat_widget = ChatWidget(
+            self.agent, settings=self.settings, workspace_manager=self.workspace_manager
+        )
         self.canvas_widget = CanvasWidget()
         self.main_splitter.addWidget(self.chat_widget)
         self.main_splitter.addWidget(self.canvas_widget)

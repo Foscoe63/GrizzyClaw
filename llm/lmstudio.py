@@ -99,3 +99,28 @@ class LMStudioProvider(LLMProvider):
         except Exception as e:
             logger.debug("LM Studio list_models failed: %s", e)
             return []
+
+    def _native_api_base(self) -> str:
+        """LM Studio native API is at /api/v0, OpenAI-compat is at /v1. Strip /v1 to get host."""
+        base = self.base_url.rstrip("/")
+        if base.endswith("/v1"):
+            return base[:-3]  # http://localhost:1234
+        return base
+
+    async def get_model_context_length(self, model: str) -> Optional[int]:
+        """Query model's max_context_length via native GET /api/v0/models/{model}."""
+        try:
+            host = self._native_api_base()
+            url = f"{host}/api/v0/models/{model}"
+            headers = {}
+            if self.api_key:
+                headers["Authorization"] = f"Bearer {self.api_key}"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers or None) as response:
+                    if response.status != 200:
+                        return None
+                    data = await response.json()
+                    return data.get("max_context_length")
+        except Exception as e:
+            logger.debug("LM Studio get_model_context_length failed: %s", e)
+            return None

@@ -99,7 +99,7 @@ class WorkspaceManager:
             description: Description
             icon: Emoji icon
             color: Color hex code
-            template: Template name (default, coding, writing, research, personal)
+            template: Template name (default, coding, writing, research, personal, planning)
             config: Custom configuration (overrides template)
         
         Returns:
@@ -238,6 +238,16 @@ class WorkspaceManager:
             self._create_default_workspace()
         return self.get_workspaces_sorted()
     
+    def record_feedback(self, workspace_id: str, up: bool) -> None:
+        """Record thumbs up (True) or thumbs down (False) for a workspace. Persists immediately."""
+        ws = self.workspaces.get(workspace_id)
+        if ws:
+            if up:
+                ws.feedback_up += 1
+            else:
+                ws.feedback_down += 1
+            self._save_workspaces()
+
     def get_workspace_stats(self) -> Dict[str, Any]:
         """Get statistics about workspaces"""
         return {
@@ -255,6 +265,8 @@ class WorkspaceManager:
                     "avg_response_time_ms": round(ws.avg_response_time_ms, 1),
                     "total_tokens": ws.total_tokens,
                     "quality_score": round(ws.quality_score, 1),
+                    "feedback_up": ws.feedback_up,
+                    "feedback_down": ws.feedback_down,
                 }
                 for ws in self.get_workspaces_sorted()
             ]
@@ -301,6 +313,7 @@ class WorkspaceManager:
             settings.openrouter_model = config.llm_model
         settings.system_prompt = config.system_prompt
         settings.max_context_length = config.max_context_length
+        settings.max_tokens = getattr(config, "max_tokens", 2000)
         settings.max_session_messages = config.max_session_messages
         settings.safety_content_filter = getattr(config, "safety_content_filter", True)
         settings.safety_pii_redact_logs = getattr(config, "safety_pii_redact_logs", True)
@@ -476,7 +489,7 @@ class WorkspaceManager:
                 response = "".join(chunks)
             elif hasattr(response, "__iter__"):
                 response = "".join(response)
-            return str(response)[:1000]  # Truncate long responses
+            return str(response)[:8000]  # Truncate very long responses; 8k for multi-file tool results
         except Exception as e:
             logger.error(f"Inter-agent error: {e}")
             return f"Error: {str(e)}"

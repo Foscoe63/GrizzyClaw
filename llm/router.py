@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from typing import Any, AsyncIterator, Dict, List, Optional
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 
 from . import (
     LLMProvider,
@@ -84,9 +84,12 @@ class LLMRouter:
         messages: List[Dict[str, Any]],
         provider: Optional[str] = None,
         model: Optional[str] = None,
+        on_fallback: Optional[Callable[[str], None]] = None,
         **kwargs,
     ) -> AsyncIterator[str]:
         provider_name = provider or self.default_provider
+        # Pop so we don't pass to provider.generate
+        kwargs.pop("on_fallback", None)
 
         if not provider_name or provider_name not in self.providers:
             raise LLMError(f"Provider '{provider_name}' not available")
@@ -152,6 +155,11 @@ class LLMRouter:
                 try:
                     if await fallback.health_check():
                         logger.info(f"Falling back to {name}")
+                        if on_fallback:
+                            try:
+                                on_fallback(name)
+                            except Exception:
+                                pass
                         async for chunk in fallback.generate(
                             messages, model=model, **kwargs
                         ):
@@ -176,6 +184,22 @@ class LLMRouter:
             except (asyncio.TimeoutError, Exception):
                 results[name] = False
         return results
+
+    async def get_model_max_context_length(
+        self, provider: str, model: str
+    ) -> Optional[int]:
+        """Query model's max context length (Ollama/LM Studio only). Returns None if unsupported or failed."""
+        if not model or provider not in self.providers:
+            return None
+        prov = self.providers[provider]
+        if hasattr(prov, "get_model_context_length"):
+            try:
+                return await asyncio.wait_for(
+                    prov.get_model_context_length(model), timeout=5.0
+                )
+            except (asyncio.TimeoutError, Exception) as e:
+                logger.debug("get_model_max_context_length failed: %s", e)
+        return None
 
     async def list_models(self, provider: Optional[str] = None) -> List[Dict[str, Any]]:
         if provider and provider in self.providers:

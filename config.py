@@ -67,6 +67,7 @@ class Settings(BaseSettings):
     # Default LLM settings
     default_llm_provider: str = Field(default="ollama", alias="DEFAULT_LLM_PROVIDER")
     default_model: str = Field(default="llama3.2", alias="DEFAULT_MODEL")
+    max_tokens: int = Field(default=2000, alias="MAX_TOKENS")  # Per-response limit; workspace overrides
 
     # Channels
     telegram_bot_token: Optional[str] = Field(default=None, alias="TELEGRAM_BOT_TOKEN")

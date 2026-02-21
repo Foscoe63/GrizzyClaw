@@ -123,6 +123,32 @@ class OllamaProvider(LLMProvider):
             logger.debug("Ollama list_models failed: %s", e)
             return []
 
+    async def get_model_context_length(self, model: str) -> Optional[int]:
+        """Query model's max context length via /api/show. Returns None on failure."""
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{self.base_url}/api/show", json={"model": model, "verbose": False}
+                ) as response:
+                    if response.status != 200:
+                        return None
+                    data = await response.json()
+                    # model_info: {"gemma3.context_length": 131072, ...} or parameters: "num_ctx 2048"
+                    mi = data.get("model_info") or {}
+                    for k, v in mi.items():
+                        if k.endswith(".context_length") or k == "context_length":
+                            if isinstance(v, (int, float)):
+                                return int(v)
+                    params = (data.get("parameters") or "").strip()
+                    for line in params.splitlines():
+                        parts = line.split()
+                        if len(parts) >= 2 and parts[0] == "num_ctx":
+                            return int(parts[1])
+                    return None
+        except Exception as e:
+            logger.debug("Ollama get_model_context_length failed: %s", e)
+            return None
+
     async def pull_model(self, model: str) -> bool:
         url = f"{self.base_url}/api/pull"
         payload = {"name": model, "stream": False}

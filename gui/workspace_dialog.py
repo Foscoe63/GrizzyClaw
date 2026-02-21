@@ -231,6 +231,7 @@ class WorkspaceDialog(QDialog):
         self.model_combo.setEditable(True)  # Allow custom model entry
         self.model_combo.setPlaceholderText("Select or type model name")
         self.model_combo.setMinimumWidth(200)
+        self.model_combo.currentTextChanged.connect(self._on_model_changed)
         model_row.addWidget(self.model_combo)
         
         self.refresh_models_btn = QPushButton("🔄")
@@ -248,15 +249,36 @@ class WorkspaceDialog(QDialog):
         llm_layout.addRow("Temperature:", self.temp_spin)
         
         self.max_tokens_spin = QSpinBox()
-        self.max_tokens_spin.setRange(100, 32000)
-        self.max_tokens_spin.setValue(2000)
+        self.max_tokens_spin.setRange(100, 131072)
+        self.max_tokens_spin.setValue(131072)
         llm_layout.addRow("Max Tokens:", self.max_tokens_spin)
+
+        self.model_max_context_lbl = QLabel("")
+        self.model_max_context_lbl.setStyleSheet("color: gray; font-size: 11px;")
+        self.model_max_context_lbl.setWordWrap(True)
+        llm_layout.addRow(self.model_max_context_lbl)
 
         self.max_session_spin = QSpinBox()
         self.max_session_spin.setRange(4, 100)
         self.max_session_spin.setValue(20)
         self.max_session_spin.setToolTip("Max conversation turns to keep. Older tool-heavy messages are prioritized.")
         llm_layout.addRow("Context Window (messages):", self.max_session_spin)
+
+        self.use_agents_sdk_cb = QCheckBox("Use Agents SDK (OpenAI + LiteLLM)")
+        self.use_agents_sdk_cb.setToolTip(
+            "Use OpenAI Agents SDK with LiteLLM for improved coding workflows. "
+            "Requires: pip install 'openai-agents[litellm]'. Uses MCP tools natively."
+        )
+        llm_layout.addRow(self.use_agents_sdk_cb)
+
+        self.max_turns_spin = QSpinBox()
+        self.max_turns_spin.setRange(5, 100)
+        self.max_turns_spin.setValue(25)
+        self.max_turns_spin.setToolTip(
+            "Max agent turns when using Agents SDK (tool-call iterations). "
+            "Increase for complex multi-file coding tasks."
+        )
+        llm_layout.addRow("Agents SDK Max Turns:", self.max_turns_spin)
 
         self.tabs.addTab(llm_tab, "LLM")
         
@@ -310,7 +332,7 @@ class WorkspaceDialog(QDialog):
         self.use_shared_memory_cb.setToolTip("When enabled, this workspace shares a memory DB with other workspaces on the same channel for swarm context.")
         swarm_layout.addRow(self.use_shared_memory_cb)
         self.swarm_auto_delegate_cb = QCheckBox("Leader: auto-run @mentions from my response (break task → delegate to specialists)")
-        self.swarm_auto_delegate_cb.setToolTip("When this workspace is the leader, any @research / @coding / @personal lines in its reply are executed and specialist replies are collected.")
+        self.swarm_auto_delegate_cb.setToolTip("When this workspace is the leader, any @research / @coding / @personal / @planning lines in its reply are executed and specialist replies are collected.")
         swarm_layout.addRow(self.swarm_auto_delegate_cb)
         self.swarm_consensus_cb = QCheckBox("Leader: synthesize specialist replies into one consensus answer")
         self.swarm_consensus_cb.setToolTip("After delegations, call the leader again to combine specialist responses into a single recommendation.")
@@ -328,7 +350,7 @@ class WorkspaceDialog(QDialog):
         self.proactive_file_triggers_cb.setToolTip("Watch ~/.grizzyclaw/file_watcher.json for watch_dirs; triggers.json can use event file_change or git_event.")
         proact_layout.addRow(self.proactive_file_triggers_cb)
         swarm_layout.addRow(proact_group)
-        swarm_hint = QLabel("Tip: In chat, use @workspace_slug or @Workspace Name to delegate (e.g. @coding analyze this code). Leader can output @research / @coding / @personal to auto-delegate.")
+        swarm_hint = QLabel("Tip: In chat, use @workspace_slug or @Workspace Name to delegate (e.g. @coding analyze this code). Leader can output @research / @coding / @personal / @planning to auto-delegate.")
         swarm_hint.setWordWrap(True)
         swarm_hint.setStyleSheet("color: gray; font-size: 11px;")
         swarm_layout.addRow(swarm_hint)
@@ -542,6 +564,9 @@ class WorkspaceDialog(QDialog):
         self.temp_spin.setValue(workspace.config.temperature)
         self.max_tokens_spin.setValue(workspace.config.max_tokens)
         self.max_session_spin.setValue(getattr(workspace.config, "max_session_messages", 20))
+        self.use_agents_sdk_cb.setChecked(getattr(workspace.config, "use_agents_sdk", False))
+        self.max_turns_spin.setValue(getattr(workspace.config, "agents_sdk_max_turns", 25))
+        self._update_max_tokens_from_model()
 
         # Prompt tab
         self.prompt_input.setText(workspace.config.system_prompt)
@@ -564,7 +589,10 @@ class WorkspaceDialog(QDialog):
         # Metrics tab
         self.avg_time_lbl.setText(f"{workspace.avg_response_time_ms:.1f} ms")
         self.total_tokens_lbl.setText(f"{workspace.total_tokens:,}")
-        self.quality_lbl.setText(f"{workspace.quality_score:.1f}%")
+        total_fb = workspace.feedback_up + workspace.feedback_down
+        self.quality_lbl.setText(
+            f"{workspace.quality_score:.1f}%" if total_fb > 0 else "N/A (no feedback yet)"
+        )
         self.messages_lbl.setText(str(workspace.message_count))
         self.session_lbl.setText(str(workspace.session_count))
         
@@ -629,6 +657,8 @@ class WorkspaceDialog(QDialog):
             "temperature": self.temp_spin.value(),
             "max_tokens": self.max_tokens_spin.value(),
             "max_session_messages": self.max_session_spin.value(),
+            "use_agents_sdk": self.use_agents_sdk_cb.isChecked(),
+            "agents_sdk_max_turns": self.max_turns_spin.value(),
             "system_prompt": self.prompt_input.toPlainText(),
             "openai_api_key": self.openai_key_input.text() or None,
             "anthropic_api_key": self.anthropic_key_input.text() or None,
@@ -720,6 +750,7 @@ class WorkspaceDialog(QDialog):
         }
         if provider in default_models:
             self.model_combo.addItems(default_models[provider])
+        self._update_max_tokens_from_model()
     
     def _refresh_models(self):
         """Fetch models from the selected provider"""
@@ -764,6 +795,7 @@ class WorkspaceDialog(QDialog):
                 else:
                     self.model_combo.setCurrentText(current)
             self.model_combo.setFocus()
+            self._update_max_tokens_from_model()
         except Exception as e:
             QMessageBox.warning(self, "Ollama Error", f"Could not fetch models from Ollama:\n{str(e)}\n\nMake sure Ollama is running.")
     
@@ -798,9 +830,51 @@ class WorkspaceDialog(QDialog):
                 else:
                     self.model_combo.setCurrentText(current)
             self.model_combo.setFocus()
+            self._update_max_tokens_from_model()
         except Exception as e:
             QMessageBox.warning(self, "LM Studio Error", f"Could not fetch models from LM Studio:\n{str(e)}\n\nUse Settings → LLM Providers to set the LM Studio URL, then try again.")
     
+    def _on_model_changed(self):
+        """When model changes, update max tokens spinbox ceiling from provider query (Ollama/LM Studio)."""
+        self._update_max_tokens_from_model()
+
+    def _update_max_tokens_from_model(self):
+        """Query model's max context length (Ollama/LM Studio) and cap max_tokens spinbox."""
+        provider = self.provider_combo.currentText()
+        model = self.model_combo.currentText().strip()
+        self.model_max_context_lbl.setText("")
+        if provider not in ("ollama", "lmstudio") or not model:
+            self.max_tokens_spin.setMaximum(131072)
+            return
+        try:
+            from grizzyclaw.utils.async_runner import run_async
+            parent = self.parent()
+            if provider == "ollama":
+                from grizzyclaw.llm.ollama import OllamaProvider
+                url = "http://localhost:11434"
+                if parent and hasattr(parent, "settings"):
+                    url = getattr(parent.settings, "ollama_url", url) or url
+                prov = OllamaProvider(url)
+            else:
+                from grizzyclaw.llm.lmstudio import LMStudioProvider
+                url = "http://localhost:1234/v1"
+                if parent and hasattr(parent, "settings"):
+                    url = getattr(parent.settings, "lmstudio_url", url) or url
+                url = _normalize_lmstudio_url(url)
+                prov = LMStudioProvider(url)
+            max_ctx = run_async(prov.get_model_context_length(model))
+            ceiling = max_ctx if max_ctx and max_ctx > 0 else 131072
+            self.max_tokens_spin.setMaximum(ceiling)
+            if self.max_tokens_spin.value() > ceiling:
+                self.max_tokens_spin.setValue(ceiling)
+            if max_ctx and max_ctx > 0:
+                self.model_max_context_lbl.setText(f"Model max context: {max_ctx:,} tokens")
+            else:
+                self.model_max_context_lbl.setText("Could not query model; using default max.")
+        except Exception:
+            self.max_tokens_spin.setMaximum(131072)
+            self.model_max_context_lbl.setText("Could not query model; using default max.")
+
     def _fetch_openai_models(self):
         """Fetch models from OpenAI"""
         # OpenAI requires API key, show defaults

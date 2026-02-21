@@ -16,12 +16,17 @@ from grizzyclaw.safety.content_filter import ContentFilter
 from grizzyclaw.utils.vision import build_vision_content
 
 from .command_parsers import (
+    extract_code_blocks_for_file_creation,
     find_json_blocks,
     find_json_blocks_fallback,
     find_schedule_task_fallback,
+    find_tool_call_blocks_raw_json,
+    find_tool_call_blocks_relaxed,
+    find_write_file_path_content_blocks,
     normalize_llm_json,
 )
 from .context_utils import trim_session
+from .sdk_runner import AGENTS_SDK_AVAILABLE, run_agents_sdk
 from grizzyclaw.workspaces.workspace import WorkspaceConfig
 from typing import TYPE_CHECKING
 
@@ -92,7 +97,9 @@ class AgentCore:
         images: Optional[List[str]] = None,
         audio_path: Optional[str] = None,
         audio_base64: Optional[str] = None,
+        **kwargs: Any,
     ) -> AsyncIterator[str]:
+        on_fallback = kwargs.pop("on_fallback", None)
         # Evaluate automation triggers (fire webhooks, etc.)
         try:
             from grizzyclaw.automation.triggers import (
@@ -122,7 +129,7 @@ class AgentCore:
                     preview = (forward_msg[:50] + "…") if len(forward_msg) > 50 else forward_msg
                     yield f"✅ Delegated to @{target_name}: {preview}\n"
                     if result and not result.startswith("Target ") and not result.startswith("Error:"):
-                        yield f"@{target_name} replied: {result[:300]}{'…' if len(result) > 300 else ''}\n"
+                        yield f"@{target_name} replied: {result[:1500]}{'…' if len(result) > 1500 else ''}\n"
                     forwarded_any = True
             if forwarded_any:
                 yield "Swarm delegations done.\n"
@@ -186,6 +193,43 @@ class AgentCore:
             memory_context = "\n\nRelevant context from previous conversations:\n"
             for mem in memories:
                 memory_context += f"- {mem.content}\n"
+
+        # Optional: Use OpenAI Agents SDK + LiteLLM when workspace has use_agents_sdk enabled
+        if (
+            self.workspace_config
+            and getattr(self.workspace_config, "use_agents_sdk", False)
+            and AGENTS_SDK_AVAILABLE
+        ):
+            cfg = self.workspace_config
+            system_prompt = cfg.system_prompt or self.settings.system_prompt
+            provider = getattr(cfg, "llm_provider", None) or self.settings.default_llm_provider
+            model = getattr(cfg, "llm_model", None) or self.settings.default_model
+            temperature = getattr(cfg, "temperature", None)
+            if temperature is None:
+                temperature = 0.7
+            max_tokens = getattr(cfg, "max_tokens", None) or self.settings.max_tokens
+            max_turns = getattr(cfg, "agents_sdk_max_turns", None) or 25
+            mcp_file = Path(self.settings.mcp_servers_file).expanduser()
+            full_response = ""
+            async for chunk in run_agents_sdk(
+                message=message,
+                system_prompt=system_prompt,
+                memory_context=memory_context,
+                provider=provider,
+                model=model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                settings=self.settings,
+                mcp_file=mcp_file,
+                workspace=self.workspace_config,
+                max_turns=max_turns,
+            ):
+                full_response += chunk
+                yield chunk
+            session.append({"role": "user", "content": message})
+            session.append({"role": "assistant", "content": full_response})
+            trim_session(session, self.settings.max_session_messages)
+            return
 
         # Build system prompt
         system_content = self.settings.system_prompt + """
@@ -323,6 +367,8 @@ Examples:
             except Exception as e:
                 logger.warning(f"Failed to load MCP file {mcp_file}: {e}")
         mcp_str = "\n".join(mcp_list) if mcp_list else "none"
+        has_write_file = False
+        write_file_server: Optional[str] = None
         if mcp_list or skills_str != "none":
             # Build tool examples from discovered tools (so LLM knows exact names)
             tool_examples: List[str] = []
@@ -338,6 +384,12 @@ Examples:
                     "- fast-filesystem: tool 'fast_list_directory' - list directory\n"
                     "- context7: tool 'query-docs' - query documentation"
                 )
+            # Check if we have file-writing capability (write_file, fast_write_file, etc.)
+            for srv, tools in discovered_tools_map.items():
+                if any(t[0] in ("write_file", "fast_write_file", "write") for t in tools):
+                    write_file_server = srv
+                    break
+            has_write_file = write_file_server is not None
             system_content += f"""
 
 Enabled skills: {skills_str}
@@ -371,8 +423,18 @@ Discovered tools (use these exact names):
 {examples_block}
 
 When users ask to search the web/internet, use ddg-search with tool 'search' if available. Agent executes tools and returns real results.
-When using TOOL_CALL, write a brief intro first (e.g. 'Let me search for that.') so the user sees a natural response.
+CRITICAL: Describing an action in text (e.g. 'Now writing files via fast-filesystem') does NOT execute it. You MUST output TOOL_CALL = {{ ... }} to run tools. Never say you will do something without outputting the actual TOOL_CALL.
+When using TOOL_CALL, write a brief intro first (e.g. 'Let me search for that.') then output the TOOL_CALL on the same or next line.
 When you receive tool results in a follow-up message, use them to continue your response. Do NOT repeat the TOOL_CALL - the tools have already been executed."""
+            if has_write_file:
+                system_content += """
+
+## CREATING FILES
+When asked to build/create an app or write files: first call fast_list_allowed_directories to see writable paths. For fast-filesystem use tool "fast_write_file" (path, content). The path the user gives is the TARGET FOLDER—write files directly into it: path/File.swift. Do NOT create a subfolder with the same name (e.g. if they say ZZZZ use ZZZZ/File.swift not ZZZZ/ZZZZ/File.swift). Output ONE complete TOOL_CALL per file.
+
+Match the user's scope: if they ask for robust, feature-rich, feature-filled, professional, beautiful, or "do not scrimp"—implement many features, a polished UI, preferences/settings panels, and do NOT default to minimal implementations.
+
+When the user provides a detailed plan, phased implementation, or step-by-step guide: implement the FULL plan. Create ALL files specified (Core Data model, views, preferences, etc.). Output MULTIPLE TOOL_CALLs in the same response—one per file. Do NOT stop after creating one file. If you need more turns, continue in the next response with more files until the plan is complete."""
 
         if memories:
             system_content += f"\n\n{memory_context}"
@@ -385,12 +447,29 @@ When you receive tool results in a follow-up message, use them to continue your 
         messages.extend(session)
 
         # Add user message (with optional vision content)
+        user_message = message
         if images and any(images):
             text_for_session, content_blocks = build_vision_content(message or "What's in this image?", images)
             messages.append({"role": "user", "content": content_blocks})
             message = text_for_session  # For session storage and search triggers
         else:
-            messages.append({"role": "user", "content": message})
+            # If user specified a path for file creation, append it so model uses it exactly
+            _um = (user_message or "").lower()
+            if has_write_file and (" put " in _um or " in " in _um or " to " in _um):
+                path_m = re.search(r"([/]?(?:Volumes|Users|home)[/\w\-\.]+)", user_message or "")
+                if path_m:
+                    exact_path = path_m.group(1).strip()
+                    # Strip zero-width chars that can cause duplicate folders (e.g. Z​ZZZ)
+                    exact_path = exact_path.replace("\u200b", "").replace("\u200c", "").replace("\u200d", "").replace("\ufeff", "")
+                    if not exact_path.startswith("/"):
+                        exact_path = "/" + exact_path
+                    user_message = f"{user_message or ''}\n\n[IMPORTANT: Path {exact_path} is the target FOLDER. Write files directly into it (e.g. {exact_path}/TodoApp.swift). Use existing folder or it will be created. Do NOT create a subfolder with the same name.]"
+            # If user provided a detailed plan, emphasize full implementation
+            if has_write_file and any(
+                p in _um for p in ("plan", "phase", "phased", "step-by-step", "timeline", "weeks", "deliverable")
+            ):
+                user_message = f"{user_message or ''}\n\n[CRITICAL: Implement the FULL plan. Create ALL files (Core Data model, views, preferences, etc.). Output MULTIPLE TOOL_CALLs in this response—one per file. Do NOT stop after one file.]"
+            messages.append({"role": "user", "content": user_message})
 
         # Agentic loop: generate -> execute tools -> feed results back -> repeat
         mcp_file = Path(self.settings.mcp_servers_file).expanduser()
@@ -411,8 +490,19 @@ When you receive tool results in a follow-up message, use them to continue your 
                     custom = list(policy.get("custom_blocklist", [])) if isinstance(policy, dict) else []
                     content_filter = ContentFilter(custom_patterns=custom or None)
 
+                _max_tokens = getattr(self.settings, "max_tokens", 2000)
+                _temperature = (
+                    getattr(self.workspace_config, "temperature", None)
+                    if self.workspace_config
+                    else None
+                )
+                if _temperature is None:
+                    _temperature = 0.7
                 async for chunk in self.llm_router.generate(
-                    current_messages, temperature=0.7, max_tokens=2000
+                    current_messages,
+                    temperature=_temperature,
+                    max_tokens=_max_tokens,
+                    on_fallback=on_fallback,
                 ):
                     response_chunks.append(chunk)
                     out = chunk
@@ -427,6 +517,31 @@ When you receive tool results in a follow-up message, use them to continue your 
                 tool_call_matches = find_json_blocks(response_text, "TOOL_CALL")
                 if not tool_call_matches:
                     tool_call_matches = find_json_blocks_fallback(response_text, "TOOL_CALL")
+                if not tool_call_matches:
+                    tool_call_matches = find_tool_call_blocks_relaxed(response_text)
+                if not tool_call_matches:
+                    tool_call_matches = find_tool_call_blocks_raw_json(response_text)
+
+                # Fallback: model showed path/content JSON or code blocks but no TOOL_CALLs
+                code_block_writes: list[tuple[str, str]] = []
+                base_hint: Optional[str] = None
+                if not tool_call_matches and has_write_file:
+                    # 1) to=fast-filesystem.fast_write_file format: {"path":"...","content":"..."}
+                    code_block_writes = list(find_write_file_path_content_blocks(response_text))
+                    # 2) Markdown code blocks with filename headers (if no path/content blocks)
+                    if not code_block_writes:
+                        if " put " in msg_lower or " in " in msg_lower or " to " in msg_lower:
+                            import re as _re
+                            path_m = _re.search(r"[/]?(?:Volumes|Users|home)[/\w\-\.]+", user_message or "")
+                            if path_m:
+                                base_hint = path_m.group(0).strip()
+                                for _zw in ("\u200b", "\u200c", "\u200d", "\ufeff"):
+                                    base_hint = base_hint.replace(_zw, "")
+                                if not base_hint.startswith("/"):
+                                    base_hint = "/" + base_hint
+                        code_block_writes = extract_code_blocks_for_file_creation(
+                            response_text, base_path_hint=base_hint
+                        )
 
                 # Proactive search fallback: empty response + user wants search
                 if wants_search and not tool_call_matches and len(response_text.strip()) < 50 and iteration == 0:
@@ -473,11 +588,55 @@ When you receive tool results in a follow-up message, use them to continue your 
                             yield err_display
                             accumulated_tool_displays.append(err_display)
 
-                if not tool_call_matches:
+                if not tool_call_matches and not code_block_writes:
+                    # Model described files but didn't output code? Ask once for code blocks.
+                    file_creation_hints = ("create", "write", "file", "placed", "i'll create", "here's", "swift", "entry point", "source file")
+                    resp_lower = response_text.lower()
+                    if (base_hint and iteration == 0 and has_write_file and
+                        any(h in resp_lower for h in file_creation_hints)):
+                        follow_msg = (
+                            f"[IMPORTANT] You described creating files but didn't output the actual source code. "
+                            f"The system can create files from markdown code blocks. Output each file like this:\n\n"
+                            f"### {{filename}}.swift\n```swift\n<complete source>\n```\n\n"
+                            f"Use this EXACT path: {base_hint}. Output ALL files now."
+                        )
+                        current_messages.append({"role": "assistant", "content": response_text})
+                        current_messages.append({"role": "user", "content": follow_msg})
+                        continue
                     break  # No tools this turn - we're done
 
-                # Execute tools and collect results
+                # Execute tools and collect results (from TOOL_CALLs or extracted code blocks)
                 tool_result_parts: List[str] = []
+                if code_block_writes:
+                    wfs = write_file_server or "fast-filesystem"
+                    write_tool = "fast_write_file" if wfs == "fast-filesystem" else "write_file"
+                    _zw_chars = ("\u200b", "\u200c", "\u200d", "\ufeff")
+                    for full_path, content in code_block_writes:
+                        for c in _zw_chars:
+                            full_path = full_path.replace(c, "")
+                        try:
+                            tool_result = await call_mcp_tool(
+                                mcp_file, wfs, write_tool,
+                                {"path": full_path, "content": content},
+                            )
+                            result_display = f"\n\n**🔧 {wfs}.{write_tool}** ({full_path})\n{tool_result}\n"
+                            if content_filter:
+                                result_display, _ = content_filter.filter(result_display)
+                            yield result_display
+                            accumulated_tool_displays.append(result_display)
+                            tool_result_parts.append(f"[Tool result {wfs}.{write_tool}]\n{tool_result}")
+                        except Exception as e:
+                            logger.warning(f"Code-block write error: {e}")
+                            err_msg = f"**❌ Write error ({full_path}): {str(e)}**\n\n"
+                            yield err_msg
+                            accumulated_tool_displays.append(err_msg)
+                            tool_result_parts.append(f"[Tool error]\n{str(e)}")
+                    if tool_result_parts:
+                        tool_results_msg = "\n\n".join(tool_result_parts) + "\n\nUse the above results. Files were created from code blocks."
+                        current_messages.append({"role": "assistant", "content": response_text})
+                        current_messages.append({"role": "user", "content": tool_results_msg})
+                    continue  # Next iteration
+
                 for match_str in tool_call_matches:
                     try:
                         normalized = normalize_llm_json(match_str)
@@ -491,9 +650,20 @@ When you receive tool results in a follow-up message, use them to continue your 
                                 pass
                         if not tool_call or not isinstance(tool_call, dict):
                             continue
-                        mcp_name = tool_call.get("mcp", "unknown")
-                        tool_name = tool_call.get("tool", "unknown")
+                        mcp_name = (tool_call.get("mcp") or "unknown").strip()
+                        tool_name = (tool_call.get("tool") or "unknown").strip()
                         args = dict(tool_call.get("arguments", {}) or {})
+
+                        # fast-filesystem MCP uses "fast_write_file" (not "write_file"); keep it
+
+                        # Strip whitespace and zero-width chars from string args (prevents duplicate folders)
+                        _zw = ("\u200b", "\u200c", "\u200d", "\ufeff")
+                        for k, v in list(args.items()):
+                            if isinstance(v, str):
+                                v = v.strip()
+                                for c in _zw:
+                                    v = v.replace(c, "")
+                                args[k] = v
 
                         # Correct and simplify search queries for better DuckDuckGo results
                         if mcp_name == "ddg-search" and tool_name == "search" and "query" in args:
