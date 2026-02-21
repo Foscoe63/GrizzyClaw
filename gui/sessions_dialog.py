@@ -3,7 +3,7 @@
 import asyncio
 import json
 import logging
-from typing import Optional
+from typing import Optional, Tuple, List, Any
 
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QFont
@@ -113,27 +113,41 @@ class SessionsDialog(QDialog):
             self.session_list.addItem(QListWidgetItem("websockets package required for sessions."))
             return
         from grizzyclaw.utils.async_runner import run_async
-        sessions = run_async(self._fetch_sessions())
+        sessions, error_msg = run_async(self._fetch_sessions())
         self.session_list.clear()
-        if sessions is None:
-            self.session_list.addItem(QListWidgetItem("(Daemon not running or unreachable)"))
-        else:
+        if error_msg:
+            self.session_list.addItem(
+                QListWidgetItem(f"(Daemon not reachable: {error_msg})")
+            )
+        elif sessions is not None:
             self._populate_sessions(sessions)
 
-    async def _fetch_sessions(self):
+    async def _fetch_sessions(self) -> Tuple[Optional[List[Any]], Optional[str]]:
+        """Returns (sessions_list, error_message). On success error_message is None."""
         try:
+            import websockets
             async with websockets.connect(GATEWAY_WS, close_timeout=5) as ws:
                 await ws.send(json.dumps({"type": "get_sessions"}))
-                for _ in range(5):
+                for _ in range(10):
                     msg = await asyncio.wait_for(ws.recv(), timeout=5)
                     data = json.loads(msg)
                     if data.get("type") == "sessions":
-                        return data.get("sessions", [])
+                        return (data.get("sessions", []), None)
                     if data.get("type") == "error":
-                        return None
-                return []
-        except Exception:
-            return None
+                        return (None, data.get("error", "Gateway returned error"))
+                return (None, "No sessions response from gateway")
+        except asyncio.TimeoutError as e:
+            logger.debug("Sessions fetch timeout: %s", e)
+            return (None, "Connection timeout")
+        except ConnectionRefusedError as e:
+            logger.debug("Sessions fetch connection refused: %s", e)
+            return (None, "Connection refused (is daemon running?)")
+        except OSError as e:
+            logger.debug("Sessions fetch OS error: %s", e)
+            return (None, str(e))
+        except Exception as e:
+            logger.exception("Sessions fetch failed")
+            return (None, str(e))
 
     def _populate_sessions(self, sessions: list):
         self.session_list.clear()

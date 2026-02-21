@@ -9,6 +9,12 @@ from pathlib import Path
 import websockets
 from websockets.server import WebSocketServerProtocol
 
+# Use legacy server so the handler always receives (websocket, path) regardless of websockets version
+try:
+    from websockets.legacy.server import serve as ws_serve
+except ImportError:
+    ws_serve = websockets.serve
+
 from grizzyclaw import __version__
 from grizzyclaw.config import Settings
 from grizzyclaw.security import RateLimiter
@@ -88,8 +94,8 @@ class GatewayServer:
         # Register event handlers
         self._register_event_handlers()
 
-        # Start WebSocket server
-        self.server = await websockets.serve(
+        # Start WebSocket server (legacy serve so handler gets (websocket, path))
+        self.server = await ws_serve(
             self._handle_client,
             self.host,
             self.port
@@ -121,12 +127,12 @@ class GatewayServer:
 
         logger.info("Gateway server stopped")
 
-    async def _handle_client(self, websocket: WebSocketServerProtocol, path: str):
-        """Handle incoming WebSocket connection"""
+    async def _handle_client(self, websocket: WebSocketServerProtocol, path: str = ""):
+        """Handle incoming WebSocket connection (path from legacy serve; default for new API)."""
         self.clients.add(websocket)
         client_id = id(websocket)
-
-        logger.info(f"Client {client_id} connected from {websocket.remote_address}")
+        remote = getattr(websocket, "remote_address", None)
+        logger.info(f"Client {client_id} connected from {remote}")
 
         try:
             # Send welcome message
@@ -150,6 +156,8 @@ class GatewayServer:
 
         except websockets.exceptions.ConnectionClosed:
             logger.info(f"Client {client_id} disconnected")
+        except Exception as e:
+            logger.exception(f"Connection handler error for client {client_id}: {e}")
         finally:
             self.clients.discard(websocket)
             self._unsubscribe_client(websocket)
