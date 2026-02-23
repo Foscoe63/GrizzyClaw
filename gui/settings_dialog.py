@@ -3,6 +3,8 @@ import subprocess
 import sys
 from pathlib import Path
 import asyncio
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
 
 from PyQt6.QtWidgets import (
     QApplication, QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
@@ -14,6 +16,7 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QFont
 
 from grizzyclaw.config import Settings, get_config_path
+from grizzyclaw.mcp_client import invalidate_tools_cache, discover_one_server, validate_server_config
 
 
 def _sanitize_telegram_token(raw: str) -> str | None:
@@ -106,57 +109,85 @@ class GeneralTab(SettingsTab):
         super().__init__(parent)
         self.settings = settings
         self.setup_ui()
-    
+
     def setup_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(40, 30, 40, 30)
-        layout.setSpacing(20)
-        
-        form = QFormLayout()
-        form.setSpacing(16)
-        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
-        
-        # App Name
+        layout.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        container = QWidget()
+        container_layout = QVBoxLayout(container)
+        container_layout.setContentsMargins(40, 24, 40, 24)
+        container_layout.setSpacing(24)
+
+        general_group = QGroupBox("General")
+        general_group.setStyleSheet(self.get_group_style())
+        form = QFormLayout(general_group)
+        form.setSpacing(18)
+
         self.app_name = QLineEdit(self.settings.app_name)
         self.app_name.setFixedHeight(32)
         form.addRow("App Name:", self.app_name)
-        
-        # Debug Mode
         self.debug_mode = QCheckBox("Enable Debug Mode")
         self.debug_mode.setChecked(self.settings.debug)
         form.addRow("", self.debug_mode)
-        
-        # Provider
         self.provider_combo = QComboBox()
-        self.provider_combo.setEditable(False)  # Not editable, selection only
+        self.provider_combo.setEditable(False)
         self.provider_combo.addItems(["ollama", "lmstudio", "openai", "anthropic", "openrouter", "custom"])
         self.provider_combo.setCurrentText(self.settings.default_llm_provider)
         self.provider_combo.setFixedHeight(32)
         form.addRow("Default Provider:", self.provider_combo)
-
-        # Model info (read-only)
         model_hint = QLabel("Configure models in the 'LLM Providers' tab")
         model_hint.setStyleSheet("font-size: 12px; color: #8E8E93;")
         form.addRow("", model_hint)
-        
-        # Context
         self.context_spin = QSpinBox()
         self.context_spin.setRange(1000, 100000)
         self.context_spin.setValue(self.settings.max_context_length)
         self.context_spin.setSingleStep(1000)
         self.context_spin.setFixedHeight(32)
         form.addRow("Max Context:", self.context_spin)
-        
-        # Log Level
         self.log_combo = QComboBox()
-        self.log_combo.setEditable(False)  # Not editable, selection only
+        self.log_combo.setEditable(False)
         self.log_combo.addItems(["DEBUG", "INFO", "WARNING", "ERROR"])
         self.log_combo.setCurrentText(self.settings.log_level)
         self.log_combo.setFixedHeight(32)
         form.addRow("Log Level:", self.log_combo)
-        
-        layout.addLayout(form)
-        layout.addStretch()
+        self.max_agentic_iterations = QSpinBox()
+        self.max_agentic_iterations.setRange(3, 30)
+        self.max_agentic_iterations.setValue(getattr(self.settings, "max_agentic_iterations", 10))
+        self.max_agentic_iterations.setFixedHeight(32)
+        form.addRow("Max tool-use rounds:", self.max_agentic_iterations)
+        self.memory_retrieval_limit_spin = QSpinBox()
+        self.memory_retrieval_limit_spin.setRange(3, 50)
+        self.memory_retrieval_limit_spin.setValue(getattr(self.settings, "memory_retrieval_limit", 10))
+        self.memory_retrieval_limit_spin.setFixedHeight(32)
+        form.addRow("Memory retrieval limit:", self.memory_retrieval_limit_spin)
+        self.agent_reflection = QCheckBox("Prompt to continue or answer after tool results")
+        self.agent_reflection.setChecked(getattr(self.settings, "agent_reflection_enabled", True))
+        form.addRow("", self.agent_reflection)
+        self.agent_plan = QCheckBox("Ask for PLAN before tools (complex tasks)")
+        self.agent_plan.setChecked(getattr(self.settings, "agent_plan_before_tools", False))
+        form.addRow("", self.agent_plan)
+        self.agent_tool_result_max = QSpinBox()
+        self.agent_tool_result_max.setRange(500, 20000)
+        self.agent_tool_result_max.setValue(getattr(self.settings, "agent_tool_result_max_chars", 4000))
+        self.agent_tool_result_max.setFixedHeight(32)
+        form.addRow("Tool result max chars:", self.agent_tool_result_max)
+        self.agent_retry_failure = QCheckBox("Retry hint when a tool fails")
+        self.agent_retry_failure.setChecked(getattr(self.settings, "agent_retry_on_tool_failure", True))
+        form.addRow("", self.agent_retry_failure)
+
+        container_layout.addWidget(general_group)
+        scroll.setWidget(container)
+        layout.addWidget(scroll)
+
+    def get_group_style(self):
+        dialog = self.window()
+        if isinstance(dialog, SettingsDialog) and getattr(dialog, "is_dark", False):
+            return "QGroupBox { font-weight: 600; font-size: 13px; border: 1px solid #3A3A3C; border-radius: 6px; margin-top: 8px; margin-bottom: 8px; padding: 8px 16px 16px 16px; background: #2C2C2E; } QGroupBox::title { subcontrol-origin: padding; left: 0; top: 0; padding-bottom: 4px; color: #FFFFFF; }"
+        return "QGroupBox { font-weight: 600; font-size: 13px; border: 1px solid #E5E5EA; border-radius: 6px; margin-top: 8px; margin-bottom: 8px; padding: 8px 16px 16px 16px; background: #FAFAFA; } QGroupBox::title { subcontrol-origin: padding; left: 0; top: 0; padding-bottom: 4px; color: #1C1C1E; }"
 
     def get_settings(self):
         return {
@@ -165,6 +196,12 @@ class GeneralTab(SettingsTab):
             "default_llm_provider": self.provider_combo.currentText(),
             "max_context_length": self.context_spin.value(),
             "log_level": self.log_combo.currentText(),
+            "max_agentic_iterations": self.max_agentic_iterations.value(),
+            "memory_retrieval_limit": self.memory_retrieval_limit_spin.value(),
+            "agent_reflection_enabled": self.agent_reflection.isChecked(),
+            "agent_plan_before_tools": self.agent_plan.isChecked(),
+            "agent_tool_result_max_chars": self.agent_tool_result_max.value(),
+            "agent_retry_on_tool_failure": self.agent_retry_failure.isChecked(),
         }
 
 
@@ -703,7 +740,7 @@ class WhatsAppTab(SettingsTab):
             "whatsapp_session_path": self.session_path.text() or "~/.grizzyclaw/whatsapp_session",
         }
 
-from PyQt6.QtWidgets import QTextEdit, QGroupBox, QCheckBox, QListWidget, QListWidgetItem, QPushButton, QHBoxLayout, QInputDialog, QTreeWidget, QTreeWidgetItem
+from PyQt6.QtWidgets import QHeaderView, QTextEdit, QPlainTextEdit, QGroupBox, QCheckBox, QListWidget, QListWidgetItem, QPushButton, QHBoxLayout, QInputDialog, QTreeWidget, QTreeWidgetItem
 import json
 import os
 import signal
@@ -760,83 +797,113 @@ class PromptsTab(SettingsTab):
             "rules_file": self.rules_file.text() or None,
         }
 
-class SkillsTab(SettingsTab):
+class ClawHubTab(SettingsTab):
+    """ClawHub skills registry and HuggingFace token only."""
     def __init__(self, settings, parent=None):
         super().__init__(parent)
         self.settings = settings
-        self.running_processes = {}  # name -> Popen (keep ref so stdin pipe stays open)
-        self.recently_started = {}   # name -> timestamp for grace period
-        self.started_servers_file = Path.home() / '.grizzyclaw' / 'mcp_started.json'
         self.is_dark = False
-        # Detect theme directly from settings object
-        theme = getattr(self.settings, 'theme', 'Light')
-        self.is_dark = theme in ['Dark', 'High Contrast Dark', 'Dracula', 'Monokai', 'Nord', 'Solarized Dark']
+        theme = getattr(self.settings, "theme", "Light")
+        self.is_dark = theme in ["Dark", "High Contrast Dark", "Dracula", "Monokai", "Nord", "Solarized Dark"]
         self._setup_theme_colors()
-        self._load_started_servers()  # Load previously started servers on startup
         self.setup_ui()
 
-    def showEvent(self, event: QShowEvent):
-        """Refresh MCP status when Skills tab is shown so buttons reflect current state."""
-        super().showEvent(event)
-        self.refresh_mcp_statuses()
-
     def _setup_theme_colors(self):
-        """Setup colors based on current theme"""
         if self.is_dark:
-            self.bg_color = '#1E1E1E'
-            self.fg_color = '#FFFFFF'
-            self.card_bg = '#2D2D2D'
-            self.border_color = '#3A3A3C'
-            self.input_bg = '#3A3A3C'
-            self.accent_color = '#0A84FF'
-            self.secondary_text = '#8E8E93'
-            self.hover_bg = '#3A3A3C'
-            self.alt_row_bg = '#252525'
+            self.bg_color = "#1E1E1E"
+            self.fg_color = "#FFFFFF"
+            self.card_bg = "#2D2D2D"
+            self.border_color = "#3A3A3C"
+            self.input_bg = "#3A3A3C"
+            self.accent_color = "#0A84FF"
+            self.secondary_text = "#8E8E93"
+            self.hover_bg = "#3A3A3C"
         else:
-            self.bg_color = '#FFFFFF'
-            self.fg_color = '#1C1C1E'
-            self.card_bg = '#FAFAFA'
-            self.border_color = '#E5E5EA'
-            self.input_bg = '#FFFFFF'
-            self.accent_color = '#007AFF'
-            self.secondary_text = '#8E8E93'
-            self.hover_bg = '#F5F5F7'
-            self.alt_row_bg = '#FAFAFA'
-    
+            self.bg_color = "#FFFFFF"
+            self.fg_color = "#1C1C1E"
+            self.card_bg = "#FAFAFA"
+            self.border_color = "#E5E5EA"
+            self.input_bg = "#FFFFFF"
+            self.accent_color = "#007AFF"
+            self.secondary_text = "#8E8E93"
+            self.hover_bg = "#F5F5F7"
+
+    def _create_card(self, title, description):
+        card = QFrame()
+        card.setStyleSheet(f"""
+            QFrame {{ background: {self.card_bg}; border: 1px solid {self.border_color};
+                border-radius: 12px; padding: 16px; }}
+        """)
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+        title_label = QLabel(title)
+        title_label.setFont(QFont("-apple-system", 15, QFont.Weight.DemiBold))
+        title_label.setStyleSheet(f"color: {self.fg_color}; background: transparent;")
+        layout.addWidget(title_label)
+        if description:
+            desc_label = QLabel(description)
+            desc_label.setStyleSheet(f"color: {self.secondary_text}; font-size: 12px; background: transparent;")
+            layout.addWidget(desc_label)
+        return card
+
+    def _input_style(self):
+        return f"""
+            QLineEdit {{ padding: 0 12px; border: 1px solid {self.border_color};
+                border-radius: 8px; background: {self.input_bg}; color: {self.fg_color}; font-size: 13px; }}
+            QLineEdit:focus {{ border: 2px solid {self.accent_color}; }}
+        """
+
+    def _list_style(self):
+        return f"""
+            QListWidget {{ border: 1px solid {self.border_color}; border-radius: 8px;
+                background: {self.input_bg}; color: {self.fg_color}; padding: 4px; }}
+            QListWidget::item {{ padding: 8px 12px; border-radius: 4px; color: {self.fg_color}; }}
+            QListWidget::item:selected {{ background: {self.accent_color}; color: white; }}
+            QListWidget::item:hover:!selected {{ background: {self.hover_bg}; }}
+        """
+
+    def _secondary_btn_style(self):
+        btn_bg = "#3A3A3C" if self.is_dark else "#F5F5F7"
+        btn_hover = "#48484A" if self.is_dark else "#E5E5EA"
+        return f"""
+            QPushButton {{ background: {btn_bg}; color: {self.fg_color};
+                border: 1px solid {self.border_color}; border-radius: 8px; padding: 8px 16px; font-size: 13px; }}
+            QPushButton:hover {{ background: {btn_hover}; }}
+        """
+
+    def _icon_btn_style(self):
+        btn_bg = "#3A3A3C" if self.is_dark else "#F5F5F7"
+        btn_hover = "#48484A" if self.is_dark else "#E5E5EA"
+        return f"""
+            QPushButton {{ background: {btn_bg}; border: 1px solid {self.border_color};
+                border-radius: 8px; font-size: 14px; color: {self.fg_color}; }}
+            QPushButton:hover {{ background: {btn_hover}; }}
+        """
+
     def setup_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 20, 24, 20)
-        layout.setSpacing(16)
-        
-        # Set background
+        layout.setSpacing(20)
         self.setStyleSheet(f"background-color: {self.bg_color};")
-        
-        # Page header
-        header = QLabel("Skills & MCP Servers")
+        header = QLabel("ClawHub - Skills")
         header.setFont(QFont("-apple-system", 18, QFont.Weight.Bold))
         header.setStyleSheet(f"color: {self.fg_color}; background: transparent;")
         layout.addWidget(header)
-        
-        subtitle = QLabel("Configure AI skills and Model Context Protocol (MCP) servers for extended capabilities.")
+        subtitle = QLabel("Configure HuggingFace and the built-in skills registry.")
         subtitle.setWordWrap(True)
-        subtitle.setStyleSheet(f"color: {self.secondary_text}; font-size: 13px; margin-bottom: 8px; background: transparent;")
+        subtitle.setStyleSheet(f"color: {self.secondary_text}; font-size: 13px; background: transparent;")
         layout.addWidget(subtitle)
-        
-        # Scroll area for content
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
-        
         scroll_content = QWidget()
         scroll_layout = QVBoxLayout(scroll_content)
         scroll_layout.setContentsMargins(0, 0, 8, 0)
         scroll_layout.setSpacing(20)
-        
-        # ===== HuggingFace Token Section =====
         hf_card = self._create_card("🤗 Hugging Face", "Access HuggingFace models and spaces")
         hf_layout = hf_card.layout()
-        
         token_row = QHBoxLayout()
         token_row.setSpacing(12)
         self.hf_token = QLineEdit(self.settings.hf_token or "")
@@ -845,7 +912,6 @@ class SkillsTab(SettingsTab):
         self.hf_token.setFixedHeight(36)
         self.hf_token.setStyleSheet(self._input_style())
         token_row.addWidget(self.hf_token)
-        
         show_token_btn = QPushButton("👁")
         show_token_btn.setFixedSize(36, 36)
         show_token_btn.setCheckable(True)
@@ -854,27 +920,21 @@ class SkillsTab(SettingsTab):
             QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password))
         token_row.addWidget(show_token_btn)
         hf_layout.addLayout(token_row)
-        
         hf_hint = QLabel("Get your token from huggingface.co/settings/tokens")
         hf_hint.setStyleSheet("color: #8E8E93; font-size: 12px;")
         hf_layout.addWidget(hf_hint)
         scroll_layout.addWidget(hf_card)
-        
-        # ===== Skills Section =====
-        skills_card = self._create_card("⚡ ClawHub - Skills Registry", "Discover and install AI capabilities from the built-in registry")
+        skills_card = self._create_card("⚡ Skills Registry", "Discover and install AI capabilities from the built-in registry")
         skills_layout = skills_card.layout()
-
         skills_hint = QLabel("Skills: web_search, filesystem, documentation, browser, memory, scheduler, calendar, gmail, github, mcp_marketplace")
         skills_hint.setStyleSheet(f"color: {self.secondary_text}; font-size: 12px;")
         skills_layout.addWidget(skills_hint)
-
         self.skills_list = QListWidget()
         self.skills_list.setFixedHeight(100)
         self.skills_list.setStyleSheet(self._list_style())
         for skill in self.settings.enabled_skills:
             self.skills_list.addItem(skill)
         skills_layout.addWidget(self.skills_list)
-        
         skills_btns = QHBoxLayout()
         skills_btns.setSpacing(8)
         add_skill_btn = QPushButton("+ Add Skill")
@@ -885,12 +945,142 @@ class SkillsTab(SettingsTab):
         remove_skill_btn.clicked.connect(self.remove_skill)
         remove_skill_btn.setStyleSheet(self._secondary_btn_style())
         skills_btns.addWidget(remove_skill_btn)
+        refresh_skills_btn = QPushButton("Refresh")
+        refresh_skills_btn.setToolTip("Reload enabled skills from settings")
+        refresh_skills_btn.clicked.connect(self.refresh_skills_list)
+        refresh_skills_btn.setStyleSheet(self._secondary_btn_style())
+        skills_btns.addWidget(refresh_skills_btn)
         skills_btns.addStretch()
         skills_layout.addLayout(skills_btns)
         scroll_layout.addWidget(skills_card)
-        
-        # ===== MCP Servers Section =====
-        mcp_card = self._create_card("🔌 MCP Servers", "Model Context Protocol servers for extended tools")
+        scroll_layout.addStretch()
+        scroll.setWidget(scroll_content)
+        layout.addWidget(scroll, 1)
+
+    def refresh_skills_list(self):
+        """Reload enabled skills list from current settings."""
+        self.skills_list.clear()
+        for skill in self.settings.enabled_skills:
+            self.skills_list.addItem(skill)
+        QMessageBox.information(self, "Refresh", "Skills list reloaded from settings.")
+
+    def add_skill(self):
+        _prompt = (
+            "Enter a skill id to enable (e.g. web_search, calendar, gmail, filesystem, memory, "
+            "scheduler, browser, documentation, github, mcp_marketplace):"
+        )
+        try:
+            from grizzyclaw.skills.registry import get_available_skills
+            skills = get_available_skills()
+            enabled = [self.skills_list.item(i).text().strip().lower() for i in range(self.skills_list.count())]
+            available = [s for s in skills if s.id.lower() not in enabled]
+            if not available:
+                QMessageBox.information(self, "Add Skill", "All available skills are already enabled.")
+                return
+            items = [f"{s.icon} {s.name} — {s.description}" for s in available]
+            if not items:
+                skill, ok = QInputDialog.getText(self, "Add Skill", _prompt)
+                if ok and skill.strip():
+                    sid = skill.strip()
+                    if sid.lower() not in enabled:
+                        self.skills_list.addItem(sid)
+                        QMessageBox.information(self, "Add Skill", f"Added \"{sid}\". The skill is now enabled. Some skills need API keys or other setup in Settings → Integrations.")
+                return
+            choice, ok = QInputDialog.getItem(
+                self, "Add Skill", "Select a skill to add (only skills not already enabled are shown):",
+                items, 0, False
+            )
+            if ok and choice:
+                for s in available:
+                    if f"{s.icon} {s.name} — {s.description}" == choice:
+                        if s.id.lower() not in enabled:
+                            self.skills_list.addItem(s.id)
+                            QMessageBox.information(self, "Add Skill", f"Added \"{s.name}\". Some skills (e.g. calendar, gmail) need credentials in Settings → Integrations.")
+                        break
+        except Exception:
+            skill, ok = QInputDialog.getText(self, "Add Skill", _prompt)
+            if ok and skill.strip():
+                enabled = [self.skills_list.item(i).text().strip().lower() for i in range(self.skills_list.count())]
+                if skill.strip().lower() not in enabled:
+                    self.skills_list.addItem(skill.strip())
+                    QMessageBox.information(self, "Add Skill", f"Added \"{skill.strip()}\". The skill is now enabled. Some skills need API keys or other setup in Settings → Integrations.")
+
+    def remove_skill(self):
+        row = self.skills_list.currentRow()
+        if row >= 0:
+            self.skills_list.takeItem(row)
+
+    def get_settings(self):
+        return {
+            "hf_token": self.hf_token.text() or None,
+            "enabled_skills": [self.skills_list.item(i).text() for i in range(self.skills_list.count())],
+        }
+
+
+class MCPTab(SettingsTab):
+    """MCP servers only (add/edit/test, marketplace, refresh)."""
+    def __init__(self, settings, parent=None):
+        super().__init__(parent)
+        self.settings = settings
+        self.running_processes = {}
+        self.recently_started = {}
+        self.started_servers_file = Path.home() / ".grizzyclaw" / "mcp_started.json"
+        self.mcp_last_error = {}
+        self.is_dark = False
+        theme = getattr(self.settings, "theme", "Light")
+        self.is_dark = theme in ["Dark", "High Contrast Dark", "Dracula", "Monokai", "Nord", "Solarized Dark"]
+        self._setup_theme_colors()
+        self._load_started_servers()
+        self.setup_ui()
+
+    def showEvent(self, event: QShowEvent):
+        super().showEvent(event)
+        self.refresh_mcp_statuses()
+
+    def _setup_theme_colors(self):
+        if self.is_dark:
+            self.bg_color = "#1E1E1E"
+            self.fg_color = "#FFFFFF"
+            self.card_bg = "#2D2D2D"
+            self.border_color = "#3A3A3C"
+            self.input_bg = "#3A3A3C"
+            self.accent_color = "#0A84FF"
+            self.secondary_text = "#8E8E93"
+            self.hover_bg = "#3A3A3C"
+            self.alt_row_bg = "#252525"
+        else:
+            self.bg_color = "#FFFFFF"
+            self.fg_color = "#1C1C1E"
+            self.card_bg = "#FAFAFA"
+            self.border_color = "#E5E5EA"
+            self.input_bg = "#FFFFFF"
+            self.accent_color = "#007AFF"
+            self.secondary_text = "#8E8E93"
+            self.hover_bg = "#F5F5F7"
+            self.alt_row_bg = "#FAFAFA"
+
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(16)
+        self.setStyleSheet(f"background-color: {self.bg_color};")
+        header = QLabel("MCP Servers")
+        header.setFont(QFont("-apple-system", 18, QFont.Weight.Bold))
+        header.setStyleSheet(f"color: {self.fg_color}; background: transparent;")
+        layout.addWidget(header)
+        subtitle = QLabel("Model Context Protocol servers for extended tools.")
+        subtitle.setWordWrap(True)
+        subtitle.setStyleSheet(f"color: {self.secondary_text}; font-size: 13px; margin-bottom: 8px; background: transparent;")
+        layout.addWidget(subtitle)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        scroll_content = QWidget()
+        scroll_layout = QVBoxLayout(scroll_content)
+        scroll_layout.setContentsMargins(0, 0, 8, 0)
+        scroll_layout.setSpacing(20)
+        mcp_card = self._create_card("🔌 MCP Servers", "Add and manage MCP servers for tools (search, filesystem, etc.)")
         mcp_layout = mcp_card.layout()
         
         mcp_marketplace_row = QHBoxLayout()
@@ -904,18 +1094,30 @@ class SkillsTab(SettingsTab):
         mcp_marketplace_hint = QLabel("Leave empty to use built-in list. In chat, use skill mcp_marketplace → discover / install.")
         mcp_marketplace_hint.setStyleSheet(f"color: {self.secondary_text}; font-size: 11px;")
         mcp_layout.addWidget(mcp_marketplace_hint)
+        docs_link = QLabel(
+            '<a href="https://modelcontextprotocol.io/introduction">How to add MCP servers</a>'
+        )
+        docs_link.setOpenExternalLinks(True)
+        docs_link.setStyleSheet(f"color: {self.accent_color}; font-size: 12px;")
+        mcp_layout.addWidget(docs_link)
         
-        # Server list with better styling
+        # Server list: 4 columns (Server, Status, Tools, Test)
         self.mcp_servers_tree = QTreeWidget()
-        self.mcp_servers_tree.setHeaderLabels(["Server", "Status", "Tools"])
-        self.mcp_servers_tree.setColumnWidth(0, 240)  # Server name
-        self.mcp_servers_tree.setColumnWidth(1, 36)   # Status button (smaller)
-        self.mcp_servers_tree.setColumnWidth(2, 50)   # Tools count
-        self.mcp_servers_tree.setMinimumHeight(180)
-        self.mcp_servers_tree.setMaximumHeight(280)
+        self.mcp_servers_tree.setHeaderLabels(["Server", "Status", "Tools", "Test"])
+        header = self.mcp_servers_tree.header()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+        self.mcp_servers_tree.setColumnWidth(1, 44)
+        self.mcp_servers_tree.setColumnWidth(2, 58)
+        self.mcp_servers_tree.setColumnWidth(3, 52)
+        self.mcp_servers_tree.setMinimumHeight(200)
+        self.mcp_servers_tree.setMaximumHeight(320)
+        self.mcp_servers_tree.setUniformRowHeights(True)
         self.mcp_servers_tree.setAlternatingRowColors(True)
         self.mcp_servers_tree.setRootIsDecorated(False)
-        self.mcp_servers_tree.setIndentation(0)  # Remove indentation for alignment
+        self.mcp_servers_tree.setIndentation(0)
         self.mcp_servers_tree.setStyleSheet(self._tree_style())
         mcp_layout.addWidget(self.mcp_servers_tree)
         
@@ -933,6 +1135,12 @@ class SkillsTab(SettingsTab):
         add_btn.setStyleSheet(self._primary_btn_style())
         mcp_btns.addWidget(add_btn)
         
+        add_marketplace_btn = QPushButton("Add from marketplace")
+        add_marketplace_btn.clicked.connect(self.add_mcp_from_marketplace)
+        add_marketplace_btn.setStyleSheet(self._secondary_btn_style())
+        add_marketplace_btn.setToolTip("Pick a server from the built-in or configured marketplace list")
+        mcp_btns.addWidget(add_marketplace_btn)
+        
         edit_btn = QPushButton("Edit")
         edit_btn.clicked.connect(self.edit_mcp)
         edit_btn.setStyleSheet(self._secondary_btn_style())
@@ -946,7 +1154,8 @@ class SkillsTab(SettingsTab):
         mcp_btns.addStretch()
         
         refresh_btn = QPushButton("🔄 Refresh")
-        refresh_btn.clicked.connect(self.refresh_mcp_statuses)
+        refresh_btn.clicked.connect(self._on_refresh_mcp)
+        refresh_btn.setToolTip("Refresh status and invalidate tool discovery cache")
         refresh_btn.setStyleSheet(self._secondary_btn_style())
         mcp_btns.addWidget(refresh_btn)
         
@@ -1047,7 +1256,8 @@ class SkillsTab(SettingsTab):
                 alternate-background-color: {self.alt_row_bg};
             }}
             QTreeWidget::item {{
-                padding: 6px 8px;
+                height: 32px;
+                padding: 0 10px;
                 border-bottom: 1px solid {row_border};
                 color: {self.fg_color};
             }}
@@ -1131,23 +1341,21 @@ class SkillsTab(SettingsTab):
         """
     
     def test_mcp(self):
-        token_ok = bool(self.hf_token.text().strip())
-        skills_count = self.skills_list.count()
         mcp_count = len(self.mcp_servers_data)
         running_status = []
         for i, s in enumerate(self.mcp_servers_data):
-            name = s.get('name', f'MCP {i}')
-            status = 'remote'
-            if 'command' in s:
+            name = s.get("name", f"MCP {i}")
+            if s.get("url"):
+                status = "✓ running" if self._test_remote_connection(s) == "✓" else "✗ stopped"
+            elif s.get("command"):
                 running = self._check_server_running_by_ps(s)
-                status = '✓ running' if running else '✗ stopped'
+                status = "✓ running" if running else "✗ stopped"
+            else:
+                status = "—"
             running_status.append(f"  {name}: {status}")
-        skills_ready = '✓' if token_ok and skills_count > 0 else '✗'
-        running_count = len([r for r in running_status if '✓ running' in r])
-        names_str = ', '.join([s.get('name', str(i)) for i, s in enumerate(self.mcp_servers_data)][:5]) or 'none'
-        msg = f"""HF Token: {'✓' if token_ok else '✗'}
-Skills ready: {skills_ready}
-MCP File: {self.mcp_file}
+        running_count = len([r for r in running_status if "✓ running" in r])
+        names_str = ", ".join([s.get("name", str(i)) for i, s in enumerate(self.mcp_servers_data)][:5]) or "none"
+        msg = f"""MCP File: {self.mcp_file}
 Configured: {mcp_count}
 Running: {running_count}/{mcp_count}
 
@@ -1156,47 +1364,6 @@ Status:
 
 Names: {names_str}"""
         QMessageBox.information(self, "Test MCP", msg)
-    
-    def add_skill(self):
-        _prompt = (
-            "Enter a skill id to enable (e.g. web_search, calendar, gmail, filesystem, memory, "
-            "scheduler, browser, documentation, github, mcp_marketplace):"
-        )
-        try:
-            from grizzyclaw.skills.registry import get_available_skills
-            skills = get_available_skills()
-            items = [f"{s.icon} {s.name} ({s.id})" for s in skills]
-            if not items:
-                skill, ok = QInputDialog.getText(self, "Add Skill", _prompt)
-                if ok and skill.strip():
-                    sid = skill.strip()
-                    if sid not in [self.skills_list.item(i).text() for i in range(self.skills_list.count())]:
-                        self.skills_list.addItem(sid)
-                        QMessageBox.information(self, "Add Skill", f"Added \"{sid}\". The skill is now enabled. Some skills need API keys or other setup in Settings → Integrations.")
-                return
-            skill_id, ok = QInputDialog.getItem(
-                self, "Add Skill", "Select a skill from the ecosystem:",
-                items, 0, False
-            )
-            if ok and skill_id:
-                # Extract id from "icon name (id)"
-                sid = skill_id.split("(")[-1].rstrip(")")
-                if sid and sid not in [self.skills_list.item(i).text() for i in range(self.skills_list.count())]:
-                    self.skills_list.addItem(sid)
-                    QMessageBox.information(self, "Add Skill", f"Added \"{sid}\". The skill is now enabled. Some skills (e.g. calendar, gmail) need credentials in Settings → Integrations.")
-        except Exception:
-            # Fallback on any error (ImportError, empty list, Qt issues)
-            skill, ok = QInputDialog.getText(self, "Add Skill", _prompt)
-            if ok and skill.strip():
-                sid = skill.strip()
-                if sid not in [self.skills_list.item(i).text() for i in range(self.skills_list.count())]:
-                    self.skills_list.addItem(sid)
-                    QMessageBox.information(self, "Add Skill", f"Added \"{sid}\". The skill is now enabled. Some skills need API keys or other setup in Settings → Integrations.")
-
-    def remove_skill(self):
-        row = self.skills_list.currentRow()
-        if row >= 0:
-            self.skills_list.takeItem(row)
 
     def load_mcp_list(self):
         self.mcp_servers_tree.clear()
@@ -1205,27 +1372,36 @@ Names: {names_str}"""
             display_name = server.get("name", "Unnamed MCP")
             if server.get("url"):
                 display_name += " 🌐"  # Remote indicator
-            item = QTreeWidgetItem([display_name, "", ""])
+            item = QTreeWidgetItem([display_name, "", "", ""])
             item.setData(0, 32, json.dumps(server))
             self.mcp_servers_tree.addTopLevelItem(item)
 
-            # Status button - smaller size with theme-aware styling
             btn = QPushButton("🔴")
-            btn.setFixedSize(28, 22)  # Smaller button
+            btn.setFixedSize(32, 26)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            srv = server.copy()  # Bind per iteration so each button gets correct server
+            srv = server.copy()
             btn.clicked.connect(lambda checked=False, s=srv: self.toggle_mcp_connection(s))
             btn.setStyleSheet(self._stopped_btn_style())
             self.mcp_servers_tree.setItemWidget(item, 1, btn)
 
-            # Tools count label with theme-aware styling
             tools_label = QLabel("--")
             tools_label.setAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
+            tools_label.setFixedSize(52, 26)
             tools_label.setStyleSheet(self._tools_label_style())
             self.mcp_servers_tree.setItemWidget(item, 2, tools_label)
 
+            test_btn = QPushButton("Test")
+            test_btn.setFixedSize(48, 26)
+            test_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            test_btn.setStyleSheet(self._secondary_btn_style())
+            test_btn.clicked.connect(lambda checked=False, it=item: self._test_one_server(it))
+            self.mcp_servers_tree.setItemWidget(item, 3, test_btn)
         self.refresh_mcp_statuses()
-    
+
+    def _mcp_cell_widget(self, item: QTreeWidgetItem, column: int) -> QWidget | None:
+        """Return the widget for column 1 (button) or 2 (tools label)."""
+        return self.mcp_servers_tree.itemWidget(item, column)
+
     def _stopped_btn_style(self):
         """Style for stopped (red) status button"""
         if self.is_dark:
@@ -1289,16 +1465,16 @@ Names: {names_str}"""
             """
     
     def _tools_label_style(self):
-        """Style for tools count label"""
+        """Style for tools count label (vertical alignment via wrapper layout)."""
         if self.is_dark:
             return """
                 QLabel {
                     background: #1A3A5C;
                     color: #64B5F6;
                     border-radius: 3px;
-                    padding: 2px 4px;
+                    padding: 5px 6px;
                     font-weight: 600;
-                    font-size: 10px;
+                    font-size: 11px;
                 }
             """
         else:
@@ -1307,9 +1483,9 @@ Names: {names_str}"""
                     background: #E3F2FD;
                     color: #1565C0;
                     border-radius: 3px;
-                    padding: 2px 4px;
+                    padding: 5px 6px;
                     font-weight: 600;
-                    font-size: 10px;
+                    font-size: 11px;
                 }
             """
 
@@ -1365,6 +1541,108 @@ Names: {names_str}"""
                 self._save_mcp_data()
             self.load_mcp_list()
     
+    def _on_refresh_mcp(self):
+        """Invalidate discovery cache then refresh status so next agent run gets fresh tools."""
+        try:
+            invalidate_tools_cache(self.mcp_file)
+        except Exception:
+            pass
+        self.refresh_mcp_statuses()
+
+    def _test_one_server(self, item: QTreeWidgetItem):
+        """Run discovery for the server in this row; show OK (N tools) or error. Store last error for tooltip."""
+        data_str = item.data(0, 32)
+        if not data_str:
+            return
+        try:
+            server_data = json.loads(data_str)
+        except json.JSONDecodeError:
+            return
+        name = server_data.get("name", "")
+        if not name:
+            QMessageBox.warning(self, "Test", "No server name.")
+            return
+        from grizzyclaw.utils.async_runner import run_async
+        try:
+            tools, err = run_async(discover_one_server(self.mcp_file, name))
+        except Exception as e:
+            err = str(e)
+            tools = []
+        if err:
+            self.mcp_last_error[name] = err
+            QMessageBox.warning(self, f"Test: {name}", err)
+        else:
+            self.mcp_last_error.pop(name, None)
+            QMessageBox.information(self, f"Test: {name}", f"OK — {len(tools)} tools")
+        # Update tools count label for this row
+        tools_lbl = self._mcp_cell_widget(item, 2)
+        if tools_lbl:
+            tools_lbl.setText(str(len(tools)) if tools else "0")
+        self.refresh_mcp_statuses()
+
+    def add_mcp_from_marketplace(self):
+        """Fetch marketplace list and let user pick a server to add (same as mcp_marketplace install)."""
+        marketplace_url = getattr(self.settings, "mcp_marketplace_url", None) or self.mcp_marketplace_url.text().strip() or None
+        servers = []
+        used_builtin = False
+        if marketplace_url:
+            try:
+                with urlopen(Request(marketplace_url), timeout=10) as resp:
+                    data = json.loads(resp.read().decode())
+                servers = data.get("servers", data) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+            except Exception:
+                used_builtin = True
+                from grizzyclaw.skills.executors import DEFAULT_MCP_MARKETPLACE
+                servers = DEFAULT_MCP_MARKETPLACE
+        if not servers:
+            from grizzyclaw.skills.executors import DEFAULT_MCP_MARKETPLACE
+            servers = DEFAULT_MCP_MARKETPLACE
+        if not servers:
+            QMessageBox.information(self, "Marketplace", "No servers in marketplace list.")
+            return
+        if used_builtin:
+            QMessageBox.information(
+                self, "Marketplace",
+                "Couldn't reach marketplace URL; using built-in list. You can add a URL in the field above or leave it empty."
+            )
+        existing_names = {s.get("name", "").strip().lower() for s in self.mcp_servers_data}
+        servers = [s for s in servers if (s.get("name") or "").strip().lower() not in existing_names]
+        if not servers:
+            QMessageBox.information(self, "Marketplace", "All marketplace servers are already added.")
+            return
+        items = [f"{s.get('name', '?')} — {s.get('description', '')}" for s in servers]
+        choice, ok = QInputDialog.getItem(self, "Add from marketplace", "Select a server to add:", items, 0, False)
+        if not ok or not choice:
+            return
+        name = choice.split(" — ")[0].strip()
+        entry = next((s for s in servers if (s.get("name") or "").strip() == name), None)
+        if not entry:
+            entry = servers[items.index(choice)] if choice in items else servers[0]
+        name = (entry.get("name") or entry.get("id") or "mcp-server").strip()
+        mcp_file = self.mcp_file
+        mcp_file.parent.mkdir(parents=True, exist_ok=True)
+        data = {"mcpServers": {}}
+        if mcp_file.exists():
+            try:
+                with open(mcp_file, "r") as f:
+                    data = json.load(f)
+                data.setdefault("mcpServers", {})
+            except Exception:
+                pass
+        cmd = entry.get("command", "npx")
+        args = entry.get("args", ["-y", name])
+        data["mcpServers"][name] = {"command": cmd, "args": args}
+        try:
+            with open(mcp_file, "w") as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            QMessageBox.warning(self, "Save Failed", str(e))
+            return
+        invalidate_tools_cache(mcp_file)
+        self.mcp_servers_data = self._load_mcp_data()
+        self.load_mcp_list()
+        QMessageBox.information(self, "Added", f"Added **{name}**. Click Refresh or Test to verify.")
+
     def refresh_mcp_statuses(self):
         """Refresh status indicators for all MCP servers"""
         TOOLS_COUNTS = {
@@ -1390,7 +1668,7 @@ Names: {names_str}"""
             tools_count = TOOLS_COUNTS.get(name_lower, 12)
             
             # Update tools count label
-            tools_lbl = self.mcp_servers_tree.itemWidget(item, 2)
+            tools_lbl = self._mcp_cell_widget(item, 2)
             if tools_lbl:
                 tools_lbl.setText(str(tools_count))
             
@@ -1404,7 +1682,7 @@ Names: {names_str}"""
             is_running = status_icon == "✓"
             
             # Update button appearance
-            btn = self.mcp_servers_tree.itemWidget(item, 1)
+            btn = self._mcp_cell_widget(item, 1)
             if btn:
                 if is_running:
                     btn.setText("🟢")
@@ -1412,7 +1690,11 @@ Names: {names_str}"""
                     btn.setStyleSheet(self._running_btn_style())
                 else:
                     btn.setText("🔴")
-                    btn.setToolTip(f"{name} is stopped. Click to start.")
+                    last_err = self.mcp_last_error.get(name, "")
+                    tip = f"{name} is stopped. Click to start."
+                    if last_err:
+                        tip += f"\nLast error: {last_err[:200]}{'…' if len(last_err) > 200 else ''}"
+                    btn.setToolTip(tip)
                     btn.setStyleSheet(self._stopped_btn_style())
                 # Force repaint
                 btn.update()
@@ -1428,7 +1710,7 @@ Names: {names_str}"""
             try:
                 server_data = json.loads(data_str)
                 if server_data.get('name') == server_name:
-                    btn = self.mcp_servers_tree.itemWidget(item, 1)
+                    btn = self._mcp_cell_widget(item, 1)
                     if btn:
                         if is_running:
                             btn.setText("🟢")
@@ -1503,17 +1785,27 @@ Names: {names_str}"""
         return "✓" if self._check_server_running_by_ps(server_data) else "✗"
 
     def _test_remote_connection(self, server_data):
-        url = server_data.get('url', '').rstrip('/') + '/'
-        headers = server_data.get('headers', {})
+        """Check if remote MCP server is reachable. Uses Python urllib (no curl) so it works in bundled app."""
+        url = (server_data.get('url') or '').strip().rstrip('/') or ''
         if not url:
             return "✗"
-        curl_cmd = ['curl', '-s', '-o', '/dev/null', '-w', '%{{http_code}}', '--max-time', '3', url]
-        for k, v in headers.items():
-            curl_cmd += ['-H', f'{k}: {v}']
+        if not url.endswith('/'):
+            url = url + '/'
+        headers = server_data.get('headers') or {}
+        if not isinstance(headers, dict):
+            headers = {}
         try:
-            result = subprocess.run(curl_cmd, capture_output=True, text=True, timeout=6)
-            code = result.stdout.strip()
-            return "✓" if code == '200' else "✗"
+            req = Request(url, headers=headers)
+            with urlopen(req, timeout=3) as resp:
+                code = getattr(resp, 'status', 200)
+                if 200 <= code < 300:
+                    return "✓"
+                return "✗"
+        except HTTPError as e:
+            # Server responded; 2xx = up, else down (e.g. 404/500)
+            return "✓" if 200 <= e.code < 300 else "✗"
+        except (URLError, OSError, TimeoutError):
+            return "✗"
         except Exception:
             return "✗"
 
@@ -1623,8 +1915,10 @@ Names: {names_str}"""
             try:
                 import time
                 DEVNULL = subprocess.DEVNULL
-                # Use expanded environment so npx/uvx/node can be found
+                # Use expanded environment + any server-specific env vars
                 expanded_env = self._get_expanded_env()
+                for k, v in (server_data.get("env") or {}).items():
+                    expanded_env[str(k)] = str(v)
                 # stdin=PIPE keeps the pipe open so stdio-based MCP servers don't get EOF and exit
                 p = subprocess.Popen(cmd_list, stdin=subprocess.PIPE, stdout=DEVNULL, stderr=DEVNULL,
                                      start_new_session=True, env=expanded_env)
@@ -1674,7 +1968,23 @@ Names: {names_str}"""
     def _save_mcp_data(self):
         try:
             self.mcp_file.parent.mkdir(parents=True, exist_ok=True)
-            mcp_dict = {s["name"]: {"command": s["command"], "args": s["args"]} for s in self.mcp_servers_data}
+            # Persist url/headers (remote) and command/args (local) so remote servers survive save/reload
+            mcp_dict = {}
+            for s in self.mcp_servers_data:
+                name = s.get("name")
+                if not name:
+                    continue
+                cfg = {}
+                if "url" in s:
+                    cfg["url"] = s["url"]
+                    if s.get("headers"):
+                        cfg["headers"] = s["headers"]
+                if "command" in s:
+                    cfg["command"] = s["command"]
+                    cfg["args"] = s.get("args", [])
+                    if s.get("env"):
+                        cfg["env"] = s["env"]
+                mcp_dict[name] = cfg
             with open(self.mcp_file, 'w') as f:
                 json.dump({"mcpServers": mcp_dict}, f, indent=2)
         except Exception as e:
@@ -1694,7 +2004,7 @@ Names: {names_str}"""
             started = []
             for row in range(self.mcp_servers_tree.topLevelItemCount()):
                 item = self.mcp_servers_tree.topLevelItem(row)
-                btn = self.mcp_servers_tree.itemWidget(item, 1)
+                btn = self._mcp_cell_widget(item, 1)
                 if btn and btn.text() == '🟢':
                     data_str = item.data(0, 32)
                     if data_str:
@@ -1715,11 +2025,15 @@ Names: {names_str}"""
         except Exception:
             pass  # Ignore errors saving state file
 
+    def get_settings(self):
+        return {"mcp_marketplace_url": self.mcp_marketplace_url.text().strip() or None}
+
+
 class MCPDialog(QDialog):
     def __init__(self, parent=None, edit_data=None):
         super().__init__(parent)
         self.setWindowTitle("Edit MCP Server" if edit_data else "Add MCP Server")
-        self.setFixedSize(500, 350)
+        self.setFixedSize(500, 420)
         self.setup_ui()
         if edit_data:
             self.name_edit.setText(edit_data.get("name", ""))
@@ -1733,6 +2047,8 @@ class MCPDialog(QDialog):
                 self.cmd_edit.setText(edit_data.get("command", ""))
                 args_text = " ".join(str(a) for a in edit_data.get("args", []))
                 self.args_edit.setPlainText(args_text)
+                env_data = edit_data.get("env") or {}
+                self.env_edit.setPlainText(self._format_env_for_edit(env_data))
                 self.toggle_fields(False)
 
     def setup_ui(self):
@@ -1771,12 +2087,23 @@ class MCPDialog(QDialog):
         self.args_edit.setPlaceholderText('Space-separated e.g. --port 8000 -m mcp_server')
         form.addRow("Arguments:", self.args_edit)
 
+        self.env_edit = QPlainTextEdit()
+        self.env_edit.setPlaceholderText("KEY=value (one per line)")
+        self.env_edit.setMaximumBlockCount(50)
+        self.env_edit.setFixedHeight(80)
+        self.env_edit.setTabChangesFocus(True)
+        form.addRow("Environment:", self.env_edit)
+
         widget = QWidget()
         widget.setLayout(form)
         layout.addWidget(widget)
 
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
+        validate_btn = QPushButton("Validate")
+        validate_btn.setToolTip("Test connection / list tools before saving")
+        validate_btn.clicked.connect(self._validate_config)
+        btn_layout.addWidget(validate_btn)
         ok_btn = QPushButton("Save")
         ok_btn.clicked.connect(self.accept)
         btn_layout.addWidget(ok_btn)
@@ -1786,12 +2113,75 @@ class MCPDialog(QDialog):
         btn_layout.addWidget(cancel_btn)
 
         layout.addLayout(btn_layout)
+        self.toggle_fields(self.remote_cb.isChecked())
 
     def toggle_fields(self, checked: bool):
         self.url_edit.setVisible(checked)
         self.headers_edit.setVisible(checked)
         self.cmd_edit.setVisible(not checked)
         self.args_edit.setVisible(not checked)
+        self.env_edit.setVisible(not checked)
+
+    @staticmethod
+    def _format_env_for_edit(env: dict) -> str:
+        if not env:
+            return ""
+        return "\n".join(f"{k}={v}" for k, v in sorted(env.items()))
+
+    @staticmethod
+    def _parse_env_text(text: str) -> dict:
+        """Parse KEY=value lines or JSON object into a dict. Empty/invalid lines ignored."""
+        text = (text or "").strip()
+        if not text:
+            return {}
+        stripped = text.strip()
+        if stripped.startswith("{"):
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                pass
+        result = {}
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line:
+                k, _, v = line.partition("=")
+                result[k.strip()] = v.strip()
+        return result
+
+    def _validate_config(self):
+        """Run validation for current form (local: list tools; remote: HTTP check)."""
+        if self.remote_cb.isChecked():
+            url = self.url_edit.text().strip()
+            if not url:
+                QMessageBox.warning(self, "Validate", "Enter URL first.")
+                return
+            headers_text = self.headers_edit.toPlainText().strip()
+            try:
+                headers = json.loads(headers_text) if headers_text else {}
+            except json.JSONDecodeError:
+                QMessageBox.warning(self, "Validate", "Invalid headers JSON.")
+                return
+            config = {"url": url, "headers": headers}
+        else:
+            cmd = self.cmd_edit.text().strip()
+            if not cmd:
+                QMessageBox.warning(self, "Validate", "Enter command first.")
+                return
+            args_text = self.args_edit.toPlainText().strip()
+            args = args_text.split() if args_text else []
+            env = self._parse_env_text(self.env_edit.toPlainText())
+            config = {"command": cmd, "args": args, "env": env}
+        from grizzyclaw.utils.async_runner import run_async
+        try:
+            ok, msg = run_async(validate_server_config(config))
+        except Exception as e:
+            ok, msg = False, str(e)
+        if ok:
+            QMessageBox.information(self, "Validate", msg)
+        else:
+            QMessageBox.warning(self, "Validate", msg)
 
     def accept(self):
         name = self.name_edit.text().strip()
@@ -1822,7 +2212,8 @@ class MCPDialog(QDialog):
             cmd = self.cmd_edit.text().strip()
             args_text = self.args_edit.toPlainText().strip()
             args = args_text.split() if args_text else []
-            return {"name": name, "command": cmd, "args": args}
+            env = self._parse_env_text(self.env_edit.toPlainText())
+            return {"name": name, "command": cmd, "args": args, "env": env}
 
 class SecurityTab(SettingsTab):
     def __init__(self, settings, parent=None):
@@ -1832,88 +2223,70 @@ class SecurityTab(SettingsTab):
     
     def setup_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(40, 30, 40, 30)
-        layout.setSpacing(20)
-        
-        # Warning
+        layout.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        container = QWidget()
+        container_layout = QVBoxLayout(container)
+        container_layout.setContentsMargins(40, 24, 40, 24)
+        container_layout.setSpacing(24)
+
         warning = QLabel("⚠️  Changes require restart")
-        warning.setStyleSheet("""
-            font-weight: 600;
-            padding: 12px;
-            border-radius: 6px;
-        """)
+        warning.setStyleSheet("font-weight: 600; padding: 12px; border-radius: 6px;")
         warning.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(warning)
-        
-        form = QFormLayout()
-        form.setSpacing(16)
-        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
-        
-        # Secret Key
+        container_layout.addWidget(warning)
+
+        security_group = QGroupBox("Security")
+        security_group.setStyleSheet(self.get_group_style())
+        form = QFormLayout(security_group)
+        form.setSpacing(18)
+
         self.secret_key = QLineEdit(self.settings.secret_key)
         self.secret_key.setEchoMode(QLineEdit.EchoMode.Password)
         self.secret_key.setFixedHeight(32)
         form.addRow("Secret Key:", self.secret_key)
-        
-        # JWT Secret
         self.jwt_secret = QLineEdit(self.settings.jwt_secret)
         self.jwt_secret.setEchoMode(QLineEdit.EchoMode.Password)
         self.jwt_secret.setFixedHeight(32)
         form.addRow("JWT Secret:", self.jwt_secret)
-        
-        # Rate Limit
         self.rate_limit = QSpinBox()
         self.rate_limit.setRange(10, 1000)
         self.rate_limit.setValue(self.settings.rate_limit_requests)
         self.rate_limit.setFixedHeight(32)
         form.addRow("Rate Limit:", self.rate_limit)
-
-        # Allow shell commands (OpenClaw-style exec with approval)
         self.exec_commands_enabled = QCheckBox("Allow shell commands")
         self.exec_commands_enabled.setChecked(getattr(self.settings, "exec_commands_enabled", False))
-        self.exec_commands_enabled.setToolTip(
-            "Let the agent run shell commands. Each command requires your approval in a dialog. "
-            "Similar to OpenClaw's exec capability."
-        )
+        self.exec_commands_enabled.setToolTip("Let the agent run shell commands. Each command requires your approval in a dialog.")
         form.addRow("", self.exec_commands_enabled)
-
         self.exec_safe_commands_skip_approval = QCheckBox("Skip approval for safe commands (ls, df, pwd, whoami, date, etc.)")
-        self.exec_safe_commands_skip_approval.setChecked(
-            getattr(self.settings, "exec_safe_commands_skip_approval", True)
-        )
-        self.exec_safe_commands_skip_approval.setToolTip(
-            "Read-only commands like ls, df, pwd run immediately without approval."
-        )
+        self.exec_safe_commands_skip_approval.setChecked(getattr(self.settings, "exec_safe_commands_skip_approval", True))
         form.addRow("", self.exec_safe_commands_skip_approval)
-
         self.exec_sandbox_enabled = QCheckBox("Run approved commands in sandbox (restricted PATH)")
         self.exec_sandbox_enabled.setChecked(getattr(self.settings, "exec_sandbox_enabled", False))
-        self.exec_sandbox_enabled.setToolTip(
-            "When enabled, approved commands run with PATH=/usr/bin:/bin only. Best-effort restriction."
-        )
         form.addRow("", self.exec_sandbox_enabled)
-
         self.pre_send_health_check = QCheckBox("Check LLM provider before sending")
         self.pre_send_health_check.setChecked(getattr(self.settings, "pre_send_health_check", False))
-        self.pre_send_health_check.setToolTip(
-            "Ping the default LLM (e.g. Ollama) before sending; warn if unreachable and offer to send anyway."
-        )
         form.addRow("", self.pre_send_health_check)
 
-        layout.addLayout(form)
-        
-        # Generate button
+        container_layout.addWidget(security_group)
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
-        
         gen_btn = QPushButton("Generate New Keys")
         gen_btn.setFixedSize(140, 28)
         gen_btn.clicked.connect(self.generate_keys)
         btn_layout.addWidget(gen_btn)
-        
-        layout.addLayout(btn_layout)
-        layout.addStretch()
-    
+        container_layout.addLayout(btn_layout)
+        scroll.setWidget(container)
+        layout.addWidget(scroll)
+
+    def get_group_style(self):
+        dialog = self.window()
+        if isinstance(dialog, SettingsDialog) and getattr(dialog, "is_dark", False):
+            return "QGroupBox { font-weight: 600; font-size: 13px; border: 1px solid #3A3A3C; border-radius: 6px; margin-top: 8px; margin-bottom: 8px; padding: 8px 16px 16px 16px; background: #2C2C2E; } QGroupBox::title { subcontrol-origin: padding; left: 0; top: 0; padding-bottom: 4px; color: #FFFFFF; }"
+        return "QGroupBox { font-weight: 600; font-size: 13px; border: 1px solid #E5E5EA; border-radius: 6px; margin-top: 8px; margin-bottom: 8px; padding: 8px 16px 16px 16px; background: #FAFAFA; } QGroupBox::title { subcontrol-origin: padding; left: 0; top: 0; padding-bottom: 4px; color: #1C1C1E; }"
+
     def generate_keys(self):
         reply = QMessageBox.question(
             self, "Generate Keys",
@@ -2008,7 +2381,7 @@ class IntegrationsTab(SettingsTab):
         media_group = QGroupBox("Media & Transcription")
         media_group.setStyleSheet(self.get_group_style())
         media_form = QFormLayout(media_group)
-        media_form.setSpacing(12)
+        media_form.setSpacing(18)
 
         self.transcription_provider = QComboBox()
         self.transcription_provider.addItems(["openai", "local"])
@@ -2057,6 +2430,7 @@ class IntegrationsTab(SettingsTab):
         voice_group = QGroupBox("Voice (TTS)")
         voice_group.setStyleSheet(self.get_group_style())
         voice_form = QFormLayout(voice_group)
+        voice_form.setSpacing(18)
         self.elevenlabs_key = QLineEdit(
             getattr(self.settings, "elevenlabs_api_key", None) or ""
         )
@@ -2453,66 +2827,58 @@ class AppearanceTab(SettingsTab):
     
     def setup_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(40, 30, 40, 30)
-        layout.setSpacing(20)
-        
-        # Theme Section
+        layout.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        container = QWidget()
+        container_layout = QVBoxLayout(container)
+        container_layout.setContentsMargins(40, 24, 40, 24)
+        container_layout.setSpacing(24)
+
         theme_group = self.create_group("Theme")
         theme_form = QFormLayout(theme_group)
-        theme_form.setSpacing(12)
-        
+        theme_form.setSpacing(18)
         self.theme_combo = QComboBox()
-        self.theme_combo.setEditable(False)  # Not editable, selection only
+        self.theme_combo.setEditable(False)
         self.theme_combo.addItems([
-            "Light",
-            "Dark",
-            "Auto (System)",
-            "High Contrast Light",
-            "High Contrast Dark",
-            "Nord",
-            "Solarized Light",
-            "Solarized Dark",
-            "Dracula",
-            "Monokai"
+            "Light", "Dark", "Auto (System)",
+            "High Contrast Light", "High Contrast Dark",
+            "Nord", "Solarized Light", "Solarized Dark", "Dracula", "Monokai"
         ])
-        self.theme_combo.setCurrentText(getattr(self.settings, 'theme', 'Light'))
+        self.theme_combo.setCurrentText(getattr(self.settings, "theme", "Light"))
         self.theme_combo.setFixedHeight(32)
         self.theme_combo.currentTextChanged.connect(self.on_theme_changed)
         theme_form.addRow("Color Theme:", self.theme_combo)
-        
-        layout.addWidget(theme_group)
-        
-        # Font Section
+        container_layout.addWidget(theme_group)
+
         font_group = self.create_group("Typography")
         font_form = QFormLayout(font_group)
-        font_form.setSpacing(12)
-        
+        font_form.setSpacing(18)
         self.font_family = QComboBox()
-        self.font_family.setEditable(False)  # Not editable, selection only
+        self.font_family.setEditable(False)
         self.font_family.addItems(["System Default", "SF Pro", "Helvetica", "Arial", "Inter"])
-        self.font_family.setCurrentText(getattr(self.settings, 'font_family', 'System Default'))
+        self.font_family.setCurrentText(getattr(self.settings, "font_family", "System Default"))
         self.font_family.setFixedHeight(32)
         font_form.addRow("Font Family:", self.font_family)
-        
         self.font_size = QSpinBox()
         self.font_size.setRange(10, 20)
-        self.font_size.setValue(getattr(self.settings, 'font_size', 13))
+        self.font_size.setValue(getattr(self.settings, "font_size", 13))
         self.font_size.setFixedHeight(32)
         font_form.addRow("Base Font Size:", self.font_size)
-        
-        layout.addWidget(font_group)
-        
-        # UI Density Section
+        container_layout.addWidget(font_group)
+
         density_group = self.create_group("UI Density")
         density_form = QFormLayout(density_group)
-        density_form.setSpacing(12)
-        
+        density_form.setSpacing(18)
         self.compact_mode = QCheckBox("Enable Compact Mode")
-        self.compact_mode.setChecked(getattr(self.settings, 'compact_mode', False))
+        self.compact_mode.setChecked(getattr(self.settings, "compact_mode", False))
         density_form.addRow("", self.compact_mode)
-        
-        layout.addWidget(density_group)
-        layout.addStretch()
+        container_layout.addWidget(density_group)
+
+        scroll.setWidget(container)
+        layout.addWidget(scroll)
     
     def create_group(self, title):
         group = QGroupBox(title)
@@ -2586,7 +2952,7 @@ class SettingsDialog(QDialog):
         self.is_dark = False
         self.setWindowTitle("Preferences")
         self.setMinimumSize(700, 550)
-        self.resize(750, 600)
+        self.resize(780, 600)
         self.setup_ui()
         # Apply theme to match main window
         if theme_colors:
@@ -2701,7 +3067,8 @@ class SettingsDialog(QDialog):
         self.telegram_tab = TelegramTab(self.settings)
         self.whatsapp_tab = WhatsAppTab(self.settings)
         self.prompts_tab = PromptsTab(self.settings)
-        self.skills_tab = SkillsTab(self.settings)
+        self.clawhub_tab = ClawHubTab(self.settings)
+        self.mcp_tab = MCPTab(self.settings)
         self.security_tab = SecurityTab(self.settings)
         self.integrations_tab = IntegrationsTab(self.settings)
         self.daemon_tab = DaemonTab(self.settings)
@@ -2712,17 +3079,18 @@ class SettingsDialog(QDialog):
             ("LLM Providers", self.llm_tab),
             ("Telegram", self.telegram_tab),
             ("WhatsApp", self.whatsapp_tab),
+            ("Appearance", self.appearance_tab),
+            ("Daemon", self.daemon_tab),
             ("Prompts & Rules", self.prompts_tab),
-            ("ClawHub & MCP", self.skills_tab),
+            ("ClawHub", self.clawhub_tab),
+            ("MCP Servers", self.mcp_tab),
             ("Security", self.security_tab),
             ("Integrations", self.integrations_tab),
-            ("Daemon", self.daemon_tab),
-            ("Appearance", self.appearance_tab),
         ]
         for label, widget in tab_items:
             self.tabs.addTab(widget, label)
         
-        # Custom tab bar: 2 rows of buttons
+        # Custom tab bar: 2 rows only (6 on first row, 5 on second)
         self.tab_bar = QWidget()
         self.tab_bar.setStyleSheet("background: #F5F5F7; border-bottom: 1px solid #E5E5EA;")
         tab_bar_layout = QGridLayout(self.tab_bar)
@@ -2775,9 +3143,9 @@ class SettingsDialog(QDialog):
             btn.clicked.connect(lambda checked, idx=i: self.tabs.setCurrentIndex(idx))
             tab_btn_group.addButton(btn)
             self._tab_buttons.append(btn)
-            row, col = divmod(i, 5)
+            row, col = divmod(i, 6)
             tab_bar_layout.addWidget(btn, row, col)
-        tab_bar_layout.setColumnStretch(4, 1)
+        tab_bar_layout.setColumnStretch(5, 1)
         layout.addWidget(self.tab_bar)
         layout.addWidget(self.tabs, 1)
         self._tab_buttons[0].setChecked(True)
@@ -2825,7 +3193,8 @@ class SettingsDialog(QDialog):
         new_settings.update(self.telegram_tab.get_settings())
         new_settings.update(self.whatsapp_tab.get_settings())
         new_settings.update(self.prompts_tab.get_settings())
-        new_settings.update(self.skills_tab.get_settings())
+        new_settings.update(self.clawhub_tab.get_settings())
+        new_settings.update(self.mcp_tab.get_settings())
         new_settings.update(self.security_tab.get_settings())
         new_settings.update(self.integrations_tab.get_settings())
         new_settings.update(self.daemon_tab.get_settings())

@@ -336,8 +336,14 @@ class WorkspaceManager:
         if config.rules_file:
             settings.rules_file = config.rules_file
         
-        # Custom database path for workspace isolation
-        settings.database_url = f"sqlite:///{workspace.get_memory_db_path()}"
+        # Custom database path for workspace isolation.
+        # Shared memory: one absolute DB per channel so all workspaces on that channel share it.
+        if config.use_shared_memory:
+            channel = config.inter_agent_channel or "default"
+            db_path = self.data_dir / f"shared_memory_{channel}.db"
+        else:
+            db_path = self.data_dir / workspace.get_memory_db_path()
+        settings.database_url = f"sqlite:///{db_path.resolve()}"
 
         # Lazy import to avoid circular import: agent.core -> workspaces.workspace -> manager -> agent.core
         from grizzyclaw.agent.core import AgentCore
@@ -455,6 +461,25 @@ class WorkspaceManager:
                 return ws
         return None
 
+    def get_workspace_slug(self, workspace: Workspace) -> str:
+        """Return @mention slug for a workspace (name lowercased, spaces → underscores)."""
+        return workspace.name.lower().replace(" ", "_").replace("-", "_")
+
+    def get_discoverable_specialist_slugs(
+        self,
+        inter_agent_channel: Optional[str] = None,
+        exclude_workspace_id: Optional[str] = None,
+    ) -> List[str]:
+        """Return list of @mention slugs for workspaces that can receive delegations on the given channel."""
+        slugs: List[str] = []
+        for ws in self.workspaces.values():
+            if not ws.config.enable_inter_agent or ws.id == exclude_workspace_id:
+                continue
+            if inter_agent_channel and ws.config.inter_agent_channel and ws.config.inter_agent_channel != inter_agent_channel:
+                continue
+            slugs.append(self.get_workspace_slug(ws))
+        return sorted(slugs)
+
     async def send_message_to_workspace(
         self,
         from_id: str,
@@ -478,9 +503,17 @@ class WorkspaceManager:
             if from_ws.config.inter_agent_channel != target.config.inter_agent_channel:
                 return f"Target workspace is on channel '{target.config.inter_agent_channel}'; cannot message from '{from_ws.config.inter_agent_channel}'."
         try:
+            delegation_context = context or {}
+            if from_ws:
+                delegation_context = {
+                    **delegation_context,
+                    "from_workspace_id": from_id,
+                    "from_workspace_name": from_ws.name,
+                    "task_summary": (message.strip().split("\n")[0][:120] if message else ""),
+                }
             agent = self.get_or_create_agent(target.id)
             response = agent.process_message(
-                f"inter-agent-{from_id}", message, context=context
+                f"inter-agent-{from_id}", message, context=delegation_context
             )
             if hasattr(response, "__aiter__"):
                 chunks = []

@@ -16,6 +16,12 @@ DEFAULT_MCP_MARKETPLACE = [
 ]
 
 
+# Standard token endpoint for Google OAuth 2.0
+_GOOGLE_TOKEN_URI = "https://oauth2.googleapis.com/token"
+# Calendar scope - must be in token (and in creds scopes) for Calendar API
+_CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar"
+
+
 def _get_google_creds(settings: Any):
     """Load Google OAuth credentials (Gmail/Calendar)."""
     path = getattr(settings, "gmail_credentials_json", None)
@@ -23,7 +29,17 @@ def _get_google_creds(settings: Any):
         return None
     from grizzyclaw.automation.gmail_creds import load_gmail_credentials
     secret = getattr(settings, "secret_key", None)
-    return load_gmail_credentials(str(Path(path).expanduser()), secret)
+    data = load_gmail_credentials(str(Path(path).expanduser()), secret)
+    if not data:
+        return None
+    # Normalize for from_authorized_user_info: token_uri and scopes (Playground uses "scope" string)
+    data = dict(data)
+    if not data.get("token_uri"):
+        data["token_uri"] = _GOOGLE_TOKEN_URI
+    if "scopes" not in data and data.get("scope"):
+        # OAuth response often has "scope" as space-separated string; library expects "scopes" list
+        data["scopes"] = [s.strip() for s in str(data.pop("scope", "")).split() if s.strip()]
+    return data
 
 
 def execute_calendar(action: str, params: Dict[str, Any], settings: Any) -> str:
@@ -35,7 +51,13 @@ def execute_calendar(action: str, params: Dict[str, Any], settings: Any) -> str:
         from google.oauth2.credentials import Credentials
         from googleapiclient.discovery import build
         from google.auth.transport.requests import Request
-        creds = Credentials.from_authorized_user_info(creds_data)
+        # Ensure Calendar scope is in the list so refresh grants access to Calendar API
+        cal_creds = dict(creds_data)
+        scopes = list(cal_creds.get("scopes") or [])
+        if _CALENDAR_SCOPE not in scopes:
+            scopes.append(_CALENDAR_SCOPE)
+        cal_creds["scopes"] = scopes
+        creds = Credentials.from_authorized_user_info(cal_creds)
         if creds.expired and creds.refresh_token:
             creds.refresh(Request())
         service = build("calendar", "v3", credentials=creds)
@@ -79,6 +101,19 @@ def execute_calendar(action: str, params: Dict[str, Any], settings: Any) -> str:
             return f"✅ Event created: **{event.get('summary', summary)}** — {start}"
         return f"❌ Unknown calendar action: {action}. Use list_events or create_event."
     except Exception as e:
+        err_str = str(e).lower()
+        if "invalid_grant" in err_str or "bad request" in err_str:
+            return (
+                "❌ Calendar error: invalid_grant — refresh token doesn't match your OAuth client. "
+                "Use the same Client ID and secret in the Playground as in your token file, then do a fresh Authorize → Exchange and update the file."
+            )
+        if "403" in str(e) and ("insufficient" in err_str or "permission" in err_str or "scope" in err_str):
+            return (
+                "❌ Calendar error: token missing Calendar scope. In OAuth 2.0 Playground: add scope "
+                "https://www.googleapis.com/auth/calendar (under Google Calendar API v3), then click "
+                "Authorize APIs (sign in again), then Exchange authorization code for tokens. Replace the "
+                "refresh_token in ~/.grizzyclaw/gmail_token.json with the new one. Quit and restart the app."
+            )
         logger.exception("Calendar skill error")
         return f"❌ Calendar error: {e}"
 
@@ -160,6 +195,16 @@ def execute_gmail(action: str, params: Dict[str, Any], settings: Any) -> str:
             return "\n".join(lines)
         return f"❌ Unknown gmail action: {action}. Use send_email, reply, or list_messages."
     except Exception as e:
+        err_str = str(e).lower()
+        if "invalid_grant" in err_str or "bad request" in err_str:
+            logger.warning("Gmail invalid_grant: %s", e)
+            return (
+                "❌ Gmail error: invalid_grant — refresh token doesn't match your client. "
+                "Fix: 1) In Google Cloud Console open the same OAuth client you use in the Playground. "
+                "2) Copy its Client ID and Client secret. 3) In OAuth 2.0 Playground (gear icon) enter those exact values. "
+                "4) Select Gmail scopes → Authorize APIs → sign in as your test user → Exchange authorization code for tokens (once). "
+                "5) In your token file put that client_id, that client_secret, and the refresh_token from the response. All three must be from the same flow."
+            )
         logger.exception("Gmail skill error")
         return f"❌ Gmail error: {e}"
 

@@ -148,6 +148,13 @@ class Settings(BaseSettings):
     max_context_length: int = 4000
     max_session_messages: int = 20
     memory_retrieval_limit: int = 10
+
+    # Agent autonomy & strength
+    max_agentic_iterations: int = Field(default=10, alias="MAX_AGENTIC_ITERATIONS")  # Tool-use rounds per turn
+    agent_reflection_enabled: bool = Field(default=True, alias="AGENT_REFLECTION_ENABLED")  # Prompt to continue or answer after tool results
+    agent_plan_before_tools: bool = Field(default=False, alias="AGENT_PLAN_BEFORE_TOOLS")  # Ask for PLAN = [...] on complex tasks
+    agent_tool_result_max_chars: int = Field(default=4000, alias="AGENT_TOOL_RESULT_MAX_CHARS")  # Truncate/summarize larger tool results
+    agent_retry_on_tool_failure: bool = Field(default=True, alias="AGENT_RETRY_ON_TOOL_FAILURE")  # One retry with feedback on tool error
     session_persistence: bool = Field(
         default=True, alias="SESSION_PERSISTENCE"
     )  # Persist chat sessions to disk across restarts

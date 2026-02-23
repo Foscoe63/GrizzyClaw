@@ -1598,11 +1598,15 @@ class SidebarWidget(QWidget):
         accent = self._theme_colors.get("accent", "#007AFF") if self._theme_colors else "#007AFF"
         hover = "rgba(255, 255, 255, 0.1)" if (self._theme_colors and self._theme_colors.get("is_dark")) else "rgba(0, 0, 0, 0.05)"
         for ws in workspaces:
-            btn = QPushButton(f"{ws.icon}  {ws.name}")
+            label = f"{ws.icon}  {ws.name}"
+            btn = QPushButton(label)
             btn.setProperty("workspace_id", ws.id)
             btn.setFont(QFont("-apple-system", 13))
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.setFixedHeight(36)
+            slug = self.workspace_manager.get_workspace_slug(ws) if getattr(ws.config, "enable_inter_agent", False) else None
+            if slug:
+                btn.setToolTip(f"{ws.name} — inter-agent: use @{slug} to delegate")
             is_active = ws.id == active_id
             btn.setStyleSheet(f"""
                 QPushButton {{

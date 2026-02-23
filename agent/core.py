@@ -8,8 +8,9 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 from grizzyclaw.automation import CronScheduler, PLAYWRIGHT_AVAILABLE
 from grizzyclaw.config import Settings
+from grizzyclaw.llm import LLMError
 from grizzyclaw.llm.router import LLMRouter
-from grizzyclaw.mcp_client import call_mcp_tool, discover_tools
+from grizzyclaw.mcp_client import call_mcp_tool, discover_tools, invalidate_tools_cache
 from grizzyclaw.memory.sqlite_store import SQLiteMemoryStore
 from grizzyclaw.media.transcribe import transcribe_audio, TranscriptionError
 from grizzyclaw.safety.content_filter import ContentFilter
@@ -42,7 +43,34 @@ import time
 
 logger = logging.getLogger(__name__)
 
-MAX_AGENTIC_ITERATIONS = 5  # Max tool-use rounds to prevent infinite loops
+# Default max tool-use rounds; overridden by Settings.max_agentic_iterations or workspace
+DEFAULT_MAX_AGENTIC_ITERATIONS = 10
+
+
+def _truncate_tool_result(text: str, max_chars: int) -> str:
+    """Truncate tool result to max_chars with a suffix so the model knows it was cut."""
+    if not text or max_chars <= 0 or len(text) <= max_chars:
+        return text or ""
+    return text[: max_chars - 80].rstrip() + "\n\n... [truncated; total length " + str(len(text)) + " chars]\n"
+
+
+# Dangerous patterns that are always blocked for EXEC_COMMAND (even with approval)
+EXEC_BLOCKLIST = (
+    "rm -rf /", "rm -rf /*", "mkfs.", "dd if=", ":(){ :|:& };:", "format ", "> /dev/sd",
+    "chmod -R 777 /", "wget -O- | sh", "curl | bash", "nuke", "shred",
+)
+
+
+def _validate_exec_command(cmd: str, safe_list: List[str], blocklist: Optional[List[str]] = None) -> Tuple[bool, Optional[str]]:
+    """Return (True, None) if command is allowed; (False, reason) otherwise."""
+    cmd = (cmd or "").strip()
+    if not cmd:
+        return False, "Empty command"
+    combined = list(EXEC_BLOCKLIST) + (list(blocklist) if blocklist else [])
+    for blocked in combined:
+        if blocked.lower() in cmd.lower():
+            return False, f"Command not allowed (blocked pattern)."
+    return True, None
 
 
 # Browser automation - create fresh instance per request to avoid event loop issues
@@ -102,6 +130,14 @@ class AgentCore:
             or getattr(self.workspace_config, "proactive_file_triggers", False)
         ):
             asyncio.create_task(self._init_proactive_tasks())
+        # Shared handoff store for DELEGATE (multi-agent collaboration)
+        self._handoff_store: Dict[str, Any] = {}
+
+    def _get_max_agentic_iterations(self) -> int:
+        """Max tool-use rounds per turn (workspace override or settings)."""
+        if self.workspace_config and getattr(self.workspace_config, "max_agentic_iterations", None) is not None:
+            return max(1, int(self.workspace_config.max_agentic_iterations))
+        return max(1, getattr(self.settings, "max_agentic_iterations", DEFAULT_MAX_AGENTIC_ITERATIONS))
 
     async def process_message(
         self,
@@ -164,18 +200,49 @@ class AgentCore:
                 target_name = match.group(1)
                 forward_msg = match.group(2).strip()
                 if forward_msg:
+                    yield f"Delegating to @{target_name}…\n"
+                    delegation_ctx = {
+                        "from_workspace_id": self.workspace_id,
+                        "task_summary": forward_msg.strip().split("\n")[0][:120] if forward_msg else "",
+                    }
+                    if self.workspace_config:
+                        from_ws = self.workspace_manager.get_workspace(self.workspace_id) if self.workspace_manager else None
+                        if from_ws:
+                            delegation_ctx["from_workspace_name"] = from_ws.name
                     result = await self.workspace_manager.send_message_to_workspace(
-                        self.workspace_id, target_name, forward_msg
+                        self.workspace_id, target_name, forward_msg, context=delegation_ctx
                     )
-                    preview = (forward_msg[:50] + "…") if len(forward_msg) > 50 else forward_msg
-                    yield f"✅ Delegated to @{target_name}: {preview}\n"
-                    if result and not result.startswith("Target ") and not result.startswith("Error:"):
-                        yield f"@{target_name} replied: {result[:1500]}{'…' if len(result) > 1500 else ''}\n"
+                    if result.startswith("Target ") or result.startswith("Error:"):
+                        yield f"⚠️ {result}\n"
+                    elif result:
+                        yield f"✅ @{target_name} replied: {result[:1500]}{'…' if len(result) > 1500 else ''}\n"
                     forwarded_any = True
             if forwarded_any:
                 yield "Swarm delegations done.\n"
                 return
-        
+
+        # Auto-run Gmail list_messages when user clearly asks to check email (avoids model refusing)
+        _msg_lower = (message or "").strip().lower()
+        _wants_email = (
+            ("check" in _msg_lower and ("email" in _msg_lower or "gmail" in _msg_lower))
+            or ("show" in _msg_lower and ("email" in _msg_lower or "unread" in _msg_lower))
+            or ("list" in _msg_lower and "email" in _msg_lower)
+            or ("unread" in _msg_lower and "email" in _msg_lower)
+        )
+        _check_email = _wants_email and "gmail" in (getattr(self.settings, "enabled_skills", None) or [])
+        if _check_email and len(_msg_lower) < 120:
+            try:
+                result = await self._execute_skill_action({
+                    "skill": "gmail",
+                    "action": "list_messages",
+                    "params": {"q": "is:unread", "maxResults": 10},
+                })
+                yield f"**🛠️ Gmail**\n{result}\n"
+                return
+            except Exception as e:
+                logger.debug("Auto Gmail check failed: %s", e)
+                # Fall through to normal LLM flow; model may suggest setup
+
         # Transcribe audio if provided
         if audio_path or audio_base64:
             loop = asyncio.get_event_loop()
@@ -227,12 +294,20 @@ class AgentCore:
 
         session = self.sessions[user_id]
 
-        # Retrieve relevant memories
-        memories = await self.memory.retrieve(user_id, message, limit=5)
+        # Retrieve relevant memories (use settings limit for stronger recall)
+        mem_limit = getattr(self.settings, "memory_retrieval_limit", 10)
+        memories = await self.memory.retrieve(user_id, message, limit=mem_limit)
         memory_context = ""
         if memories:
             memory_context = "\n\nRelevant context from previous conversations:\n"
             for mem in memories:
+                memory_context += f"- {mem.content}\n"
+        # Known-about-user: preferences/facts for stronger personalization
+        known_limit = min(10, mem_limit)
+        known_memories = await self.memory.retrieve(user_id, "", limit=known_limit)
+        if known_memories:
+            memory_context += "\n\nKnown about the user (preferences/facts):\n"
+            for mem in known_memories:
                 memory_context += f"- {mem.content}\n"
 
         # Optional: Use OpenAI Agents SDK + LiteLLM when workspace has use_agents_sdk enabled
@@ -269,11 +344,29 @@ class AgentCore:
                 yield chunk
             session.append({"role": "user", "content": message})
             session.append({"role": "assistant", "content": full_response})
-            trim_session(session, self.settings.max_session_messages)
+            max_messages = getattr(self.settings, "max_session_messages", 20)
+            session = trim_session(session, max_messages)
+            self.sessions[user_id] = session
+            self._save_session(user_id)
             return
 
         # Build system prompt
-        system_content = self.settings.system_prompt + """
+        system_content = self.settings.system_prompt
+        # Swarm leader: inject discoverable @mention slugs so leader knows current specialists
+        if (
+            self.workspace_manager
+            and self.workspace_config
+            and getattr(self.workspace_config, "swarm_role", "") == "leader"
+            and getattr(self.workspace_config, "swarm_auto_delegate", False)
+        ):
+            channel = getattr(self.workspace_config, "inter_agent_channel", None)
+            slugs = self.workspace_manager.get_discoverable_specialist_slugs(
+                inter_agent_channel=channel,
+                exclude_workspace_id=self.workspace_id,
+            )
+            if slugs:
+                system_content += "\n\n## SWARM @MENTIONS\nAvailable specialist workspaces (use these exact slugs when delegating): " + ", ".join(f"@{s}" for s in slugs) + "."
+        system_content += """
 
 ## ABOUT GRIZZYCLAW
 
@@ -416,15 +509,17 @@ Output EXEC_COMMAND in your first response. Default cwd is home directory. Safe 
                         args = server_data.get("args", [])
                         arg_str = (" ".join(str(a) for a in args[:6]) + "..." if len(args) > 6 else " ".join(str(a) for a in args)) if args else ""
                         mcp_list.append(f"- {name}: {cmd} {arg_str}".strip())
-                # Dynamic tool discovery: connect to each server and list tools (timeout so chat is never blocked)
+                # Dynamic tool discovery: parallel per-server with per-server timeout; overall cap so chat isn't blocked
                 try:
                     discovered_tools_map = await asyncio.wait_for(
-                        discover_tools(mcp_file), timeout=5.0
+                        discover_tools(mcp_file, force_refresh=False), timeout=20.0
                     )
                 except asyncio.TimeoutError:
-                    logger.warning("MCP tool discovery timed out (5s); continuing without tool list")
+                    logger.warning("MCP tool discovery timed out; using fallback tool list")
+                    discovered_tools_map = {}
                 except Exception as e:
-                    logger.info("MCP tool discovery failed: %s", e)
+                    logger.info("MCP tool discovery failed: %s; using fallback tool list", e)
+                    discovered_tools_map = {}
             except Exception as e:
                 logger.warning(f"Failed to load MCP file {mcp_file}: {e}")
         mcp_str = "\n".join(mcp_list) if mcp_list else "none"
@@ -432,17 +527,20 @@ Output EXEC_COMMAND in your first response. Default cwd is home directory. Safe 
         write_file_server: Optional[str] = None
         if mcp_list or skills_str != "none":
             # Build tool examples from discovered tools (so LLM knows exact names)
-            tool_examples: List[str] = []
+            tool_examples_per_server = getattr(self.settings, "mcp_tool_examples_per_server", 8)
+            tool_examples_total = getattr(self.settings, "mcp_tool_examples_total", 30)
+            tool_examples_list: List[str] = []
             for server_name, tools in discovered_tools_map.items():
-                for tool_name, desc in tools[:5]:  # Limit per server to avoid huge prompts
+                for tool_name, desc in tools[:tool_examples_per_server]:
                     short_desc = (desc[:60] + "...") if len(desc) > 60 else desc
-                    tool_examples.append(f"- {server_name}: tool '{tool_name}' - {short_desc}")
-            if tool_examples:
-                examples_block = "\n".join(tool_examples[:20])  # Cap total examples
+                    tool_examples_list.append(f"- {server_name}: tool '{tool_name}' - {short_desc}")
+            if tool_examples_list:
+                examples_block = "\n".join(tool_examples_list[:tool_examples_total])
             else:
+                # Fallback when discovery fails or no servers so agent can still suggest tools
                 examples_block = (
                     "- ddg-search: tool 'search' - web search\n"
-                    "- fast-filesystem: tool 'fast_list_directory' - list directory\n"
+                    "- fast-filesystem: tool 'fast_write_file' - write file; fast_list_directory - list directory\n"
                     "- context7: tool 'query-docs' - query documentation"
                 )
             # Check if we have file-writing capability (write_file, fast_write_file, etc.)
@@ -467,6 +565,9 @@ Examples:
 - github: list_prs {{\"repo\": \"owner/repo\", \"state\": \"open\"}}, list_issues {{\"repo\": \"owner/repo\"}}, create_issue {{\"repo\": \"owner/repo\", \"title\": \"Bug\", \"body\": \"...\"}}, get_pr {{\"repo\": \"owner/repo\", \"number\": 1}}
 - mcp_marketplace: discover {{}} to list ClawHub MCP servers, install {{\"name\": \"playwright-mcp\"}} to add one
 
+When the user asks to check email, list emails, read Gmail, or show unread emails: output SKILL_ACTION with skill \"gmail\" and action \"list_messages\" (e.g. params {{\"q\": \"is:unread\", \"maxResults\": 10}}) immediately. Do NOT reply that Gmail is not configured—only suggest Settings if the skill returns an error.
+When the user asks about calendar or upcoming events: output SKILL_ACTION with skill \"calendar\" and action \"list_events\" immediately. Do NOT reply that Calendar is not configured—only suggest Settings if the skill returns an error.
+
 Configure API keys/tokens in Settings → Integrations first.
 
 MCP servers:
@@ -485,8 +586,17 @@ Discovered tools (use these exact names):
 
 When users ask to search the web/internet, use ddg-search with tool 'search' if available. Agent executes tools and returns real results.
 CRITICAL: Describing an action in text (e.g. 'Now writing files via fast-filesystem') does NOT execute it. You MUST output TOOL_CALL = {{ ... }} to run tools. Never say you will do something without outputting the actual TOOL_CALL.
+CRITICAL (Gmail/Calendar): When the user asks to check email, list emails, read Gmail, or show unread emails, you MUST output SKILL_ACTION = {{ \"skill\": \"gmail\", \"action\": \"list_messages\", \"params\": {{ \"q\": \"is:unread\", \"maxResults\": 10 }} }} in your response. Do NOT say you cannot access email or that they must connect Gmail first—the app handles auth; you must try the skill. Only suggest Settings if the skill result contains an error. Same for calendar: if they ask about events or calendar, output SKILL_ACTION with skill \"calendar\", action \"list_events\".
 When using TOOL_CALL, write a brief intro first (e.g. 'Let me search for that.') then output the TOOL_CALL on the same or next line.
-When you receive tool results in a follow-up message, use them to continue your response. Do NOT repeat the TOOL_CALL - the tools have already been executed."""
+When you receive tool results in a follow-up message, use them to continue your response. Do NOT repeat the TOOL_CALL - the tools have already been executed.
+To ask the user a clarifying question, output ASK_USER = {{ \"question\": \"...\" }}. You will get their reply in the next message.
+To delegate to a specialist role, output DELEGATE = {{ \"role\": \"researcher\" | \"writer\" | \"coder\", \"message\": \"...\" }}. You will get their response and can synthesize it."""
+            if not discovered_tools_map and mcp_list:
+                system_content += "\n\nNote: MCP tools were not discovered (servers may be offline). You can still use skills and memory."
+            if getattr(self.settings, "agent_plan_before_tools", False):
+                system_content += """
+
+For complex multi-step tasks, first output PLAN = [\"step1\", \"step2\", ...] then execute with TOOL_CALLs."""
             if has_write_file:
                 system_content += """
 
@@ -509,6 +619,12 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
 
         # Add user message (with optional vision content)
         user_message = message
+        # Prepend delegation context when this request came from another workspace
+        if context and context.get("from_workspace_name"):
+            delegation_line = "[Delegated from workspace " + context["from_workspace_name"] + "]"
+            if context.get("task_summary"):
+                delegation_line += " Task: " + (context["task_summary"].strip()[:120] or "")
+            user_message = delegation_line + "\n\n" + (user_message or "")
         if images and any(images):
             text_for_session, content_blocks = build_vision_content(message or "What's in this image?", images)
             messages.append({"role": "user", "content": content_blocks})
@@ -544,7 +660,8 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
         use_simple_model = self._is_simple_task(message, images)
 
         try:
-            for iteration in range(MAX_AGENTIC_ITERATIONS):
+            max_iterations = self._get_max_agentic_iterations()
+            for iteration in range(max_iterations):
                 content_filter = None
                 if getattr(self.settings, "safety_content_filter", True):
                     policy = getattr(self.settings, "safety_policy", None)
@@ -565,27 +682,44 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
                 if use_simple_model and getattr(self.settings, "simple_task_provider", None) and getattr(self.settings, "simple_task_model", None):
                     gen_provider = self.settings.simple_task_provider
                     gen_model = self.settings.simple_task_model
-                while empty_retry < 2:
-                    response_chunks = []
-                    async for chunk in self.llm_router.generate(
-                        current_messages,
-                        provider=gen_provider,
-                        model=gen_model,
-                        temperature=_temperature,
-                        max_tokens=_max_tokens,
-                        on_fallback=on_fallback,
-                    ):
-                        response_chunks.append(chunk)
-                        out = chunk
-                        if content_filter:
-                            out, _ = content_filter.filter(out)
-                        yield out
+                # Transient errors: retry with backoff (do not retry auth or rate-limit)
+                max_llm_retries = getattr(self.settings, "llm_retry_attempts", 2)
+                _transient = (asyncio.TimeoutError, ConnectionError, OSError, LLMError)
+                response_text = ""
+                last_llm_error: Optional[Exception] = None
+                for attempt in range(max_llm_retries + 1):
+                    try:
+                        while empty_retry < 2:
+                            response_chunks = []
+                            async for chunk in self.llm_router.generate(
+                                current_messages,
+                                provider=gen_provider,
+                                model=gen_model,
+                                temperature=_temperature,
+                                max_tokens=_max_tokens,
+                                on_fallback=on_fallback,
+                            ):
+                                response_chunks.append(chunk)
+                                out = chunk
+                                if content_filter:
+                                    out, _ = content_filter.filter(out)
+                                yield out
 
-                    response_text = "".join(response_chunks)
-                    if response_text.strip() or empty_retry > 0:
-                        break
-                    empty_retry += 1
-                    logger.warning("Empty LLM response, retrying (%s/1)", empty_retry)
+                            response_text = "".join(response_chunks)
+                            if response_text.strip() or empty_retry > 0:
+                                break
+                            empty_retry += 1
+                            logger.warning("Empty LLM response, retrying (%s/1)", empty_retry)
+                        break  # success
+                    except _transient as e:
+                        last_llm_error = e
+                        if attempt >= max_llm_retries:
+                            logger.warning("LLM failed after %s attempts: %s", attempt + 1, e)
+                            yield "\n\n⚠️ The model is temporarily unavailable (timeout or connection). Please try again in a moment.\n"
+                            return
+                        backoff = (attempt + 1) * 1.0
+                        logger.warning("LLM transient error (attempt %s/%s), retrying in %ss: %s", attempt + 1, max_llm_retries + 1, backoff, e)
+                        await asyncio.sleep(backoff)
 
                 if not response_text.strip() and iteration == 0:
                     yield (
@@ -595,6 +729,62 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
                     return
 
                 accumulated_response += response_text
+
+                # ASK_USER: human-in-the-loop — agent asks a question and ends turn so user can reply
+                ask_matches = find_json_blocks(response_text, "ASK_USER")
+                if not ask_matches:
+                    ask_matches = find_json_blocks_fallback(response_text, "ASK_USER")
+                if ask_matches:
+                    try:
+                        raw = ask_matches[0]
+                        normalized = normalize_llm_json(raw)
+                        ask_data = json.loads(normalized) if normalized else {}
+                        if isinstance(ask_data, dict):
+                            q = ask_data.get("question", "").strip() or ask_data.get("q", "").strip()
+                            if q:
+                                yield f"\n\n**I need a bit more information:**\n{q}\n"
+                                return
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+
+                # DELEGATE: collaborative sub-call to a role (researcher, writer, coder)
+                delegate_matches = find_json_blocks(response_text, "DELEGATE")
+                if not delegate_matches:
+                    delegate_matches = find_json_blocks_fallback(response_text, "DELEGATE")
+                if delegate_matches:
+                    try:
+                        raw = delegate_matches[0]
+                        normalized = normalize_llm_json(raw)
+                        del_data = json.loads(normalized) if normalized else {}
+                        if isinstance(del_data, dict):
+                            role = (del_data.get("role") or "").strip().lower()
+                            sub_msg = (del_data.get("message") or del_data.get("msg") or "").strip()
+                            if role and sub_msg:
+                                role_prompts = {
+                                    "researcher": "You are a researcher. Answer the following question concisely and factually. Do not use tools.",
+                                    "writer": "You are a writer. Respond to the following request with clear, well-structured text. Do not use tools.",
+                                    "coder": "You are a coder. Respond with code or technical steps only. Do not use tools.",
+                                }
+                                sys_delegate = role_prompts.get(role, f"You are a {role}. Answer the following concisely. Do not use tools.")
+                                delegate_messages = [
+                                    {"role": "system", "content": sys_delegate},
+                                    {"role": "user", "content": sub_msg},
+                                ]
+                                delegate_chunks: List[str] = []
+                                async for ch in self.llm_router.generate(delegate_messages, temperature=0.5, max_tokens=1500):
+                                    delegate_chunks.append(ch)
+                                delegate_response = "".join(delegate_chunks).strip()
+                                if delegate_response:
+                                    self._handoff_store[f"{user_id}:{role}"] = delegate_response
+                                    yield f"\n\n**@{role}**\n{delegate_response[:500]}{'…' if len(delegate_response) > 500 else ''}\n"
+                                    current_messages.append({"role": "assistant", "content": response_text})
+                                    current_messages.append({
+                                        "role": "user",
+                                        "content": f"[Delegate result from {role}]\n{delegate_response}\n\nUse this to continue your response to the user.",
+                                    })
+                                    continue
+                    except (json.JSONDecodeError, ValueError, Exception):
+                        pass
 
                 # Parse MCP TOOL_CALLs
                 tool_call_matches = find_json_blocks(response_text, "TOOL_CALL")
@@ -753,7 +943,24 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
                             q = correct_search_query(str(args["query"]))
                             args["query"] = simplify_search_query(q)
 
-                        tool_result = await call_mcp_tool(mcp_file, mcp_name, tool_name, args)
+                        # Writes: no extra path blocking here. With full disk access, trust the MCP server's
+                        # own allowlist (e.g. fast-filesystem's configured dirs) and the app's existing
+                        # "ask permission for risky actions" safety model.
+                        t0 = time.perf_counter()
+                        try:
+                            tool_result = await call_mcp_tool(mcp_file, mcp_name, tool_name, args)
+                        except Exception as call_err:
+                            duration_ms = (time.perf_counter() - t0) * 1000
+                            logger.warning(
+                                "tool_call mcp=%s tool=%s duration_ms=%.0f success=false error=%s",
+                                mcp_name, tool_name, duration_ms, call_err,
+                            )
+                            raise
+                        duration_ms = (time.perf_counter() - t0) * 1000
+                        logger.info(
+                            "tool_call mcp=%s tool=%s duration_ms=%.0f success=true",
+                            mcp_name, tool_name, duration_ms,
+                        )
                         # Retry with shorter query if DuckDuckGo returned no results
                         if (mcp_name == "ddg-search" and tool_name == "search" and "query" in args and
                             args["query"] and len(args["query"]) > 25):
@@ -767,7 +974,9 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
                             result_display, _ = content_filter.filter(result_display)
                         yield result_display
                         accumulated_tool_displays.append(result_display)
-                        tool_result_parts.append(f"[Tool result {mcp_name}.{tool_name}]\n{tool_result}")
+                        max_result_chars = getattr(self.settings, "agent_tool_result_max_chars", 4000)
+                        result_for_context = _truncate_tool_result(tool_result or "", max_result_chars)
+                        tool_result_parts.append(f"[Tool result {mcp_name}.{tool_name}]\n{result_for_context}")
                     except Exception as e:
                         logger.warning(f"TOOL_CALL error: {e}")
                         err_msg = f"**❌ Tool error: {str(e)}**\n\n"
@@ -775,8 +984,15 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
                         accumulated_tool_displays.append(err_msg)
                         tool_result_parts.append(f"[Tool error]\n{str(e)}")
 
-                # Feed tool results back for next LLM turn
-                tool_results_msg = "\n\n".join(tool_result_parts) + "\n\nUse the above results to continue. Do NOT repeat the TOOL_CALL."
+                # Feed tool results back for next LLM turn (with reflection and optional retry hint)
+                tool_results_msg = "\n\n".join(tool_result_parts)
+                if getattr(self.settings, "agent_reflection_enabled", True):
+                    tool_results_msg += "\n\nIf the results above are not enough to fully answer, output another TOOL_CALL. Otherwise answer the user concisely. Do NOT repeat the same TOOL_CALL."
+                else:
+                    tool_results_msg += "\n\nUse the above results to continue. Do NOT repeat the TOOL_CALL."
+                has_tool_errors = any("[Tool error]" in p for p in tool_result_parts)
+                if has_tool_errors and getattr(self.settings, "agent_retry_on_tool_failure", True):
+                    tool_results_msg += "\n\nOne or more tools failed. If you can proceed with partial results, answer the user; otherwise try a different TOOL_CALL or rephrase."
                 current_messages.append({"role": "assistant", "content": response_text})
                 current_messages.append({"role": "user", "content": tool_results_msg})
 
@@ -801,17 +1017,29 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
                     forward_msg = match.group(2).strip()
                     if not forward_msg:
                         continue
+                    delegation_ctx = {
+                        "from_workspace_id": self.workspace_id,
+                        "task_summary": forward_msg.strip().split("\n")[0][:120] if forward_msg else "",
+                    }
+                    from_ws = self.workspace_manager.get_workspace(self.workspace_id) if self.workspace_manager else None
+                    if from_ws:
+                        delegation_ctx["from_workspace_name"] = from_ws.name
                     result = await self.workspace_manager.send_message_to_workspace(
-                        self.workspace_id, target_name, forward_msg
+                        self.workspace_id, target_name, forward_msg, context=delegation_ctx
                     )
                     if result and not result.startswith("Target ") and not result.startswith("Error:"):
                         specialist_replies.append((target_name, result))
                 if specialist_replies:
+                    sources = ", ".join(f"@{name}" for name, _ in specialist_replies)
                     yield "\n\n--- **Swarm delegations** ---\n"
                     for name, reply in specialist_replies:
                         yield f"\n**@{name}:** {reply[:400]}{'…' if len(reply) > 400 else ''}\n"
+                    yield f"\n**Sources:** {sources}\n"
+                    # Store last delegation set for session continuity (leader can refer next turn)
+                    handoff_key = f"{user_id}:swarm_last"
+                    self._handoff_store[handoff_key] = {"sources": sources, "replies": specialist_replies}
                     if getattr(self.workspace_config, "swarm_consensus", False) and specialist_replies:
-                        synthesis_system = "You are the swarm leader. Synthesize the specialist responses below into one clear recommendation for the user. Be concise; combine the best points; do not simply repeat each response."
+                        synthesis_system = "You are the swarm leader. Synthesize the specialist responses below into one clear recommendation for the user. Start with a one-line summary, then the details. End by citing sources (e.g. Sources: @a, @b). Be concise; combine the best points; do not simply repeat each response."
                         synthesis_user = f"User asked: {message}\n\nSpecialist responses:\n" + "\n\n".join(
                             f"[{name}]: {reply}" for name, reply in specialist_replies
                         )
@@ -954,6 +1182,11 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
                         command = (exec_cmd.get("command") or exec_cmd.get("cmd") or "").strip()
                         if not command:
                             yield "**❌ EXEC_COMMAND requires a 'command' field.**\n\n"
+                            continue
+                        safe_list = getattr(self.settings, "exec_safe_commands", []) or []
+                        ok, reason = _validate_exec_command(command, safe_list)
+                        if not ok:
+                            yield f"**❌ Exec blocked: {reason}**\n\n"
                             continue
                         cwd = (exec_cmd.get("cwd") or "").strip() or None
                         result = await self._execute_exec_command(

@@ -14,6 +14,7 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
+from telegram.request import HTTPXRequest
 
 from grizzyclaw.config import Settings
 from grizzyclaw.agent.core import AgentCore
@@ -52,9 +53,12 @@ class TelegramChannel(Channel):
         self.status = ChannelStatus.CONNECTING
 
         try:
+            # Use longer timeouts so slow/flaky networks don't fail with "Timed out" on startup
+            request = HTTPXRequest(connect_timeout=15.0, read_timeout=30.0)
             self.application = (
                 Application.builder()
                 .token(self.config["bot_token"])
+                .request(request)
                 .build()
             )
             self.agent = AgentCore(self.settings)

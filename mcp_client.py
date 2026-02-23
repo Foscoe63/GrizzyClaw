@@ -4,6 +4,7 @@ Supports local (stdio) and remote (HTTP) servers.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -32,6 +33,12 @@ except ImportError:
 # Cache for discovered tools: (mcp_file_path, mtime) -> {server_name: [(tool_name, description), ...]}
 _tools_cache: Dict[Tuple[str, float], Dict[str, List[Tuple[str, str]]]] = {}
 
+# Default timeout for a single tool call (seconds)
+DEFAULT_TOOL_CALL_TIMEOUT = 60
+
+# Per-server discovery timeout (seconds)
+DISCOVERY_SERVER_TIMEOUT = 10
+
 
 def _get_expanded_env() -> Dict[str, str]:
     """Expand PATH for macOS GUI apps that don't inherit shell env."""
@@ -51,6 +58,16 @@ def _get_expanded_env() -> Dict[str, str]:
         if os.path.isdir(p) and p not in current:
             current = f"{p}:{current}"
     env["PATH"] = current
+    return env
+
+
+def _env_for_server(config: Dict[str, Any]) -> Dict[str, str]:
+    """Base env plus per-server env from config (so API keys, PORT, etc. are used in tool calls)."""
+    env = _get_expanded_env()
+    server_env = config.get("env") or {}
+    if isinstance(server_env, dict):
+        for k, v in server_env.items():
+            env[str(k)] = str(v)
     return env
 
 
@@ -94,7 +111,7 @@ async def _list_tools_stdio(config: Dict[str, Any]) -> List[Tuple[str, str]]:
     server_params = StdioServerParameters(
         command=cmd,
         args=[str(a) for a in args_list],
-        env=_get_expanded_env(),
+        env=_env_for_server(config),
     )
     try:
         async with stdio_client(server_params) as (read, write):
@@ -213,11 +230,37 @@ async def _call_tool_http(
         return f"**❌ Tool error:** {err_msg}"
 
 
-async def discover_tools(mcp_file: Path) -> Dict[str, List[Tuple[str, str]]]:
+def invalidate_tools_cache(mcp_file: Optional[Path] = None) -> None:
+    """Invalidate discovery cache so the next discover_tools refetches. If mcp_file is None, clear all."""
+    global _tools_cache
+    if mcp_file is None:
+        _tools_cache.clear()
+        return
+    path_str = str(mcp_file.resolve())
+    to_drop = [k for k in _tools_cache if k[0] == path_str]
+    for k in to_drop:
+        del _tools_cache[k]
+
+
+async def _discover_one(
+    name: str, config: Dict[str, Any]
+) -> Tuple[str, List[Tuple[str, str]]]:
+    """Discover tools for one server; returns (server_name, tools). Used for parallel discovery."""
+    if "url" in config:
+        tools = await _list_tools_http(config)
+    else:
+        tools = await _list_tools_stdio(config)
+    return (name, tools)
+
+
+async def discover_tools(
+    mcp_file: Path, force_refresh: bool = False
+) -> Dict[str, List[Tuple[str, str]]]:
     """
     Discover tools from all configured MCP servers.
     Returns {server_name: [(tool_name, description), ...]}.
-    Cached by mcp_file path and mtime.
+    Cached by mcp_file path and mtime unless force_refresh is True.
+    Runs servers in parallel with per-server timeout.
     """
     if not MCP_AVAILABLE:
         return {}
@@ -227,19 +270,109 @@ async def discover_tools(mcp_file: Path) -> Dict[str, List[Tuple[str, str]]]:
     except OSError:
         mtime = 0
     cache_key = (path_str, mtime)
-    if cache_key in _tools_cache:
+    if not force_refresh and cache_key in _tools_cache:
         return _tools_cache[cache_key]
     servers = _load_all_servers(mcp_file)
+    if not servers:
+        _tools_cache[cache_key] = {}
+        return {}
+
+    async def one_with_timeout(name: str, config: Dict[str, Any]) -> Tuple[str, List[Tuple[str, str]]]:
+        try:
+            return await asyncio.wait_for(
+                _discover_one(name, config), timeout=DISCOVERY_SERVER_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            logger.warning("MCP discovery timed out for server: %s", name)
+            return (name, [])
+        except Exception as e:
+            logger.debug("MCP discovery failed for %s: %s", name, e)
+            return (name, [])
+
+    tasks = [one_with_timeout(name, config) for name, config in servers.items()]
+    results = await asyncio.gather(*tasks, return_exceptions=False)
     result: Dict[str, List[Tuple[str, str]]] = {}
-    for name, config in servers.items():
-        if "url" in config:
-            tools = await _list_tools_http(config)
-        else:
-            tools = await _list_tools_stdio(config)
+    for name, tools in results:
         if tools:
             result[name] = tools
     _tools_cache[cache_key] = result
     return result
+
+
+async def discover_one_server(
+    mcp_file: Path, server_name: str
+) -> Tuple[List[Tuple[str, str]], Optional[str]]:
+    """
+    Discover tools for a single MCP server. For use by Settings "Test this server".
+    Returns (list of (tool_name, description), error_message).
+    If error_message is set, tools may be empty.
+    """
+    if not MCP_AVAILABLE:
+        return [], "MCP client not available"
+    config = _load_server_config(mcp_file, server_name)
+    if not config:
+        return [], f"Server '{server_name}' not found in config"
+    try:
+        if "url" in config:
+            tools = await asyncio.wait_for(
+                _list_tools_http(config), timeout=DISCOVERY_SERVER_TIMEOUT
+            )
+        else:
+            tools = await asyncio.wait_for(
+                _list_tools_stdio(config), timeout=DISCOVERY_SERVER_TIMEOUT
+            )
+        return tools, None
+    except asyncio.TimeoutError:
+        return [], f"Discovery timed out (>{DISCOVERY_SERVER_TIMEOUT}s)"
+    except FileNotFoundError as e:
+        return [], f"Command not found: {e}"
+    except Exception as e:
+        err = str(e)
+        if hasattr(e, "exceptions") and e.exceptions:
+            err = f"{type(e.exceptions[0]).__name__}: {e.exceptions[0]}"
+        return [], err
+
+
+async def validate_server_config(config: Dict[str, Any]) -> Tuple[bool, str]:
+    """
+    Validate MCP server config (e.g. before save in Add/Edit dialog).
+    Local: try listing tools via stdio; remote: try HTTP connection.
+    Returns (True, "OK (N tools)") or (False, error_message).
+    """
+    if not MCP_AVAILABLE:
+        return False, "MCP client not available"
+    if config.get("url"):
+        if not STREAMABLE_HTTP_AVAILABLE:
+            return False, "Remote MCP requires streamable HTTP support"
+        url = _get_mcp_url(config)
+        if not url:
+            return False, "Invalid URL"
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                r = await client.get(url)
+                if r.status_code in (200, 404, 405):
+                    return True, "Remote server reachable"
+                return False, f"HTTP {r.status_code}"
+        except Exception as e:
+            return False, str(e)
+    cmd = config.get("command", "")
+    if not cmd:
+        return False, "No command set"
+    try:
+        tools = await asyncio.wait_for(
+            _list_tools_stdio(config), timeout=DISCOVERY_SERVER_TIMEOUT
+        )
+        return True, f"OK — {len(tools)} tools" if tools else (False, "No tools returned")
+    except asyncio.TimeoutError:
+        return False, f"Timed out (>{DISCOVERY_SERVER_TIMEOUT}s)"
+    except FileNotFoundError:
+        return False, f"Command not found: {cmd}"
+    except Exception as e:
+        err = str(e)
+        if hasattr(e, "exceptions") and e.exceptions:
+            err = f"{type(e.exceptions[0]).__name__}: {e.exceptions[0]}"
+        return False, err
 
 
 async def call_mcp_tool(
@@ -257,7 +390,10 @@ async def call_mcp_tool(
 
     config = _load_server_config(mcp_file, mcp_name)
     if not config:
-        return f"**❌ MCP server '{mcp_name}' not found in config.**"
+        return (
+            f"**❌ MCP server '{mcp_name}' not found.** "
+            "Add it in Settings → Skills & MCP, or check the server name."
+        )
 
     if "url" in config:
         return await _call_tool_http(config, tool_name, arguments)
@@ -275,10 +411,10 @@ async def call_mcp_tool(
     server_params = StdioServerParameters(
         command=cmd,
         args=[str(a) for a in args_list],
-        env=_get_expanded_env(),
+        env=_env_for_server(config),
     )
 
-    try:
+    async def _run_stdio_call() -> str:
         async with stdio_client(server_params) as (read, write):
             async with ClientSession(read, write) as session:
                 await session.initialize()
@@ -296,11 +432,19 @@ async def call_mcp_tool(
                     if hasattr(content, "text"):
                         parts.append(content.text)
                 return "\n".join(parts) if parts else "(No output)"
-    except FileNotFoundError as e:
-        return f"**❌ Command not found:** {cmd}. Ensure it's installed and in PATH."
+
+    try:
+        return await asyncio.wait_for(_run_stdio_call(), timeout=DEFAULT_TOOL_CALL_TIMEOUT)
+    except asyncio.TimeoutError:
+        return f"**❌ MCP tool call timed out** (>{DEFAULT_TOOL_CALL_TIMEOUT}s). Server '{mcp_name}' may be stuck."
+    except FileNotFoundError:
+        base = cmd.split("/")[-1].split()[0] if cmd else "command"
+        return (
+            f"**❌ Command not found:** {cmd}. "
+            f"Install the required runtime (e.g. Node.js for npx) or set Environment for this server in Settings → Skills & MCP."
+        )
     except Exception as e:
         logger.exception(f"MCP tool call failed: {mcp_name}.{tool_name}")
-        # Unwrap ExceptionGroup (Python 3.11+) to show the actual cause
         err_msg = str(e)
         if hasattr(e, "exceptions") and e.exceptions:
             sub = e.exceptions[0]

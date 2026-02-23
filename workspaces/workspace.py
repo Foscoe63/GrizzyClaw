@@ -33,6 +33,7 @@ class WorkspaceConfig:
     rules_file: Optional[str] = None
     use_agents_sdk: bool = False  # Use OpenAI Agents SDK + LiteLLM for improved coding (multi-provider)
     agents_sdk_max_turns: int = 25  # Max agent turns when use_agents_sdk (tool-call iterations)
+    max_agentic_iterations: Optional[int] = None  # Override Settings max_agentic_iterations per workspace
     enabled_skills: List[str] = field(default_factory=list)
     
     # Memory
