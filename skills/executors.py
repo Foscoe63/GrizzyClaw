@@ -166,7 +166,7 @@ def execute_gmail(action: str, params: Dict[str, Any], settings: Any) -> str:
                 reply_msg["References"] = headers.get("References", headers.get("Message-ID", ""))
                 raw = base64.urlsafe_b64encode(reply_msg.as_bytes()).decode()
                 sent = service.users().messages().send(userId="me", body={"raw": raw, "threadId": thread_id}).execute()
-                return f"✅ Reply sent in thread **{thread_id}**."
+                return "✅ Reply sent."
             if message_id:
                 msg = service.users().messages().get(userId="me", id=message_id, format="metadata").execute()
                 tid = msg.get("threadId")
@@ -177,7 +177,7 @@ def execute_gmail(action: str, params: Dict[str, Any], settings: Any) -> str:
                 reply_msg["In-Reply-To"] = headers.get("Message-ID", "")
                 raw = base64.urlsafe_b64encode(reply_msg.as_bytes()).decode()
                 service.users().messages().send(userId="me", body={"raw": raw, "threadId": tid}).execute()
-                return f"✅ Reply sent to message **{message_id}**."
+                return "✅ Reply sent."
             return "❌ reply requires thread_id or message_id."
         if action == "list_messages":
             max_results = int(params.get("maxResults", params.get("max_results", 10)))
@@ -191,7 +191,7 @@ def execute_gmail(action: str, params: Dict[str, Any], settings: Any) -> str:
                 meta = service.users().messages().get(userId="me", id=m["id"], format="metadata").execute()
                 headers = {h["name"]: h["value"] for h in meta["payload"].get("headers", [])}
                 subj = headers.get("Subject", "(no subject)")
-                lines.append(f"- **{subj}** (id: {m['id']}, thread: {meta.get('threadId', '')})")
+                lines.append(f"- **{subj}**")
             return "\n".join(lines)
         return f"❌ Unknown gmail action: {action}. Use send_email, reply, or list_messages."
     except Exception as e:
