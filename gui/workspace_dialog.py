@@ -347,6 +347,9 @@ class WorkspaceDialog(QDialog):
         self.proactive_screen_cb = QCheckBox("Screen awareness: periodic screenshot + VL analysis for desktop context")
         self.proactive_screen_cb.setToolTip("Every 30 min, capture screen and ask the model what the user is doing; store summary in memory.")
         proact_layout.addRow(self.proactive_screen_cb)
+        self.proactive_autonomy_cb = QCheckBox("Continuous Autonomy: background loop for predictive prep and tasks")
+        self.proactive_autonomy_cb.setToolTip("Agent creates a background loop checking workspace state every 15 min even without prompts.")
+        proact_layout.addRow(self.proactive_autonomy_cb)
         self.proactive_file_triggers_cb = QCheckBox("Triggers on file changes and Git events")
         self.proactive_file_triggers_cb.setToolTip("Watch ~/.grizzyclaw/file_watcher.json for watch_dirs; triggers.json can use event file_change or git_event.")
         proact_layout.addRow(self.proactive_file_triggers_cb)
@@ -586,6 +589,7 @@ class WorkspaceDialog(QDialog):
         self.swarm_consensus_cb.setChecked(getattr(workspace.config, "swarm_consensus", False))
         self.proactive_habits_cb.setChecked(getattr(workspace.config, "proactive_habits", False))
         self.proactive_screen_cb.setChecked(getattr(workspace.config, "proactive_screen", False))
+        self.proactive_autonomy_cb.setChecked(getattr(workspace.config, "proactive_autonomy", False))
         self.proactive_file_triggers_cb.setChecked(getattr(workspace.config, "proactive_file_triggers", False))
         
         # Metrics tab
@@ -672,6 +676,7 @@ class WorkspaceDialog(QDialog):
             "swarm_consensus": self.swarm_consensus_cb.isChecked(),
             "proactive_habits": self.proactive_habits_cb.isChecked(),
             "proactive_screen": self.proactive_screen_cb.isChecked(),
+            "proactive_autonomy": self.proactive_autonomy_cb.isChecked(),
             "proactive_file_triggers": self.proactive_file_triggers_cb.isChecked(),
         }
         

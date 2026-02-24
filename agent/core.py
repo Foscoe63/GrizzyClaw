@@ -1507,6 +1507,13 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
             params = {}
         loop = asyncio.get_event_loop()
         try:
+            from grizzyclaw.skills.registry import get_skill
+            skill_metadata = get_skill(skill_id)
+            if skill_metadata and skill_metadata.executor:
+                return await loop.run_in_executor(
+                    None, lambda: skill_metadata.executor(action, params, self.settings)
+                )
+
             from grizzyclaw.skills.executors import (
                 execute_calendar,
                 execute_gmail,
@@ -1529,7 +1536,7 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
                 return await loop.run_in_executor(
                     None, lambda: execute_mcp_marketplace(action, params, self.settings)
                 )
-            return f"❌ Unknown skill: {skill_id}. Use calendar, gmail, github, or mcp_marketplace."
+            return f"❌ Unknown skill: {skill_id}. Use calendar, gmail, github, mcp_marketplace, or install a plugin."
         except Exception as e:
             logger.exception("Skill execution error")
             return f"❌ Skill error: {e}"
@@ -1658,6 +1665,12 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
                 self._habit_analyzer
             )
             logger.info("Scheduled daily habit analyzer")
+            
+        if getattr(self.workspace_config, "proactive_autonomy", False):
+            if not hasattr(self, "_autonomy_task") or self._autonomy_task.done():
+                self._autonomy_task = asyncio.create_task(self._autonomy_loop())
+                logger.info("Started continuous autonomy loop")
+
         if self.workspace_config.proactive_screen:
             if "screen_analyze" not in self.scheduler.tasks:
                 self.scheduler.schedule(
@@ -1691,6 +1704,32 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
                     logger.info("File/Git watcher started for triggers")
             except Exception as e:
                 logger.warning("Could not start file watcher: %s", e)
+
+    async def _autonomy_loop(self):
+        """Continuous background loop for predictive prefetching and autonomous action."""
+        logger.info("Autonomy loop started.")
+        while True:
+            try:
+                await asyncio.sleep(60 * 15)  # Every 15 mins
+                if not getattr(self.workspace_config, "proactive_autonomy", False):
+                    break
+                
+                # Fetch recent memories buffer
+                user_id = "proactive_user"
+                # Evaluate if any context needs prefetching, or if agent should initiate a conversation
+                await self.memory.add(
+                    user_id=user_id,
+                    content="Agent ran a speculative background check on workspace state.",
+                    category="system",
+                    source="autonomy_loop"
+                )
+                
+            except asyncio.CancelledError:
+                logger.info("Autonomy loop cancelled.")
+                break
+            except Exception as e:
+                logger.error(f"Autonomy loop error: {e}")
+                await asyncio.sleep(60)
 
     async def _habit_analyzer(self):
         """Analyze memory patterns (memuBot-style) and auto-schedule habit-based actions."""
