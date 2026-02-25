@@ -81,6 +81,57 @@ def find_json_blocks(text: str, prefix: str) -> list[str]:
     return blocks
 
 
+def _find_block_ranges(text: str, prefix: str) -> list[tuple[int, int]]:
+    """Find (start, end) ranges for PREFIX = { ... } (including prefix and optional ```)."""
+    pattern = re.compile(
+        re.escape(prefix) + r"\s*=\s*(?:```(?:json)?\s*)?\{",
+        re.IGNORECASE,
+    )
+    ranges: list[tuple[int, int]] = []
+    for m in pattern.finditer(text):
+        block_start = m.start()
+        brace_start = m.end() - 1
+        pair = extract_balanced_brace(text, brace_start)
+        if pair is None:
+            pair = extract_balanced_brace_dumb(text, brace_start)
+        if pair:
+            ranges.append((block_start, pair[1]))
+    return ranges
+
+
+def strip_response_blocks(text: str) -> str:
+    """Remove SKILL_ACTION, TOOL_CALL, EXEC_COMMAND, SCHEDULE_TASK blocks so the user sees only pertinent text and tool results."""
+    prefixes = ("SKILL_ACTION", "TOOL_CALL", "EXEC_COMMAND", "SCHEDULE_TASK")
+    all_ranges: list[tuple[int, int]] = []
+    for prefix in prefixes:
+        all_ranges.extend(_find_block_ranges(text, prefix))
+    all_ranges.sort(key=lambda r: r[0])
+    # Merge overlapping and drop contained ranges
+    merged: list[tuple[int, int]] = []
+    for start, end in all_ranges:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    # Build result by skipping merged ranges; replace each with a single newline if needed to avoid gluing lines
+    if not merged:
+        return text
+    out: list[str] = []
+    pos = 0
+    for start, end in merged:
+        chunk = text[pos:start]
+        if chunk.rstrip():
+            out.append(chunk.rstrip())
+            if not chunk.endswith("\n"):
+                out.append("\n")
+        pos = end
+    if pos < len(text):
+        rest = text[pos:]
+        if rest.strip():
+            out.append(rest.strip())
+    return "\n".join(out) if out else text[: merged[0][0]].strip()
+
+
 def find_json_blocks_fallback(text: str, prefix: str) -> list[str]:
     """Fallback: find PREFIX = then { within 400 chars and extract balanced block."""
     blocks: list[str] = []

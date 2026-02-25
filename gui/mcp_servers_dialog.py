@@ -21,6 +21,7 @@ from grizzyclaw.mcp_client import (
     validate_server_config,
     discover_one_server,
     discover_mcp_servers_zeroconf,
+    normalize_mcp_args,
 )
 
 
@@ -59,6 +60,8 @@ class MCPTab(QWidget):
     def showEvent(self, event: QShowEvent):
         super().showEvent(event)
         self.refresh_mcp_statuses()
+        # Auto-start servers that were running when the app was last closed (once per launch)
+        QTimer.singleShot(400, self._auto_start_saved_servers)
 
     def _setup_theme_colors(self):
         if self.is_dark:
@@ -869,20 +872,18 @@ Names: {names_str}"""
         false matches.
         """
         cmd = server_data.get('command', '')
-        args = server_data.get('args', [])
-        if isinstance(args, str):
-            args = args.split() if args else []
-        elif not isinstance(args, (list, tuple)):
-            args = []
+        args = normalize_mcp_args(server_data.get('args', []))
         cmd_match = f"{cmd} {' '.join(map(str, args[:3]))}".strip()
         patterns = [cmd_match]
-        if cmd == 'npx' and len(args) >= 2 and args[0] == '-y':
-            pkg = str(args[1])
-            patterns.append(f"npm exec {pkg}")
-            if pkg.startswith('@'):
-                patterns.append(pkg.split('/')[-1])
-            else:
-                patterns.append(pkg)
+        if cmd == 'npx' and args:
+            # Package name: first arg if it's not -y, else second (e.g. npx mcp-macos or npx -y mcp-macos)
+            pkg = str(args[1]) if (len(args) >= 2 and args[0] == '-y') else str(args[0])
+            if len(pkg) >= 10:
+                patterns.append(pkg)  # match node .../mcp-macos/... after npx exits
+            if len(args) >= 2 and args[0] == '-y':
+                patterns.append(f"npm exec {pkg}")
+                if pkg.startswith('@'):
+                    patterns.append(pkg.split('/')[-1])
         elif cmd == 'uvx' and args:
             patterns.append(str(args[0]))
         elif cmd == 'node' and args:
@@ -1048,7 +1049,7 @@ Names: {names_str}"""
                 QMessageBox.warning(self, "Start Error", f"No command defined for {name}")
                 self.refresh_mcp_statuses()
                 return
-            cmd_list = [cmd] + [str(a) for a in server_data.get('args', [])]
+            cmd_list = [cmd] + normalize_mcp_args(server_data.get("args", []))
             try:
                 import time
                 DEVNULL = subprocess.DEVNULL
@@ -1094,14 +1095,37 @@ Names: {names_str}"""
         # Save state after stopping
         self._save_started_servers()
 
+    def _get_server_data_by_name(self, name: str) -> Optional[Dict]:
+        """Return server config dict for the given name from the tree, or None."""
+        for row in range(self.mcp_servers_tree.topLevelItemCount()):
+            item = self.mcp_servers_tree.topLevelItem(row)
+            data_str = item.data(0, 32)
+            if not data_str:
+                continue
+            try:
+                server_data = json.loads(data_str)
+                if server_data.get("name") == name:
+                    return server_data
+            except json.JSONDecodeError:
+                continue
+        return None
+
     def _check_started_server_still_running(self, name: str):
-        """If we started this server and it has already exited, show stderr so user can fix (e.g. playwright install)."""
+        """If we started this server and it has already exited, show stderr so user can fix (e.g. playwright install).
+        For servers like macos-mcp (npx mcp-macos), npx may exit while the real node process keeps running; if the
+        server still appears in ps, treat it as running and do not show the 'exited' warning.
+        """
         proc = self.running_processes.get(name)
         if proc is None:
             return
         if proc.poll() is None:
             return  # Still running
         self.running_processes.pop(name, None)
+        # Check if the server is still running as a child (e.g. npx exited but node is running)
+        server_data = self._get_server_data_by_name(name)
+        if server_data and self._check_server_running_by_ps(server_data):
+            self._save_started_servers()
+            return  # Child process still running; keep button green, no warning
         self._update_button_for_server(name, False)
         self._save_started_servers()
         err_text = ""
@@ -1174,7 +1198,57 @@ Names: {names_str}"""
         """Load list of servers that were started in previous session.
         Do NOT add to recently_started - that causes false green. Verify via process check only.
         """
-        pass  # File is used by _save_started_servers; we verify running state via process detection
+        pass  # File is used by _save_started_servers; auto-start happens in _auto_start_saved_servers when tab is shown
+
+    def _start_server_silently(self, server_data: dict) -> bool:
+        """Start an MCP server without showing the 'Started' dialog. Returns True if started."""
+        name = server_data.get("name", "")
+        if not name or not server_data.get("command"):
+            return False
+        cmd_list = [server_data["command"]] + normalize_mcp_args(server_data.get("args", []))
+        try:
+            import time
+            expanded_env = self._get_expanded_env()
+            for k, v in (server_data.get("env") or {}).items():
+                expanded_env[str(k)] = str(v)
+            p = subprocess.Popen(
+                cmd_list,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+                env=expanded_env,
+            )
+            self.running_processes[name] = p
+            self.recently_started[name] = time.time()
+            self._update_button_for_server(name, True)
+            self._save_started_servers()
+            QTimer.singleShot(2000, lambda: self._check_started_server_still_running(name))
+            return True
+        except Exception:
+            return False
+
+    def _auto_start_saved_servers(self):
+        """If we have a saved list of servers that were running, start them once per app launch."""
+        if getattr(self, "_auto_start_done", False):
+            return
+        self._auto_start_done = True
+        if not self.started_servers_file.exists():
+            return
+        try:
+            data = json.loads(self.started_servers_file.read_text())
+            started_names = data.get("started", [])
+        except Exception:
+            return
+        for name in started_names:
+            if not name:
+                continue
+            server_data = self._get_server_data_by_name(name)
+            if not server_data or server_data.get("url"):
+                continue  # remote or not in list
+            if self._is_local_running(server_data) == "✓":
+                continue
+            self._start_server_silently(server_data)
     
     def _save_started_servers(self):
         """Save list of currently started servers to persist across restarts."""
@@ -1350,7 +1424,7 @@ class MCPDialog(QDialog):
                 QMessageBox.warning(self, "Validate", "Enter command first.")
                 return
             args_text = self.args_edit.toPlainText().strip()
-            args = args_text.split() if args_text else []
+            args = normalize_mcp_args(args_text) if args_text else []
             env = self._parse_env_text(self.env_edit.toPlainText())
             config = {"command": cmd, "args": args, "env": env}
         # Run in QThread so we don't block the main thread or re-raise from another thread (avoids crashes)
@@ -1407,7 +1481,7 @@ class MCPDialog(QDialog):
         else:
             cmd = self.cmd_edit.text().strip()
             args_text = self.args_edit.toPlainText().strip()
-            args = args_text.split() if args_text else []
+            args = normalize_mcp_args(args_text) if args_text else []
             env = self._parse_env_text(self.env_edit.toPlainText())
             return {"name": name, "command": cmd, "args": args, "env": env}
 

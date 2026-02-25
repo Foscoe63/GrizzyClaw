@@ -71,6 +71,42 @@ def _env_for_server(config: Dict[str, Any]) -> Dict[str, str]:
     return env
 
 
+def normalize_mcp_args(args: Any) -> List[str]:
+    """Normalize MCP server args to a flat list of strings. Handles args stored as a
+    JSON array string (e.g. '[\"mcp-macos\"]') so npx receives mcp-macos, not the literal string.
+    """
+    if args is None:
+        return []
+    if isinstance(args, str):
+        s = args.strip()
+        if s.startswith("[") and s.endswith("]"):
+            try:
+                parsed = json.loads(s)
+                if isinstance(parsed, list):
+                    return [str(x) for x in parsed]
+                return [s]
+            except json.JSONDecodeError:
+                return s.split() if s else []
+        return s.split() if s else []
+    if not isinstance(args, (list, tuple)):
+        return []
+    out: List[str] = []
+    for a in args:
+        s = str(a).strip()
+        if s.startswith("[") and s.endswith("]"):
+            try:
+                parsed = json.loads(s)
+                if isinstance(parsed, list):
+                    out.extend(str(x) for x in parsed)
+                else:
+                    out.append(s)
+            except json.JSONDecodeError:
+                out.append(s)
+        else:
+            out.append(s)
+    return out
+
+
 def _load_server_config(mcp_file: Path, mcp_name: str) -> Optional[Dict[str, Any]]:
     """Load server config from mcpServers JSON."""
     if not mcp_file.exists():
@@ -101,11 +137,7 @@ def _load_all_servers(mcp_file: Path) -> Dict[str, Dict[str, Any]]:
 async def _list_tools_stdio(config: Dict[str, Any]) -> List[Tuple[str, str]]:
     """Connect via stdio, list tools, return [(name, description), ...]."""
     cmd = config.get("command", "")
-    args_list = config.get("args", [])
-    if isinstance(args_list, str):
-        args_list = args_list.split() if args_list else []
-    elif not isinstance(args_list, (list, tuple)):
-        args_list = []
+    args_list = normalize_mcp_args(config.get("args", []))
     if not cmd:
         return []
     server_params = StdioServerParameters(
@@ -433,18 +465,14 @@ async def call_mcp_tool(
         return await _call_tool_http(config, tool_name, arguments)
 
     cmd = config.get("command", "")
-    args_list = config.get("args", [])
-    if isinstance(args_list, str):
-        args_list = args_list.split() if args_list else []
-    elif not isinstance(args_list, (list, tuple)):
-        args_list = []
+    args_list = normalize_mcp_args(config.get("args", []))
 
     if not cmd:
         return f"**❌ No command for MCP server '{mcp_name}'.**"
 
     server_params = StdioServerParameters(
         command=cmd,
-        args=[str(a) for a in args_list],
+        args=args_list,
         env=_env_for_server(config),
     )
 

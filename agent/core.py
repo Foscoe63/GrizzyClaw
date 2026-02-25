@@ -10,7 +10,12 @@ from grizzyclaw.automation import CronScheduler, PLAYWRIGHT_AVAILABLE
 from grizzyclaw.config import Settings
 from grizzyclaw.llm import LLMError
 from grizzyclaw.llm.router import LLMRouter
-from grizzyclaw.mcp_client import call_mcp_tool, discover_tools, invalidate_tools_cache
+from grizzyclaw.mcp_client import (
+    call_mcp_tool,
+    discover_tools,
+    invalidate_tools_cache,
+    _load_all_servers as load_mcp_servers,
+)
 from grizzyclaw.memory.sqlite_store import SQLiteMemoryStore
 from grizzyclaw.media.transcribe import transcribe_audio, TranscriptionError
 from grizzyclaw.safety.content_filter import ContentFilter
@@ -25,6 +30,7 @@ from .command_parsers import (
     find_tool_call_blocks_relaxed,
     find_write_file_path_content_blocks,
     normalize_llm_json,
+    strip_response_blocks,
 )
 from .context_utils import trim_session
 from .sdk_runner import AGENTS_SDK_AVAILABLE, run_agents_sdk
@@ -355,14 +361,30 @@ class AgentCore:
                 forward_msg = match.group(2).strip()
                 if forward_msg:
                     yield f"Delegating to @{target_name}…\n"
+                    task_summary = forward_msg.strip().split("\n")[0][:120] if forward_msg else ""
                     delegation_ctx = {
                         "from_workspace_id": self.workspace_id,
-                        "task_summary": forward_msg.strip().split("\n")[0][:120] if forward_msg else "",
+                        "task_summary": task_summary,
                     }
                     if self.workspace_config:
                         from_ws = self.workspace_manager.get_workspace(self.workspace_id) if self.workspace_manager else None
                         if from_ws:
                             delegation_ctx["from_workspace_name"] = from_ws.name
+                    # Emit swarm event so user-initiated delegations show in Swarm Activity
+                    if self.swarm_event_bus:
+                        task_id = f"user@{target_name}:{hash(forward_msg) % 10**8}"
+                        await self.swarm_event_bus.emit(
+                            SwarmEventTypes.SUBTASK_AVAILABLE,
+                            {
+                                "task_id": task_id,
+                                "required_role": target_name,
+                                "message": forward_msg,
+                                "task_summary": task_summary,
+                                "initiator": "user",
+                            },
+                            workspace_id=self.workspace_id,
+                            channel=getattr(self.workspace_config, "inter_agent_channel", None),
+                        )
                     result = await self.workspace_manager.send_message_to_workspace(
                         self.workspace_id, target_name, forward_msg, context=delegation_ctx
                     )
@@ -370,6 +392,20 @@ class AgentCore:
                         yield f"⚠️ {result}\n"
                     elif result:
                         yield f"✅ @{target_name} replied: {result[:1500]}{'…' if len(result) > 1500 else ''}\n"
+                    # Emit completion so Swarm Activity shows delegation finished
+                    if self.swarm_event_bus:
+                        await self.swarm_event_bus.emit(
+                            SwarmEventTypes.TASK_COMPLETED,
+                            {
+                                "task_id": task_id if forward_msg else "",
+                                "required_role": target_name,
+                                "task_summary": task_summary,
+                                "ok": not (result.startswith("Target ") or result.startswith("Error:")),
+                                "result_preview": (result[:200] + "…") if result and len(result) > 200 else (result or ""),
+                            },
+                            workspace_id=self.workspace_id,
+                            channel=getattr(self.workspace_config, "inter_agent_channel", None),
+                        )
                     forwarded_any = True
             if forwarded_any:
                 yield "Swarm delegations done.\n"
@@ -718,7 +754,14 @@ Output EXEC_COMMAND in your first response. Default cwd is home directory. Safe 
                     write_file_server = srv
                     break
             has_write_file = write_file_server is not None
+            from datetime import datetime
+            _now = datetime.now()
+            _today = _now.strftime("%Y-%m-%d")
+            _today_start = f"{_today}T00:00"
+            _today_end = f"{_today}T23:59"
             system_content += f"""
+
+Current date: {_today}. When the user says "today", "just today", "this morning", etc., use startDate: \"{_today_start}\" and endDate: \"{_today_end}\" (or equivalent) in calendar_events, reminders_tasks, or other date params. Use this date—do NOT use a placeholder or past date like 2023-10-06.
 
 Enabled skills: {skills_str}
 
@@ -736,6 +779,8 @@ Examples:
 
 When the user asks to check email, list emails, read Gmail, or show unread emails: output SKILL_ACTION with skill \"gmail\" and action \"list_messages\" (e.g. params {{\"q\": \"is:unread\", \"maxResults\": 10}}) immediately. Do NOT reply that Gmail is not configured—only suggest Settings if the skill returns an error.
 When the user asks about calendar or upcoming events: output SKILL_ACTION with skill \"calendar\" and action \"list_events\" immediately. Do NOT reply that Calendar is not configured—only suggest Settings if the skill returns an error.
+Natural commands for macOS (if macos-mcp or similar MCP server is configured, use SKILL_ACTION with that server name): \"add a note\" / \"create a note\" / \"search my notes\" → skill macos-mcp, action notes_items, params {{\"action\": \"create\" or \"read\", \"title\": \"...\", \"body\": \"...\"}}; \"remind me to\" / \"my reminders\" / \"list reminders\" → action reminders_tasks, params {{\"action\": \"read\" or \"create\", ...}}; \"my calendar\" / \"what's on my calendar\" / \"schedule a meeting\" → action calendar_events; \"find contact\" / \"look up\" / \"search contacts\" / \"get phone number for\" → action contacts_people with params {{\"action\": \"search\", \"query\": \"name or term\"}} or {{\"action\": \"read\"}} for listing; \"check my mail\" / \"my inbox\" / \"read my mail\" → action mail_messages; \"send a text\" / \"iMessage\" / \"my messages\" / \"recent chats\" → action messages_chat. Always include params.action (e.g. \"read\", \"create\", \"search\") for notes_items, calendar_events, reminders_tasks, contacts_people.
+When outputting SKILL_ACTION or TOOL_CALL, write only a brief intro line (e.g. \"Checking your calendar…\") before the JSON; the raw JSON is hidden from the user—they only see your intro and the skill result.
 If the user asks \"what skills do I have?\", \"list my skills\", or similar: answer with \"Enabled skills: {skills_str}. Use Settings → Skills for details.\"
 Configure API keys/tokens in Settings → Integrations first.
 
@@ -756,6 +801,7 @@ Discovered tools (use these exact names):
 When users ask to search the web/internet, use ddg-search with tool 'search' if available. Agent executes tools and returns real results.
 CRITICAL: Describing an action in text (e.g. 'Now writing files via fast-filesystem') does NOT execute it. You MUST output TOOL_CALL = {{ ... }} to run tools. Never say you will do something without outputting the actual TOOL_CALL.
 CRITICAL (Gmail/Calendar): When the user asks to check email, list emails, read Gmail, or show unread emails, you MUST output SKILL_ACTION = {{ \"skill\": \"gmail\", \"action\": \"list_messages\", \"params\": {{ \"q\": \"is:unread\", \"maxResults\": 10 }} }} in your response. Do NOT say you cannot access email or that they must connect Gmail first—the app handles auth; you must try the skill. Only suggest Settings if the skill result contains an error. Same for calendar: if they ask about events or calendar, output SKILL_ACTION with skill \"calendar\", action \"list_events\".
+When the user asks about notes, reminders, macOS calendar, contacts, Mail.app inbox, or Messages/iMessage: if macos-mcp (or similar) is in MCP servers, output SKILL_ACTION with that server name, action notes_items | reminders_tasks | calendar_events | contacts_people | mail_messages | messages_chat, and params that include \"action\": \"read\", \"create\", or \"search\" as appropriate. For contacts use contacts_people with {{\"action\": \"search\", \"query\": \"...\"}} or {{\"action\": \"read\"}}. Do not reply that you cannot—try the skill first.
 When using TOOL_CALL, write a brief intro first (e.g. 'Let me search for that.') then output the TOOL_CALL on the same or next line.
 When you receive tool results in a follow-up message, use them to continue your response. Do NOT repeat the TOOL_CALL - the tools have already been executed.
 To ask the user a clarifying question, output ASK_USER = {{ \"question\": \"...\" }}. You will get their reply in the next message.
@@ -829,6 +875,12 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
         search_triggers = ("search", "internet", "web", "look for", "find information", "look on", "search the")
         msg_lower = message.lower().strip()
         wants_search = any(t in msg_lower for t in search_triggers)
+        detailed_response_triggers = (
+            "detailed response", "full response", "show raw", "include the skill",
+            "show skill_action", "show tool_call", "verbose response", "debug response",
+            "give me everything", "show everything", "detailed output",
+        )
+        wants_detailed_response = any(p in msg_lower for p in detailed_response_triggers)
         use_simple_model = self._is_simple_task(message, images)
 
         try:
@@ -872,12 +924,19 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
                                 on_fallback=on_fallback,
                             ):
                                 response_chunks.append(chunk)
-                                out = chunk
-                                if content_filter:
-                                    out, _ = content_filter.filter(out)
-                                yield out
 
                             response_text = "".join(response_chunks)
+                            # Yield full response if user asked for "detailed response"; otherwise hide raw blocks
+                            if wants_detailed_response:
+                                display_text = response_text
+                            else:
+                                display_text = strip_response_blocks(response_text)
+                            if display_text.strip():
+                                if content_filter:
+                                    display_text, _ = content_filter.filter(display_text)
+                                yield display_text
+                                if not display_text.endswith("\n"):
+                                    yield "\n"
                             if response_text.strip() or empty_retry > 0:
                                 break
                             empty_retry += 1
@@ -1872,11 +1931,13 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
         """Execute built-in skill: calendar, gmail, github, mcp_marketplace."""
         skill_id = (skill_cmd.get("skill") or skill_cmd.get("skill_id") or "").strip().lower()
         action = (skill_cmd.get("action") or "").strip().lower()
-        params = skill_cmd.get("params") or skill_cmd
-        if isinstance(params, dict):
-            params = {k: v for k, v in params.items() if k not in ("skill", "skill_id", "action")}
+        raw_params = skill_cmd.get("params") or skill_cmd
+        if isinstance(raw_params, dict):
+            params = {k: v for k, v in raw_params.items() if k not in ("skill", "skill_id", "action")}
         else:
             params = {}
+        # For MCP, pass full params including "action" (macos-mcp expects params.action)
+        mcp_params = {k: v for k, v in (raw_params if isinstance(raw_params, dict) else {}).items() if k not in ("skill", "skill_id")}
         loop = asyncio.get_event_loop()
         try:
             from grizzyclaw.skills.registry import get_skill
@@ -1908,6 +1969,23 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
                 return await loop.run_in_executor(
                     None, lambda: execute_mcp_marketplace(action, params, self.settings)
                 )
+            # Route to MCP server if skill_id matches a configured server (e.g. macos-mcp or krmj22-macos-mcp)
+            mcp_file = Path(self.settings.mcp_servers_file).expanduser().resolve()
+            if not mcp_file.exists():
+                mcp_file = (Path.home() / ".grizzyclaw" / "grizzyclaw.json").resolve()
+            if mcp_file.exists():
+                servers = load_mcp_servers(mcp_file)
+                for mcp_name, _ in servers.items():
+                    name_lower = mcp_name.lower()
+                    normalized = name_lower.replace("_", "-").replace(" ", "-")
+                    exact = name_lower == skill_id
+                    macos_mcp_match = (
+                        skill_id == "macos-mcp"
+                        and ("macos-mcp" in name_lower or "macos-mcp" in normalized or ("macos" in normalized and "mcp" in normalized))
+                    )
+                    if exact or macos_mcp_match:
+                        result = await call_mcp_tool(mcp_file, mcp_name, action, mcp_params)
+                        return result
             return f"❌ Unknown skill: {skill_id}. Use calendar, gmail, github, mcp_marketplace, or install a plugin."
         except Exception as e:
             logger.exception("Skill execution error")

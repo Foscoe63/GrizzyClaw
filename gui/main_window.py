@@ -1297,6 +1297,13 @@ class ChatWidget(QWidget):
         sb = self.chat_scroll.verticalScrollBar()
         sb.setValue(sb.maximum())
 
+    def _scroll_to_bottom(self):
+        """Scroll chat to bottom (e.g. when assistant reply is added so user sees the new content)."""
+        if not getattr(self, "chat_scroll", None):
+            return
+        sb = self.chat_scroll.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
     def _on_scroll_changed(self):
         """Track if user is near bottom for smart scroll."""
         sb = self.chat_scroll.verticalScrollBar()
@@ -1327,7 +1334,7 @@ class ChatWidget(QWidget):
             self.chat_layout.insertWidget(self.chat_layout.count() - 1, self._streaming_bubble)
         current = self._streaming_bubble.label.text()
         self._streaming_bubble.label.setText(current + chunk)
-        QTimer.singleShot(0, self._scroll_to_bottom_if_near)
+        QTimer.singleShot(0, self._scroll_to_bottom)
 
     def on_message_ready(self, response_text, was_stopped=False):
         """Handle completion of the response from the worker thread."""
@@ -1349,6 +1356,7 @@ class ChatWidget(QWidget):
             self.message_added.emit(response_text, False, self._workspace_display_name)
         else:
             self.message_received.emit(response_text, False)
+        QTimer.singleShot(0, self._scroll_to_bottom)
         mw = self.window()
         if mw and hasattr(mw, "_update_session_status"):
             mw._update_session_status()
@@ -1362,6 +1370,7 @@ class ChatWidget(QWidget):
             self.message_added.emit(error_message, False, self._workspace_display_name)
         else:
             self.message_received.emit(error_message, False)
+        QTimer.singleShot(0, self._scroll_to_bottom)
 
     def _on_provider_fallback(self, fallback_provider: str):
         """Update status bar when LLM falls back to another provider (e.g. OpenAI failed -> LM Studio)."""
