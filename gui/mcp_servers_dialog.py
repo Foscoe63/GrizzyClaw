@@ -12,12 +12,35 @@ from PyQt6.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QWidget, QScrollArea, QFrame, QInputDialog,
     QHeaderView, QPlainTextEdit
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QTimer
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QThread
 from PyQt6.QtGui import QFont, QShowEvent
 
-from grizzyclaw.mcp_client import invalidate_tools_cache, call_mcp_tool, validate_server_config, discover_one_server
+from grizzyclaw.mcp_client import (
+    invalidate_tools_cache,
+    call_mcp_tool,
+    validate_server_config,
+    discover_one_server,
+    discover_mcp_servers_zeroconf,
+)
 
-class MCPTab(SettingsTab):
+
+class ValidateConfigWorker(QThread):
+    """Run MCP validate_server_config in a background thread to avoid blocking/crashing the GUI."""
+    finished_signal = pyqtSignal(bool, str)
+
+    def __init__(self, config: dict):
+        super().__init__()
+        self.config = config
+
+    def run(self):
+        try:
+            import asyncio
+            ok, msg = asyncio.run(validate_server_config(self.config))
+            self.finished_signal.emit(ok, msg)
+        except Exception as e:
+            self.finished_signal.emit(False, str(e))
+
+class MCPTab(QWidget):
     """MCP servers only (add/edit/test, marketplace, refresh)."""
     def __init__(self, settings, parent=None):
         super().__init__(parent)
@@ -122,10 +145,28 @@ class MCPTab(SettingsTab):
         mcp_layout.addWidget(self.mcp_servers_tree)
         
         # Status legend
-        legend = QLabel("🟢 Running  🔴 Stopped  •  Click status to toggle")
+        legend = QLabel(
+            "🟢 Running  🔴 Stopped  •  Click status to toggle. "
+            "Local (stdio) servers are started automatically by the agent when you use their tools in chat; keeping them running here is optional."
+        )
         legend.setStyleSheet(f"color: {self.secondary_text}; font-size: 11px; padding: 4px 0; background: transparent;")
         mcp_layout.addWidget(legend)
         
+        # Quick add: paste URL or command
+        quick_row = QHBoxLayout()
+        self.quick_add_input = QLineEdit()
+        self.quick_add_input.setPlaceholderText("Paste URL or command (e.g. npx -y @modelcontextprotocol/server-foo or https://...)")
+        self.quick_add_input.setStyleSheet(self._input_style())
+        self.quick_add_input.setMinimumWidth(320)
+        quick_row.addWidget(self.quick_add_input)
+        quick_add_btn = QPushButton("Quick add")
+        quick_add_btn.setToolTip("Parse URL or command and open Add Server with suggested name and config; Test before saving.")
+        quick_add_btn.clicked.connect(self.quick_add_mcp)
+        quick_add_btn.setStyleSheet(self._secondary_btn_style())
+        quick_row.addWidget(quick_add_btn)
+        quick_row.addStretch()
+        mcp_layout.addLayout(quick_row)
+
         # Button row
         mcp_btns = QHBoxLayout()
         mcp_btns.setSpacing(8)
@@ -140,6 +181,12 @@ class MCPTab(SettingsTab):
         add_marketplace_btn.setStyleSheet(self._secondary_btn_style())
         add_marketplace_btn.setToolTip("Pick a server from the built-in or configured marketplace list")
         mcp_btns.addWidget(add_marketplace_btn)
+        
+        discover_btn = QPushButton("Discover on network")
+        discover_btn.clicked.connect(self.discover_mcp_network)
+        discover_btn.setStyleSheet(self._secondary_btn_style())
+        discover_btn.setToolTip("Find MCP servers on the local network (mDNS / ZeroConf; servers must advertise _mcp._tcp.local.)")
+        mcp_btns.addWidget(discover_btn)
         
         edit_btn = QPushButton("Edit")
         edit_btn.clicked.connect(self.edit_mcp)
@@ -489,6 +536,46 @@ Names: {names_str}"""
                 }
             """
 
+    @staticmethod
+    def _parse_quick_add(text: str) -> Optional[Dict]:
+        """Parse pasted URL or command into suggested edit_data (name, url or command/args). Returns None if empty or unparseable."""
+        t = (text or "").strip()
+        if not t:
+            return None
+        if t.startswith("http://") or t.startswith("https://"):
+            try:
+                from urllib.parse import urlparse
+                p = urlparse(t)
+                name = (p.netloc or "remote").replace(".", "_").replace(":", "_") or "remote"
+                return {"name": name, "url": t}
+            except Exception:
+                return {"name": "remote", "url": t}
+        parts = t.split()
+        if not parts:
+            return None
+        cmd = parts[0]
+        args = parts[1:] if len(parts) > 1 else []
+        name = "mcp_server"
+        for a in reversed(args):
+            if "@" in a or "/" in a:
+                name = a.split("/")[-1].split("@")[-1].replace("@", "").strip()
+                break
+        return {"name": name, "command": cmd, "args": args}
+
+    def quick_add_mcp(self):
+        text = self.quick_add_input.text().strip()
+        edit_data = self._parse_quick_add(text)
+        if not edit_data:
+            QMessageBox.information(self, "Quick add", "Paste a URL (https://...) or command (e.g. npx -y @modelcontextprotocol/server-foo) first.")
+            return
+        dialog = MCPDialog(parent=self, edit_data=edit_data)
+        if dialog.exec():
+            config = dialog.get_config()
+            self.mcp_servers_data.append(config)
+            self._save_mcp_data()
+            self.load_mcp_list()
+            self.quick_add_input.clear()
+
     def add_mcp(self):
         dialog = MCPDialog(parent=self)
         if dialog.exec():
@@ -579,6 +666,54 @@ Names: {names_str}"""
         if tools_lbl:
             tools_lbl.setText(str(len(tools)) if tools else "0")
         self.refresh_mcp_statuses()
+
+    def discover_mcp_network(self):
+        """Discover MCP servers on the local network via ZeroConf/mDNS; add selected one."""
+        class DiscoverWorker(QThread):
+            finished = pyqtSignal(list)
+
+            def run(self):
+                result = discover_mcp_servers_zeroconf(timeout_seconds=5.0)
+                self.finished.emit(result)
+
+        self._discover_worker = DiscoverWorker(self)
+        self._discover_worker.finished.connect(self._on_discover_finished)
+        self._discover_worker.start()
+        QMessageBox.information(
+            self,
+            "Discovering",
+            "Searching for MCP servers on the local network (_mcp._tcp.local.)…\nThis may take a few seconds.",
+        )
+
+    def _on_discover_finished(self, servers: list):
+        if not servers:
+            QMessageBox.information(
+                self,
+                "Network discovery",
+                "No MCP servers found. Servers must advertise _mcp._tcp.local. (ZeroConf).\nInstall the 'zeroconf' package if needed.",
+            )
+            return
+        items = [f"{s.get('name', '?')} — {s.get('host', '')}:{s.get('port', 0)}" for s in servers]
+        choice, ok = QInputDialog.getItem(
+            self,
+            "Add discovered server",
+            "Select an MCP server to add (HTTP):",
+            items,
+            0,
+            False,
+        )
+        if ok and choice:
+            idx = items.index(choice)
+            s = servers[idx]
+            name = (s.get("name") or "discovered").replace(" ", "_")[:64]
+            host = s.get("host", "localhost")
+            port = s.get("port", 0)
+            url = f"http://{host}:{port}"
+            config = {"name": name, "url": url}
+            self.mcp_servers_data.append(config)
+            self._save_mcp_data()
+            self.load_mcp_list()
+            QMessageBox.information(self, "Added", f"Added '{name}' with URL {url}")
 
     def add_mcp_from_marketplace(self):
         """Fetch marketplace list and let user pick a server to add (same as mcp_marketplace install)."""
@@ -718,7 +853,9 @@ Names: {names_str}"""
                             btn.setStyleSheet(self._running_btn_style())
                         else:
                             btn.setText("🔴")
-                            btn.setToolTip(f"{server_name} is stopped. Click to start.")
+                            btn.setToolTip(
+                                f"{server_name} is stopped. Click to start (optional — the agent starts it automatically when using tools in chat)."
+                            )
                             btn.setStyleSheet(self._stopped_btn_style())
                         btn.update()
                         btn.repaint()
@@ -919,17 +1056,32 @@ Names: {names_str}"""
                 expanded_env = self._get_expanded_env()
                 for k, v in (server_data.get("env") or {}).items():
                     expanded_env[str(k)] = str(v)
-                # stdin=PIPE keeps the pipe open so stdio-based MCP servers don't get EOF and exit
-                p = subprocess.Popen(cmd_list, stdin=subprocess.PIPE, stdout=DEVNULL, stderr=DEVNULL,
-                                     start_new_session=True, env=expanded_env)
+                # stdin=PIPE keeps the pipe open so stdio-based MCP servers don't get EOF and exit.
+                # stderr=PIPE so we can show crash output (e.g. "playwright install chromium").
+                p = subprocess.Popen(
+                    cmd_list,
+                    stdin=subprocess.PIPE,
+                    stdout=DEVNULL,
+                    stderr=subprocess.PIPE,
+                    start_new_session=True,
+                    env=expanded_env,
+                )
                 self.running_processes[name] = p
                 # Mark as recently started for grace period
                 self.recently_started[name] = time.time()
-                QMessageBox.information(self, "Started", f"{name} started (PID: {p.pid})")
+                QMessageBox.information(
+                    self,
+                    "Started",
+                    f"{name} started (PID: {p.pid}).\n\n"
+                    "Tip: The agent also starts this server automatically when using its tools in chat. "
+                    "Keeping it running here is optional (e.g. for Test)."
+                )
                 # IMMEDIATELY update this specific button to green
                 self._update_button_for_server(name, True)
                 # Save the started state to persist across app restarts
                 self._save_started_servers()
+                # Check shortly if the process exited (e.g. Playwright not installed); show stderr to user
+                QTimer.singleShot(2000, lambda: self._check_started_server_still_running(name))
             except FileNotFoundError:
                 QMessageBox.warning(self, "Start Error", f"Command not found: {cmd}\n\nMake sure {cmd} is installed and in your PATH.\n\nCommon install locations checked:\n- /opt/homebrew/bin\n- /usr/local/bin\n- ~/.local/bin")
                 self._update_button_for_server(name, False)
@@ -941,6 +1093,34 @@ Names: {names_str}"""
         QTimer.singleShot(500, self.refresh_mcp_statuses)
         # Save state after stopping
         self._save_started_servers()
+
+    def _check_started_server_still_running(self, name: str):
+        """If we started this server and it has already exited, show stderr so user can fix (e.g. playwright install)."""
+        proc = self.running_processes.get(name)
+        if proc is None:
+            return
+        if proc.poll() is None:
+            return  # Still running
+        self.running_processes.pop(name, None)
+        self._update_button_for_server(name, False)
+        self._save_started_servers()
+        err_text = ""
+        try:
+            if proc.stderr:
+                err_text = (proc.stderr.read() or b"").decode("utf-8", errors="replace").strip()
+        except Exception:
+            pass
+        if not err_text:
+            err_text = f"Process exited with code {proc.returncode}."
+        hint = ""
+        if "playwright" in name.lower() or "browser" in err_text.lower() or "executable" in err_text.lower():
+            hint = "\n\nTo fix: run in a terminal:\n  playwright install chromium"
+        QMessageBox.warning(
+            self,
+            f"{name} exited",
+            f"{name} stopped shortly after start. This often means a dependency is missing.\n\n{err_text[:800]}{hint}",
+        )
+        QTimer.singleShot(300, self.refresh_mcp_statuses)
 
     def get_settings(self):
         skills = [self.skills_list.item(i).text() for i in range(self.skills_list.count())]
@@ -1100,10 +1280,10 @@ class MCPDialog(QDialog):
 
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
-        validate_btn = QPushButton("Validate")
-        validate_btn.setToolTip("Test connection / list tools before saving")
-        validate_btn.clicked.connect(self._validate_config)
-        btn_layout.addWidget(validate_btn)
+        self._validate_btn = QPushButton("Validate")
+        self._validate_btn.setToolTip("Test connection / list tools before saving")
+        self._validate_btn.clicked.connect(self._validate_config)
+        btn_layout.addWidget(self._validate_btn)
         ok_btn = QPushButton("Save")
         ok_btn.clicked.connect(self.accept)
         btn_layout.addWidget(ok_btn)
@@ -1151,7 +1331,7 @@ class MCPDialog(QDialog):
         return result
 
     def _validate_config(self):
-        """Run validation for current form (local: list tools; remote: HTTP check)."""
+        """Run validation for current form (local: list tools; remote: HTTP check) in a worker thread to avoid crashes."""
         if self.remote_cb.isChecked():
             url = self.url_edit.text().strip()
             if not url:
@@ -1173,15 +1353,31 @@ class MCPDialog(QDialog):
             args = args_text.split() if args_text else []
             env = self._parse_env_text(self.env_edit.toPlainText())
             config = {"command": cmd, "args": args, "env": env}
-        from grizzyclaw.utils.async_runner import run_async
+        # Run in QThread so we don't block the main thread or re-raise from another thread (avoids crashes)
+        self._validate_btn.setEnabled(False)
+        self._validate_worker = ValidateConfigWorker(config)
+        self._validate_worker.finished_signal.connect(self._on_validate_finished)
+        self._validate_worker.start()
+
+    def _on_validate_finished(self, ok: bool, msg: str):
+        worker = getattr(self, "_validate_worker", None)
+        if worker:
+            try:
+                worker.finished_signal.disconnect(self._on_validate_finished)
+            except (TypeError, RuntimeError):
+                pass
+        self._validate_worker = None
         try:
-            ok, msg = run_async(validate_server_config(config))
-        except Exception as e:
-            ok, msg = False, str(e)
-        if ok:
-            QMessageBox.information(self, "Validate", msg)
-        else:
-            QMessageBox.warning(self, "Validate", msg)
+            self._validate_btn.setEnabled(True)
+        except RuntimeError:
+            pass  # Dialog may already be closed
+        try:
+            if ok:
+                QMessageBox.information(self, "Validate", msg)
+            else:
+                QMessageBox.warning(self, "Validate", msg)
+        except RuntimeError:
+            pass  # Dialog closed before validation finished
 
     def accept(self):
         name = self.name_edit.text().strip()

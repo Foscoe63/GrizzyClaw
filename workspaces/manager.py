@@ -9,6 +9,7 @@ from typing import Dict, List, Optional, Any, TYPE_CHECKING
 from grizzyclaw.config import Settings
 from grizzyclaw.memory.sqlite_store import SQLiteMemoryStore
 from .workspace import Workspace, WorkspaceConfig, WORKSPACE_TEMPLATES
+from .swarm_events import SwarmEventBus
 
 if TYPE_CHECKING:
     from grizzyclaw.agent.core import AgentCore
@@ -31,7 +32,8 @@ class WorkspaceManager:
         self.workspaces_file = self.data_dir / "workspaces.json"
         self.workspaces: Dict[str, Workspace] = {}
         self.active_workspace_id: Optional[str] = None
-        
+        self.swarm_event_bus = SwarmEventBus()
+
         # Load existing workspaces or create default
         self._load_workspaces()
     
@@ -351,8 +353,10 @@ class WorkspaceManager:
         agent.workspace_manager = self
         agent.workspace_id = workspace_id
         agent.workspace_config = config
+        agent.swarm_event_bus = self.swarm_event_bus
         workspace.agent = agent
-        
+        agent._ensure_swarm_subscriptions()
+
         logger.info(f"Created agent for workspace: {workspace.name}")
         return agent
     

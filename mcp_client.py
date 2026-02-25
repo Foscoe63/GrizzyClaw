@@ -375,6 +375,40 @@ async def validate_server_config(config: Dict[str, Any]) -> Tuple[bool, str]:
         return False, err
 
 
+async def health_check_servers(mcp_file: Path) -> Dict[str, bool]:
+    """
+    Probe each configured MCP server; return {server_name: True/False}.
+    Used for background health checks and UI status. Failed servers can be retried
+    on next discovery (cache invalidation triggers refetch).
+    """
+    if not MCP_AVAILABLE:
+        return {}
+    servers = _load_all_servers(mcp_file)
+    if not servers:
+        return {}
+    result: Dict[str, bool] = {}
+
+    async def probe(name: str, config: Dict[str, Any]) -> Tuple[str, bool]:
+        try:
+            if "url" in config:
+                await asyncio.wait_for(_list_tools_http(config), timeout=DISCOVERY_SERVER_TIMEOUT)
+            else:
+                await asyncio.wait_for(_list_tools_stdio(config), timeout=DISCOVERY_SERVER_TIMEOUT)
+            return (name, True)
+        except Exception:
+            return (name, False)
+
+    tasks = [probe(name, config) for name, config in servers.items()]
+    done = await asyncio.gather(*tasks, return_exceptions=True)
+    for d in done:
+        if isinstance(d, Exception):
+            logger.debug("MCP health check error: %s", d)
+            continue
+        name, ok = d
+        result[name] = ok
+    return result
+
+
 async def call_mcp_tool(
     mcp_file: Path,
     mcp_name: str,
@@ -433,8 +467,24 @@ async def call_mcp_tool(
                         parts.append(content.text)
                 return "\n".join(parts) if parts else "(No output)"
 
+    async def _call_with_retry() -> str:
+        try:
+            return await asyncio.wait_for(_run_stdio_call(), timeout=DEFAULT_TOOL_CALL_TIMEOUT)
+        except FileNotFoundError:
+            raise
+        except (asyncio.TimeoutError, ConnectionError, OSError) as e:
+            logger.warning("MCP transient error (will retry once): %s", e)
+            await asyncio.sleep(1.5)
+            return await asyncio.wait_for(_run_stdio_call(), timeout=DEFAULT_TOOL_CALL_TIMEOUT)
+        except Exception as e:
+            if "timeout" in str(e).lower() or "connection" in str(e).lower():
+                logger.warning("MCP transient error (will retry once): %s", e)
+                await asyncio.sleep(1.5)
+                return await asyncio.wait_for(_run_stdio_call(), timeout=DEFAULT_TOOL_CALL_TIMEOUT)
+            raise
+
     try:
-        return await asyncio.wait_for(_run_stdio_call(), timeout=DEFAULT_TOOL_CALL_TIMEOUT)
+        return await _call_with_retry()
     except asyncio.TimeoutError:
         return f"**❌ MCP tool call timed out** (>{DEFAULT_TOOL_CALL_TIMEOUT}s). Server '{mcp_name}' may be stuck."
     except FileNotFoundError:
@@ -450,3 +500,41 @@ async def call_mcp_tool(
             sub = e.exceptions[0]
             err_msg = f"{type(sub).__name__}: {sub}"
         return f"**❌ Tool error:** {err_msg}"
+
+
+def discover_mcp_servers_zeroconf(timeout_seconds: float = 5.0) -> List[Dict[str, Any]]:
+    """
+    Discover MCP servers on the local network via mDNS (ZeroConf).
+    Servers that advertise _mcp._tcp.local. will be listed.
+    Returns list of {"name": str, "host": str, "port": int}; empty if zeroconf not installed or none found.
+    """
+    try:
+        from zeroconf import Zeroconf, ServiceListener, ServiceBrowser
+    except ImportError:
+        logger.debug("zeroconf not installed; skipping MCP network discovery")
+        return []
+
+    results: List[Dict[str, Any]] = []
+
+    class MCPListener(ServiceListener):
+        def add_service(self, zc: Any, type_: str, name: str) -> None:
+            info = zc.get_service_info(type_, name)
+            if not info:
+                return
+            host = info.server or name
+            if info.parsed_addresses:
+                host = info.parsed_addresses[0]
+            port = info.port or 0
+            if port:
+                results.append({"name": name.replace("._mcp._tcp.local.", ""), "host": host, "port": port})
+
+    try:
+        import time
+        zc = Zeroconf()
+        listener = MCPListener()
+        ServiceBrowser(zc, "_mcp._tcp.local.", listener)
+        time.sleep(timeout_seconds)
+        zc.close()
+    except Exception as e:
+        logger.debug("Zeroconf discovery error: %s", e)
+    return results

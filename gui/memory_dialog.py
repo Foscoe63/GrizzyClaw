@@ -1,5 +1,10 @@
-from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QListWidget,
-                               QListWidgetItem, QPushButton, QMessageBox)
+import json
+from pathlib import Path
+
+from PyQt6.QtWidgets import (
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QListWidget,
+    QListWidgetItem, QPushButton, QMessageBox, QComboBox, QFileDialog,
+)
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont
 
@@ -48,6 +53,18 @@ class MemoryDialog(QDialog):
         )
         layout.addWidget(self.summary_label)
 
+        # Category filter
+        filter_layout = QHBoxLayout()
+        filter_layout.addWidget(QLabel("Category:"))
+        self.category_combo = QComboBox()
+        self.category_combo.addItem("All", None)
+        for cat in ("conversation", "preferences", "facts", "tasks", "reminders", "general"):
+            self.category_combo.addItem(cat, cat)
+        self.category_combo.currentIndexChanged.connect(self.refresh)
+        filter_layout.addWidget(self.category_combo)
+        filter_layout.addStretch()
+        layout.addLayout(filter_layout)
+
         # Memories list
         self.memories_list = QListWidget()
         self.memories_list.setAlternatingRowColors(True)
@@ -71,6 +88,10 @@ class MemoryDialog(QDialog):
         clear_btn.clicked.connect(self.clear_all)
         btn_layout.addWidget(clear_btn)
 
+        export_btn = QPushButton("Export (JSON)")
+        export_btn.clicked.connect(self.export_memories)
+        btn_layout.addWidget(export_btn)
+
         btn_layout.addStretch()
         layout.addLayout(btn_layout)
 
@@ -81,7 +102,8 @@ class MemoryDialog(QDialog):
             recent_count = len(summary.get('recent_items', []))
             self.summary_label.setText(f"Total Memories: {total} | Recent: {recent_count} | User: {self.user_id}")
 
-            self.memories = self.agent.list_memories_sync(self.user_id, 50)
+            category = self.category_combo.currentData()
+            self.memories = self.agent.list_memories_sync(self.user_id, 50, category=category)
             self.memories_list.clear()
             for mem in self.memories:
                 created = mem.get('created_at', 'Unknown')
@@ -90,8 +112,8 @@ class MemoryDialog(QDialog):
                 else:
                     created_str = str(created)[:16]
                 content = mem.get('content', '')[:120] + '...' if len(mem.get('content', '')) > 120 else mem.get('content', '')
-                category = mem.get('category', 'conversation')
-                item_text = f"{created_str} | {category} | {content}"
+                cat = mem.get('category', 'conversation')
+                item_text = f"{created_str} | {cat} | {content}"
                 item = QListWidgetItem(item_text)
                 item.setData(Qt.ItemDataRole.UserRole, mem.get('id'))
                 self.memories_list.addItem(item)
@@ -133,3 +155,15 @@ class MemoryDialog(QDialog):
                 QMessageBox.information(self, "Cleared", f"Cleared {deleted} memories.")
             except Exception as e:
                 QMessageBox.warning(self, "Error", str(e))
+
+    def export_memories(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Export memories", str(Path.home()), "JSON (*.json)")
+        if not path:
+            return
+        try:
+            data = {"user_id": self.user_id, "memories": self.memories}
+            with open(path, "w") as f:
+                json.dump(data, f, indent=2, default=str)
+            QMessageBox.information(self, "Exported", f"Exported {len(self.memories)} memories to {path}")
+        except Exception as e:
+            QMessageBox.warning(self, "Export error", str(e))

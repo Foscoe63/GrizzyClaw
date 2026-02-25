@@ -5,7 +5,7 @@ from PyQt6.QtWidgets import (
     QListWidgetItem, QPushButton, QMessageBox, QLineEdit,
     QTextEdit, QComboBox, QGroupBox, QFormLayout, QSpinBox,
     QDoubleSpinBox, QCheckBox, QTabWidget, QWidget, QFrame,
-    QApplication
+    QApplication, QFileDialog
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QThread
 from PyQt6.QtGui import QFont, QColor
@@ -209,9 +209,15 @@ class WorkspaceDialog(QDialog):
         icon_row.addStretch()
         general_layout.addRow("Icon:", icon_row)
         
+        avatar_row = QHBoxLayout()
         self.avatar_path_input = QLineEdit()
         self.avatar_path_input.setPlaceholderText("Path or URL to custom/VL-generated avatar image (optional)")
-        general_layout.addRow("Avatar:", self.avatar_path_input)
+        avatar_row.addWidget(self.avatar_path_input)
+        avatar_browse_btn = QPushButton("Browse…")
+        avatar_browse_btn.setFixedWidth(80)
+        avatar_browse_btn.clicked.connect(self._browse_avatar_path)
+        avatar_row.addWidget(avatar_browse_btn)
+        general_layout.addRow("Avatar:", avatar_row)
         
         self.tabs.addTab(general_tab, "General")
         
@@ -348,8 +354,14 @@ class WorkspaceDialog(QDialog):
         self.proactive_screen_cb.setToolTip("Every 30 min, capture screen and ask the model what the user is doing; store summary in memory.")
         proact_layout.addRow(self.proactive_screen_cb)
         self.proactive_autonomy_cb = QCheckBox("Continuous Autonomy: background loop for predictive prep and tasks")
-        self.proactive_autonomy_cb.setToolTip("Agent creates a background loop checking workspace state every 15 min even without prompts.")
+        self.proactive_autonomy_cb.setToolTip("Agent creates a background loop checking workspace state periodically even without prompts.")
         proact_layout.addRow(self.proactive_autonomy_cb)
+        self.proactive_autonomy_interval_spin = QSpinBox()
+        self.proactive_autonomy_interval_spin.setRange(5, 60)
+        self.proactive_autonomy_interval_spin.setSuffix(" min")
+        self.proactive_autonomy_interval_spin.setValue(15)
+        self.proactive_autonomy_interval_spin.setToolTip("How often the autonomy loop runs (5–60 minutes).")
+        proact_layout.addRow("Autonomy interval:", self.proactive_autonomy_interval_spin)
         self.proactive_file_triggers_cb = QCheckBox("Triggers on file changes and Git events")
         self.proactive_file_triggers_cb.setToolTip("Watch ~/.grizzyclaw/file_watcher.json for watch_dirs; triggers.json can use event file_change or git_event.")
         proact_layout.addRow(self.proactive_file_triggers_cb)
@@ -590,6 +602,7 @@ class WorkspaceDialog(QDialog):
         self.proactive_habits_cb.setChecked(getattr(workspace.config, "proactive_habits", False))
         self.proactive_screen_cb.setChecked(getattr(workspace.config, "proactive_screen", False))
         self.proactive_autonomy_cb.setChecked(getattr(workspace.config, "proactive_autonomy", False))
+        self.proactive_autonomy_interval_spin.setValue(max(5, min(60, getattr(workspace.config, "proactive_autonomy_interval_minutes", 15) or 15)))
         self.proactive_file_triggers_cb.setChecked(getattr(workspace.config, "proactive_file_triggers", False))
         
         # Metrics tab
@@ -607,6 +620,17 @@ class WorkspaceDialog(QDialog):
         self.switch_btn.setEnabled(not is_active)
         self.switch_btn.setText("✓ Active Workspace" if is_active else "🔄 Switch to This Workspace")
         self.delete_btn.setEnabled(not workspace.is_default)
+
+    def _browse_avatar_path(self):
+        """Open file dialog to pick an avatar image and set the Avatar path."""
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Choose avatar image",
+            self.avatar_path_input.text().strip() or "",
+            "Images (*.png *.jpg *.jpeg *.gif *.bmp *.webp);;All files (*)",
+        )
+        if path:
+            self.avatar_path_input.setText(path)
     
     def get_selected_workspace_id(self) -> str:
         """Get the currently selected workspace ID"""
@@ -677,6 +701,7 @@ class WorkspaceDialog(QDialog):
             "proactive_habits": self.proactive_habits_cb.isChecked(),
             "proactive_screen": self.proactive_screen_cb.isChecked(),
             "proactive_autonomy": self.proactive_autonomy_cb.isChecked(),
+            "proactive_autonomy_interval_minutes": self.proactive_autonomy_interval_spin.value(),
             "proactive_file_triggers": self.proactive_file_triggers_cb.isChecked(),
         }
         

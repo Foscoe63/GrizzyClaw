@@ -117,6 +117,24 @@ class CronScheduler:
             self.tasks[task_id].enabled = False
             logger.info(f"Disabled task: {task_id}")
 
+    def update_task(
+        self,
+        task_id: str,
+        cron_expression: Optional[str] = None,
+        name: Optional[str] = None,
+    ) -> bool:
+        """Update an existing task's cron or name. Returns True if found and updated."""
+        if task_id not in self.tasks:
+            return False
+        task = self.tasks[task_id]
+        if cron_expression is not None:
+            task.cron_expression = cron_expression
+            task._calculate_next_run()
+            logger.info(f"Updated task {task_id} cron to {cron_expression}")
+        if name is not None:
+            task.name = name
+        return True
+
     async def start(self):
         """Start the scheduler"""
         logger.info("Starting cron scheduler...")

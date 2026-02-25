@@ -203,20 +203,30 @@ class BrowserDialog(QDialog):
         layout.addWidget(output_group)
 
     def check_status(self):
-        """Check if browser/playwright is available"""
+        """Check if browser/playwright is available; show current URL and last action if any."""
         from grizzyclaw.automation import PLAYWRIGHT_AVAILABLE
         if PLAYWRIGHT_AVAILABLE:
-            self.status_label.setText(
+            base = (
                 "✅ Browser automation available. Playwright is installed.\n"
                 "The browser will start automatically when you perform an action."
             )
+            state = getattr(self.agent, "get_last_browser_state", lambda: {})()
+            url = state.get("current_url", "").strip()
+            last_action = state.get("last_action", "").strip()
+            if url or last_action:
+                base += "\n\n"
+                if url:
+                    base += f"Current URL: {url}\n"
+                if last_action:
+                    base += f"Last action: {last_action}"
+            self.status_label.setText(base)
             self.status_label.setStyleSheet(
                 "font-size: 14px; padding: 10px; background: #D4EDDA; border-radius: 8px; color: #155724;"
             )
         else:
             self.status_label.setText(
                 "❌ Browser automation not available.\n"
-                "Install with: pip install playwright && playwright install chromium"
+                "Run: pip install playwright && playwright install chromium"
             )
             self.status_label.setStyleSheet(
                 "font-size: 14px; padding: 10px; background: #F8D7DA; border-radius: 8px; color: #721C24;"
@@ -243,6 +253,7 @@ class BrowserDialog(QDialog):
     def on_browser_result(self, action, result):
         """Handle successful browser action result"""
         self.log_output(f"[{action}] ✅ {result}")
+        self.check_status()
     
     def on_browser_error(self, action, error):
         """Handle browser action error"""

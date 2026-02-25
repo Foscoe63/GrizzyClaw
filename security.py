@@ -8,9 +8,14 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 from cryptography.fernet import Fernet
 from jose import jwt, JWTError
+
+try:
+    import bcrypt
+except ImportError:
+    bcrypt = None  # type: ignore[assignment]
+
+# Fallback when bcrypt not available (e.g. passlib only)
 from passlib.context import CryptContext
-
-
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 
@@ -34,13 +39,26 @@ class SecurityManager:
         """Decrypt sensitive data"""
         return self._fernet.decrypt(encrypted.encode()).decode()
 
+    def _password_bytes_72(self, password: str) -> bytes:
+        """Truncate password to 72 bytes for bcrypt (required by bcrypt 4+)."""
+        return password.encode("utf-8")[:72]
+
     def hash_password(self, password: str) -> str:
-        """Hash a password"""
-        return pwd_context.hash(password)
+        """Hash a password. Bcrypt limits input to 72 bytes; longer passwords are truncated."""
+        pwd_bytes = self._password_bytes_72(password)
+        if bcrypt is not None:
+            return bcrypt.hashpw(pwd_bytes, bcrypt.gensalt()).decode("ascii")
+        return pwd_context.hash(pwd_bytes.decode("utf-8", errors="replace"))
 
     def verify_password(self, password: str, hashed: str) -> bool:
-        """Verify a password against its hash"""
-        return pwd_context.verify(password, hashed)
+        """Verify a password against its hash. Uses same 72-byte truncation as hash_password."""
+        pwd_bytes = self._password_bytes_72(password)
+        if bcrypt is not None:
+            try:
+                return bcrypt.checkpw(pwd_bytes, hashed.encode("ascii"))
+            except Exception:
+                return False
+        return pwd_context.verify(pwd_bytes.decode("utf-8", errors="replace"), hashed)
 
     def create_jwt_token(
         self, data: dict, expires_delta: Optional[timedelta] = None

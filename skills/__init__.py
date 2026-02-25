@@ -5,6 +5,8 @@ from .registry import (
     SKILL_REGISTRY,
     get_available_skills,
     get_skill,
+    get_skill_version,
+    check_skill_update,
     load_user_skills,
     save_user_skills,
 )
@@ -14,6 +16,8 @@ __all__ = [
     "SKILL_REGISTRY",
     "get_available_skills",
     "get_skill",
+    "get_skill_version",
+    "check_skill_update",
     "load_user_skills",
     "save_user_skills",
 ]

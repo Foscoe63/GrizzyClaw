@@ -50,6 +50,8 @@ class WorkspaceConfig:
     inter_agent_channel: Optional[str] = None  # Optional channel; only workspaces on same channel can message each other
     proactive_habits: bool = False
     proactive_screen: bool = False
+    proactive_autonomy: bool = False  # Continuous background loop for predictive prep and tasks
+    proactive_autonomy_interval_minutes: int = 15  # How often the autonomy loop runs (5, 15, 30)
     proactive_file_triggers: bool = False  # Trigger on file changes / Git events (see triggers.json)
     use_shared_memory: bool = False
     swarm_role: str = "none"

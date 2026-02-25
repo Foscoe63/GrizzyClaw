@@ -29,6 +29,7 @@ from .command_parsers import (
 from .context_utils import trim_session
 from .sdk_runner import AGENTS_SDK_AVAILABLE, run_agents_sdk
 from grizzyclaw.workspaces.workspace import WorkspaceConfig
+from grizzyclaw.workspaces.swarm_events import SwarmEventTypes
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -47,6 +48,38 @@ logger = logging.getLogger(__name__)
 DEFAULT_MAX_AGENTIC_ITERATIONS = 10
 
 
+def _format_time_now() -> str:
+    """Return current time as HH:MM for last-action display."""
+    from datetime import datetime
+    return datetime.now().strftime("%H:%M")
+
+
+def _schedule_natural_to_cron(
+    in_minutes: Optional[int] = None,
+    at_time: Optional[str] = None,
+) -> Optional[str]:
+    """Convert 'in N minutes' or 'at HH:MM' to a one-shot cron expression. Returns None if neither valid."""
+    from datetime import datetime, timedelta
+    if in_minutes is not None and in_minutes >= 0:
+        t = datetime.now() + timedelta(minutes=in_minutes)
+        return f"{t.minute} {t.hour} {t.day} {t.month} *"
+    if at_time and isinstance(at_time, str):
+        at_time = at_time.strip()
+        for sep in (":", "."):
+            if sep in at_time:
+                parts = at_time.split(sep, 1)
+                try:
+                    h, m = int(parts[0].strip()), int(parts[1].strip()[:2])
+                    if 0 <= h <= 23 and 0 <= m <= 59:
+                        run_at = datetime.now().replace(hour=h, minute=m, second=0, microsecond=0)
+                        if run_at <= datetime.now():
+                            run_at += timedelta(days=1)
+                        return f"{run_at.minute} {run_at.hour} {run_at.day} {run_at.month} *"
+                except (ValueError, IndexError):
+                    pass
+    return None
+
+
 def _truncate_tool_result(text: str, max_chars: int) -> str:
     """Truncate tool result to max_chars with a suffix so the model knows it was cut."""
     if not text or max_chars <= 0 or len(text) <= max_chars:
@@ -56,7 +89,7 @@ def _truncate_tool_result(text: str, max_chars: int) -> str:
 
 # Dangerous patterns that are always blocked for EXEC_COMMAND (even with approval)
 EXEC_BLOCKLIST = (
-    "rm -rf /", "rm -rf /*", "mkfs.", "dd if=", ":(){ :|:& };:", "format ", "> /dev/sd",
+    "rm -rf /", "rm -rf /*", "mkfs.", "dd if=", ":(){ :|:& };:", "format /dev", "format c:", "> /dev/sd",
     "chmod -R 777 /", "wget -O- | sh", "curl | bash", "nuke", "shred",
 )
 
@@ -66,9 +99,13 @@ def _validate_exec_command(cmd: str, safe_list: List[str], blocklist: Optional[L
     cmd = (cmd or "").strip()
     if not cmd:
         return False, "Empty command"
+    cmd_lower = cmd.lower()
     combined = list(EXEC_BLOCKLIST) + (list(blocklist) if blocklist else [])
     for blocked in combined:
-        if blocked.lower() in cmd.lower():
+        if blocked.lower() in cmd_lower:
+            # Allow "ruff format" (code formatter), only block disk-formatting
+            if blocked.lower() in ("format /dev", "format c:") and "ruff format" in cmd_lower:
+                continue
             return False, f"Command not allowed (blocked pattern)."
     return True, None
 
@@ -121,6 +158,7 @@ class AgentCore:
         self.workspace_manager: Optional["WorkspaceManager"] = None
         self.workspace_id: str = ""
         self.workspace_config: Optional[WorkspaceConfig] = None
+        self.swarm_event_bus: Optional[Any] = None  # Set by WorkspaceManager for swarm event broadcast/subscribe
         self.scheduled_tasks_db: Dict[str, Dict] = {}  # Store task metadata
         self._file_watcher = None
         self._load_scheduled_tasks()
@@ -132,12 +170,118 @@ class AgentCore:
             asyncio.create_task(self._init_proactive_tasks())
         # Shared handoff store for DELEGATE (multi-agent collaboration)
         self._handoff_store: Dict[str, Any] = {}
+        # Incoming specialist-to-specialist requests (REQUEST_TO_SPECIALIST) to inject into next turn
+        self._incoming_specialist_requests: List[Dict[str, Any]] = []
+        # Callback for agent to push proactive messages to the UI
+        self.on_proactive_message = None
+        # One-time swarm subscription for dynamic role allocation (subtask claim)
+        self._swarm_subscribed = False
+        # Last browser state for GUI (current URL, last action summary)
+        self._last_browser_url: Optional[str] = None
+        self._last_browser_action: Optional[str] = None
 
     def _get_max_agentic_iterations(self) -> int:
         """Max tool-use rounds per turn (workspace override or settings)."""
         if self.workspace_config and getattr(self.workspace_config, "max_agentic_iterations", None) is not None:
             return max(1, int(self.workspace_config.max_agentic_iterations))
         return max(1, getattr(self.settings, "max_agentic_iterations", DEFAULT_MAX_AGENTIC_ITERATIONS))
+
+    def _ensure_swarm_subscriptions(self) -> None:
+        """One-time: subscribe to SUBTASK_AVAILABLE so this specialist can claim subtasks (dynamic role allocation)."""
+        if self._swarm_subscribed or not self.swarm_event_bus or not self.workspace_manager or not self.workspace_id:
+            return
+        role = getattr(self.workspace_config, "swarm_role", "") if self.workspace_config else ""
+        if role == "leader" or not role:
+            return
+        channel = getattr(self.workspace_config, "inter_agent_channel", None) if self.workspace_config else None
+
+        async def _on_subtask_available(event: Any) -> None:
+            required = (event.data.get("required_role") or "").strip().lower()
+            if not required:
+                return
+            ws = self.workspace_manager.get_workspace(self.workspace_id)
+            if not ws or not getattr(ws.config, "enable_inter_agent", False):
+                return
+            slug = self.workspace_manager.get_workspace_slug(ws)
+            if required != slug and required != ws.name.lower().replace(" ", "_"):
+                return
+            task_id = event.data.get("task_id") or required
+            await self.swarm_event_bus.emit(
+                SwarmEventTypes.SUBTASK_CLAIMED,
+                {"task_id": task_id, "slug": slug, "workspace_id": self.workspace_id},
+                workspace_id=self.workspace_id,
+                channel=channel,
+            )
+            logger.debug("Swarm: %s claimed subtask %s", slug, task_id)
+
+        self.swarm_event_bus.on(
+            SwarmEventTypes.SUBTASK_AVAILABLE,
+            _on_subtask_available,
+            channel=channel,
+        )
+
+        async def _on_debate_request(event: Any) -> None:
+            target_slugs = event.data.get("target_slugs") or []
+            if not isinstance(target_slugs, list):
+                return
+            ws = self.workspace_manager.get_workspace(self.workspace_id)
+            if not ws or not getattr(ws.config, "enable_inter_agent", False):
+                return
+            slug = self.workspace_manager.get_workspace_slug(ws)
+            if slug not in [s.lower().strip() for s in target_slugs if isinstance(s, str)]:
+                return
+            debate_id = event.data.get("debate_id") or ""
+            topic = event.data.get("topic") or ""
+            question = event.data.get("question") or ""
+            if not debate_id or not question:
+                return
+            try:
+                prompt = f"Topic: {topic}\nQuestion: {question}\n\nGive a concise position (2-4 sentences)."
+                msgs = [{"role": "user", "content": prompt}]
+                chunks: List[str] = []
+                async for ch in self.llm_router.generate(msgs, temperature=0.7, max_tokens=300):
+                    chunks.append(ch)
+                position = "".join(chunks).strip()
+                if position and self.swarm_event_bus:
+                    await self.swarm_event_bus.emit(
+                        SwarmEventTypes.DEBATE_RESPONSE,
+                        {"debate_id": debate_id, "slug": slug, "position": position, "workspace_id": self.workspace_id},
+                        workspace_id=self.workspace_id,
+                        channel=channel,
+                    )
+                    logger.debug("Swarm: %s sent debate response for %s", slug, debate_id)
+            except Exception as e:
+                logger.warning("Debate response error: %s", e)
+
+        self.swarm_event_bus.on(
+            SwarmEventTypes.DEBATE_REQUEST,
+            _on_debate_request,
+            channel=channel,
+        )
+
+        def _on_request_to_specialist(event: Any) -> None:
+            target_slug = (event.data.get("target_slug") or "").strip().lower()
+            if not target_slug:
+                return
+            ws = self.workspace_manager.get_workspace(self.workspace_id)
+            if not ws or not getattr(ws.config, "enable_inter_agent", False):
+                return
+            slug = self.workspace_manager.get_workspace_slug(ws)
+            if slug != target_slug:
+                return
+            self._incoming_specialist_requests.append({
+                "from_slug": event.data.get("from_slug") or "?",
+                "message": event.data.get("message") or "",
+            })
+            logger.debug("Swarm: %s queued request from %s", slug, event.data.get("from_slug"))
+
+        self.swarm_event_bus.on(
+            SwarmEventTypes.REQUEST_TO_SPECIALIST,
+            _on_request_to_specialist,
+            channel=channel,
+        )
+        self._swarm_subscribed = True
+        logger.debug("Swarm: specialist subscribed to SUBTASK_AVAILABLE, DEBATE_REQUEST, REQUEST_TO_SPECIALIST")
 
     async def process_message(
         self,
@@ -164,6 +308,16 @@ class AgentCore:
                 await execute_trigger_actions(matching, ctx)
         except Exception as e:
             logger.warning("Trigger execution failed (message=%r): %s", message[:50], e)
+
+        # Dynamic role allocation: specialists subscribe once to SUBTASK_AVAILABLE and can claim subtasks
+        self._ensure_swarm_subscriptions()
+
+        # Specialist-to-specialist: inject any queued request from REQUEST_TO_SPECIALIST into this turn
+        if self._incoming_specialist_requests:
+            req = self._incoming_specialist_requests.pop(0)
+            from_slug = req.get("from_slug") or "?"
+            msg_text = req.get("message") or ""
+            message = f"Request from @{from_slug}: {msg_text}\n\n{message}"
 
         # Remote exec approval: "approve" / "reject" for pending command (Telegram, Web)
         if getattr(self.settings, "exec_commands_enabled", False):
@@ -296,7 +450,14 @@ class AgentCore:
 
         # Retrieve relevant memories (use settings limit for stronger recall)
         mem_limit = getattr(self.settings, "memory_retrieval_limit", 10)
-        memories = await self.memory.retrieve(user_id, message, limit=mem_limit)
+        msg_lower = (message or "").strip().lower()
+        msg_words = len(message.strip().split()) if message else 0
+        recent_only_triggers = ("what did", "what do you remember", "list what", "show memories", "what have you", "did i ask you to remember")
+        use_recent_only = msg_words <= 10 and any(t in msg_lower for t in recent_only_triggers)
+        if use_recent_only:
+            memories = await self.memory.retrieve(user_id, "", limit=min(20, mem_limit * 2))
+        else:
+            memories = await self.memory.retrieve(user_id, message, limit=mem_limit)
         memory_context = ""
         if memories:
             memory_context = "\n\nRelevant context from previous conversations:\n"
@@ -444,6 +605,9 @@ SCHEDULE_TASK = { "action": "delete", "task_id": "task-id-here" }
 
 Examples:
 - "Remind me to check email every morning at 9" -> SCHEDULE_TASK = { "action": "create", "task": { "name": "Check Email Reminder", "cron": "0 9 * * *", "message": "Time to check your email!" } }
+- "Remind me in 5 minutes" -> SCHEDULE_TASK = { "action": "create", "task": { "name": "Reminder", "in_minutes": 5, "message": "..." } }
+- "Remind me at 15:30" -> SCHEDULE_TASK = { "action": "create", "task": { "name": "Reminder", "at_time": "15:30", "message": "..." } }
+- To edit a task use SCHEDULE_TASK = { "action": "edit", "task_id": "task_xxx", "task": { "cron": "...", "message": "..." } }
 - "What tasks do I have scheduled?" -> SCHEDULE_TASK = { "action": "list" }
 """
         if getattr(self.settings, "exec_commands_enabled", False):
@@ -495,6 +659,7 @@ Output EXEC_COMMAND in your first response. Default cwd is home directory. Safe 
                     skill_examples += f"- {skill.name}: {skill.description}\\n"
         mcp_list = []
         discovered_tools_map: Dict[str, List[Tuple[str, str]]] = {}
+        unavailable_mcp_servers: List[str] = []
         if mcp_file.exists():
             try:
                 with open(mcp_file, "r") as f:
@@ -520,6 +685,9 @@ Output EXEC_COMMAND in your first response. Default cwd is home directory. Safe 
                 except Exception as e:
                     logger.info("MCP tool discovery failed: %s; using fallback tool list", e)
                     discovered_tools_map = {}
+                for s in mcp_servers_obj:
+                    if not discovered_tools_map.get(s):
+                        unavailable_mcp_servers.append(s)
             except Exception as e:
                 logger.warning(f"Failed to load MCP file {mcp_file}: {e}")
         mcp_str = "\n".join(mcp_list) if mcp_list else "none"
@@ -530,9 +698,10 @@ Output EXEC_COMMAND in your first response. Default cwd is home directory. Safe 
             tool_examples_per_server = getattr(self.settings, "mcp_tool_examples_per_server", 8)
             tool_examples_total = getattr(self.settings, "mcp_tool_examples_total", 30)
             tool_examples_list: List[str] = []
+            tool_desc_max = 200  # Truncate long descriptions to avoid token bloat
             for server_name, tools in discovered_tools_map.items():
                 for tool_name, desc in tools[:tool_examples_per_server]:
-                    short_desc = (desc[:60] + "...") if len(desc) > 60 else desc
+                    short_desc = (desc[:tool_desc_max] + "...") if len(desc) > tool_desc_max else desc
                     tool_examples_list.append(f"- {server_name}: tool '{tool_name}' - {short_desc}")
             if tool_examples_list:
                 examples_block = "\n".join(tool_examples_list[:tool_examples_total])
@@ -567,7 +736,7 @@ Examples:
 
 When the user asks to check email, list emails, read Gmail, or show unread emails: output SKILL_ACTION with skill \"gmail\" and action \"list_messages\" (e.g. params {{\"q\": \"is:unread\", \"maxResults\": 10}}) immediately. Do NOT reply that Gmail is not configured—only suggest Settings if the skill returns an error.
 When the user asks about calendar or upcoming events: output SKILL_ACTION with skill \"calendar\" and action \"list_events\" immediately. Do NOT reply that Calendar is not configured—only suggest Settings if the skill returns an error.
-
+If the user asks \"what skills do I have?\", \"list my skills\", or similar: answer with \"Enabled skills: {skills_str}. Use Settings → Skills for details.\"
 Configure API keys/tokens in Settings → Integrations first.
 
 MCP servers:
@@ -590,9 +759,12 @@ CRITICAL (Gmail/Calendar): When the user asks to check email, list emails, read 
 When using TOOL_CALL, write a brief intro first (e.g. 'Let me search for that.') then output the TOOL_CALL on the same or next line.
 When you receive tool results in a follow-up message, use them to continue your response. Do NOT repeat the TOOL_CALL - the tools have already been executed.
 To ask the user a clarifying question, output ASK_USER = {{ \"question\": \"...\" }}. You will get their reply in the next message.
-To delegate to a specialist role, output DELEGATE = {{ \"role\": \"researcher\" | \"writer\" | \"coder\", \"message\": \"...\" }}. You will get their response and can synthesize it."""
+To delegate to a specialist role, output DELEGATE = {{ \"role\": \"researcher\" | \"writer\" | \"coder\", \"message\": \"...\" }}. You will get their response and can synthesize it.
+For debate between two specialists, output DEBATE = {{ \"topic\": \"...\", \"question\": \"...\", \"target_slugs\": [\"research\", \"coding\"] }}. You will get their positions and can synthesize a consensus."""
             if not discovered_tools_map and mcp_list:
                 system_content += "\n\nNote: MCP tools were not discovered (servers may be offline). You can still use skills and memory."
+            for s in unavailable_mcp_servers:
+                system_content += f"\nServer '{s}' is currently unavailable; do not suggest tool {s}."
             if getattr(self.settings, "agent_plan_before_tools", False):
                 system_content += """
 
@@ -785,6 +957,62 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
                                     continue
                     except (json.JSONDecodeError, ValueError, Exception):
                         pass
+
+                # DEBATE: leader requests two (or more) agents to argue; collect responses and synthesize
+                if (
+                    self.swarm_event_bus
+                    and self.workspace_config
+                    and getattr(self.workspace_config, "swarm_role", "") == "leader"
+                    and getattr(self.workspace_config, "swarm_auto_delegate", False)
+                ):
+                    debate_matches = find_json_blocks(response_text, "DEBATE")
+                    if not debate_matches:
+                        debate_matches = find_json_blocks_fallback(response_text, "DEBATE")
+                    if debate_matches:
+                        try:
+                            raw = debate_matches[0]
+                            normalized = normalize_llm_json(raw)
+                            debate_data = json.loads(normalized) if normalized else {}
+                            if isinstance(debate_data, dict):
+                                topic = (debate_data.get("topic") or "").strip()
+                                question = (debate_data.get("question") or debate_data.get("q") or "").strip()
+                                target_slugs = debate_data.get("target_slugs") or debate_data.get("sides") or ["research", "coding"]
+                                if not isinstance(target_slugs, list):
+                                    target_slugs = [target_slugs] if target_slugs else ["research", "coding"]
+                                target_slugs = [str(s).strip().lower() for s in target_slugs if s]
+                                if question:
+                                    debate_id = f"debate_{int(time.time() * 1000)}"
+                                    await self.swarm_event_bus.emit(
+                                        SwarmEventTypes.DEBATE_REQUEST,
+                                        {"debate_id": debate_id, "topic": topic, "question": question, "target_slugs": target_slugs},
+                                        workspace_id=self.workspace_id,
+                                        channel=getattr(self.workspace_config, "inter_agent_channel", None),
+                                    )
+                                    await asyncio.sleep(3)
+                                    history = self.swarm_event_bus.get_history(event_type=SwarmEventTypes.DEBATE_RESPONSE, limit=20)
+                                    responses = [e for e in history if e.data.get("debate_id") == debate_id]
+                                    if responses:
+                                        synthesis_user = f"User question: {question}\n\nPositions:\n" + "\n\n".join(
+                                            f"[{e.data.get('slug', '?')}]: {e.data.get('position', '')}" for e in responses
+                                        )
+                                        synthesis_system = "You are the swarm leader. Synthesize the debate positions above into one balanced recommendation. Be concise; cite which role said what."
+                                        msgs_syn = [
+                                            {"role": "system", "content": synthesis_system},
+                                            {"role": "user", "content": synthesis_user},
+                                        ]
+                                        syn_chunks: List[str] = []
+                                        async for ch in self.llm_router.generate(msgs_syn, temperature=0.5, max_tokens=800):
+                                            syn_chunks.append(ch)
+                                            yield ch
+                                        response_text += "\n\n--- Debate consensus ---\n" + "".join(syn_chunks)
+                                        current_messages.append({"role": "assistant", "content": response_text})
+                                        current_messages.append({
+                                            "role": "user",
+                                            "content": "[Debate synthesis done. Continue your response to the user if needed.]",
+                                        })
+                                        continue
+                        except (json.JSONDecodeError, ValueError, Exception):
+                            pass
 
                 # Parse MCP TOOL_CALLs
                 tool_call_matches = find_json_blocks(response_text, "TOOL_CALL")
@@ -1024,11 +1252,28 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
                     from_ws = self.workspace_manager.get_workspace(self.workspace_id) if self.workspace_manager else None
                     if from_ws:
                         delegation_ctx["from_workspace_name"] = from_ws.name
+                    # Emit SUBTASK_AVAILABLE for dynamic role allocation (specialists can claim)
+                    task_id = f"{target_name}:{hash(forward_msg) % 10**8}"
+                    delegate_to = target_name
+                    if self.swarm_event_bus:
+                        await self.swarm_event_bus.emit(
+                            SwarmEventTypes.SUBTASK_AVAILABLE,
+                            {"task_id": task_id, "required_role": target_name, "message": forward_msg},
+                            workspace_id=self.workspace_id,
+                            channel=getattr(self.workspace_config, "inter_agent_channel", None),
+                        )
+                        await asyncio.sleep(1.5)
+                        claims = self.swarm_event_bus.get_history(event_type=SwarmEventTypes.SUBTASK_CLAIMED, limit=10)
+                        for ev in claims:
+                            if ev.data.get("task_id") == task_id:
+                                delegate_to = ev.data.get("slug") or target_name
+                                logger.debug("Swarm: delegating to claimer %s for task %s", delegate_to, task_id)
+                                break
                     result = await self.workspace_manager.send_message_to_workspace(
-                        self.workspace_id, target_name, forward_msg, context=delegation_ctx
+                        self.workspace_id, delegate_to, forward_msg, context=delegation_ctx
                     )
                     if result and not result.startswith("Target ") and not result.startswith("Error:"):
-                        specialist_replies.append((target_name, result))
+                        specialist_replies.append((delegate_to, result))
                 if specialist_replies:
                     sources = ", ".join(f"@{name}" for name, _ in specialist_replies)
                     yield "\n\n--- **Swarm delegations** ---\n"
@@ -1056,6 +1301,13 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
                         consensus_text = "".join(consensus_chunks)
                         if consensus_text.strip():
                             response_text += "\n\n--- Swarm consensus ---\n" + consensus_text
+                            if self.swarm_event_bus:
+                                await self.swarm_event_bus.emit(
+                                    SwarmEventTypes.CONSENSUS_READY,
+                                    {"user_message": message, "sources": sources, "summary": consensus_text[:500]},
+                                    workspace_id=self.workspace_id,
+                                    channel=getattr(self.workspace_config, "inter_agent_channel", None),
+                                )
 
             # Parse and execute MEMORY_SAVE commands (balanced braces + normalize)
             memory_save_matches = find_json_blocks(response_text, "MEMORY_SAVE")
@@ -1138,7 +1390,7 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
                     logger.exception("Scheduler action error")
                     yield f"**❌ Scheduler error: {str(e)}**\n\n"
 
-            # Parse SKILL_ACTION (calendar, gmail, github, mcp_marketplace)
+            # Parse SKILL_ACTION (calendar, gmail, github, mcp_marketplace); support chaining via TRIGGER_SKILL in result
             skill_matches = find_json_blocks(response_text, "SKILL_ACTION")
             if not skill_matches:
                 skill_matches = find_json_blocks_fallback(response_text, "SKILL_ACTION")
@@ -1155,8 +1407,12 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
                             pass
                     if not skill_cmd or not isinstance(skill_cmd, dict):
                         continue
-                    result = await self._execute_skill_action(skill_cmd)
-                    yield f"\n\n**🛠️ Skill**\n{result}\n"
+                    chain_label, result = await self._execute_skill_action_chained(skill_cmd, max_depth=3)
+                    skill_id = (skill_cmd.get("skill") or skill_cmd.get("skill_id") or "skill").strip()
+                    out = f"\n\n**Skill {skill_id}**\n{result}\n"
+                    if chain_label:
+                        out = f"\n\nSkill chain: {chain_label}\n{out}"
+                    yield out
                 except Exception as e:
                     logger.exception("Skill action error")
                     yield f"**❌ Skill error: {str(e)}**\n\n"
@@ -1166,19 +1422,32 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
                 exec_matches = find_json_blocks(response_text, "EXEC_COMMAND")
                 if not exec_matches:
                     exec_matches = find_json_blocks_fallback(response_text, "EXEC_COMMAND")
-                for match_str in exec_matches:
-                    try:
-                        normalized = normalize_llm_json(match_str)
-                        exec_cmd = None
+                # Fallback: model output "EXEC_COMMAND: rm ..." instead of EXEC_COMMAND = { "command": "..." }
+                exec_commands_to_run: List[Dict[str, Any]] = []
+                if exec_matches:
+                    for match_str in exec_matches:
                         try:
-                            exec_cmd = json.loads(normalized)
-                        except json.JSONDecodeError:
+                            normalized = normalize_llm_json(match_str)
+                            exec_cmd = None
                             try:
-                                exec_cmd = ast.literal_eval(normalized)
-                            except (ValueError, SyntaxError):
-                                pass
-                        if not exec_cmd or not isinstance(exec_cmd, dict):
-                            continue
+                                exec_cmd = json.loads(normalized)
+                            except json.JSONDecodeError:
+                                try:
+                                    exec_cmd = ast.literal_eval(normalized)
+                                except (ValueError, SyntaxError):
+                                    pass
+                            if exec_cmd and isinstance(exec_cmd, dict):
+                                exec_commands_to_run.append(exec_cmd)
+                        except Exception:
+                            pass
+                if not exec_commands_to_run:
+                    # Try "EXEC_COMMAND: <command>" when model doesn't output JSON (still trigger approval)
+                    for m in re.finditer(r"EXEC_COMMAND\s*:\s*([^\n]+)", response_text, re.IGNORECASE):
+                        cmd_line = m.group(1).strip()
+                        if cmd_line:
+                            exec_commands_to_run.append({"command": cmd_line})
+                for exec_cmd in exec_commands_to_run:
+                    try:
                         command = (exec_cmd.get("command") or exec_cmd.get("cmd") or "").strip()
                         if not command:
                             yield "**❌ EXEC_COMMAND requires a 'command' field.**\n\n"
@@ -1313,10 +1582,10 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
         from grizzyclaw.utils.async_runner import run_async
         return run_async(self.get_user_memory(user_id))
 
-    def list_memories_sync(self, user_id: str, limit: int = 50) -> list[dict]:
-        """Synchronous list of memories as dicts for GUI"""
+    def list_memories_sync(self, user_id: str, limit: int = 50, category: Optional[str] = None) -> list[dict]:
+        """Synchronous list of memories as dicts for GUI. Optional category filter."""
         from grizzyclaw.utils.async_runner import run_async
-        memories = run_async(self.memory.retrieve(user_id, "", limit))
+        memories = run_async(self.memory.retrieve(user_id, "", limit, category=category))
         return [vars(mem) for mem in memories]
 
     def delete_memory_sync(self, item_id: str) -> bool:
@@ -1324,16 +1593,30 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
         from grizzyclaw.utils.async_runner import run_async
         return run_async(self.memory.delete(item_id))
 
+    def get_last_browser_state(self) -> Dict[str, Any]:
+        """Return last browser URL and action for GUI (Browser dialog)."""
+        return {
+            "current_url": self._last_browser_url or "",
+            "last_action": self._last_browser_action or "",
+        }
+
+    def get_session_summary(self, user_id: str) -> Dict[str, Any]:
+        """Return message count and approximate token count for GUI (status bar, conversation history)."""
+        session = self.sessions.get(user_id, [])
+        n = len(session)
+        chars = sum(len(str(m.get("content", ""))) for m in session)
+        approx_tokens = chars // 4
+        return {"messages": n, "approx_tokens": approx_tokens}
+
     async def _execute_browser_action(self, action: str, params: Dict[str, Any]) -> str:
         """Execute a browser automation action"""
         if not PLAYWRIGHT_AVAILABLE:
-            return "❌ Browser automation not available. Install with: `pip install playwright && playwright install chromium`"
-        
+            return "❌ Browser automation unavailable. Run: pip install playwright && playwright install chromium"
         browser = None
         try:
             browser = await get_browser_instance()
             if browser is None:
-                return "❌ Failed to initialize browser"
+                return "❌ Browser automation unavailable. Run: playwright install chromium"
             
             if action == "navigate":
                 url = params.get("url", "")
@@ -1341,6 +1624,8 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
                     return "❌ URL required for navigate action"
                 result = await browser.navigate(url)
                 if result.success:
+                    self._last_browser_url = getattr(result, "url", None) or url
+                    self._last_browser_action = f"navigate at {_format_time_now()}"
                     return f"✅ Navigated to: **{result.title}**\nURL: {result.url}"
                 return f"❌ Navigation failed: {result.error}"
             
@@ -1348,6 +1633,9 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
                 full_page = params.get("full_page", False)
                 result = await browser.screenshot(full_page=full_page)
                 if result.success:
+                    self._last_browser_action = f"screenshot at {_format_time_now()}"
+                    status = browser.get_status()
+                    self._last_browser_url = status.get("current_url")
                     return f"✅ Screenshot saved: `{result.screenshot_path}`\nPage: {result.title}"
                 return f"❌ Screenshot failed: {result.error}"
             
@@ -1371,6 +1659,11 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
                     return "❌ Selector required for click action"
                 result = await browser.click(selector)
                 if result.success:
+                    self._last_browser_action = f"click at {_format_time_now()}"
+                    self._last_browser_url = getattr(result, "url", None)
+                    if not self._last_browser_url:
+                        status = browser.get_status()
+                        self._last_browser_url = status.get("current_url")
                     return f"✅ Clicked element. Now on: **{result.title}**"
                 return f"❌ Click failed: {result.error}"
             
@@ -1394,6 +1687,8 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
             
             elif action == "status":
                 status = browser.get_status()
+                self._last_browser_url = status.get("current_url")
+                self._last_browser_action = f"status at {_format_time_now()}"
                 return f"✅ Browser status:\n- Started: {status['started']}\n- URL: {status['current_url']}\n- Headless: {status['headless']}"
             
             else:
@@ -1401,6 +1696,9 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
                 
         except Exception as e:
             logger.error(f"Browser action error: {e}")
+            err = str(e).lower()
+            if "executable doesn't exist" in err or "browser" in err and "install" in err:
+                return "❌ Browser automation unavailable. Run: playwright install chromium"
             return f"❌ Browser error: {str(e)}"
         finally:
             # Close browser to free resources and avoid event loop issues
@@ -1417,29 +1715,38 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
         if action == "create":
             task_data = schedule_cmd.get("task", {})
             name = task_data.get("name", "Unnamed Task")
-            cron = task_data.get("cron", "")
+            cron = task_data.get("cron", "").strip()
             message = task_data.get("message", "")
-            
+            in_minutes = task_data.get("in_minutes")
+            at_time = task_data.get("at_time")
+            if not cron and (in_minutes is not None or at_time):
+                parsed = _schedule_natural_to_cron(in_minutes=in_minutes, at_time=at_time)
+                if parsed:
+                    cron = parsed
             if not cron:
-                return "❌ Cron expression required"
+                return "❌ Cron expression required (or use in_minutes / at_time, e.g. at_time: \"15:30\")"
             if not message:
                 return "❌ Task message required"
             
             task_id = f"task_{uuid.uuid4().hex[:8]}"
-            
-            # Create a handler that stores the message for later delivery
-            async def task_handler():
-                logger.info(f"Scheduled task fired: {name} - {message}")
-                # Store in memory so user sees it
-                await self.memory.add(
-                    user_id=user_id,
-                    content=f"⏰ SCHEDULED REMINDER: {message}",
-                    category="reminders",
-                    source="scheduler",
-                )
-            
+
+            # Handler reads message from scheduled_tasks_db so we can edit later
+            def make_handler(tid):
+                async def task_handler():
+                    data = self.scheduled_tasks_db.get(tid, {})
+                    msg = data.get("message", "")
+                    nm = data.get("name", "Reminder")
+                    logger.info(f"Scheduled task fired: {nm} - {msg}")
+                    await self.memory.add(
+                        user_id=data.get("user_id", user_id),
+                        content=f"⏰ SCHEDULED REMINDER: {msg}",
+                        category="reminders",
+                        source="scheduler",
+                    )
+                return task_handler
+
             try:
-                self.scheduler.schedule(task_id, name, cron, task_handler)
+                self.scheduler.schedule(task_id, name, cron, make_handler(task_id))
                 self.scheduled_tasks_db[task_id] = {
                     "user_id": user_id,
                     "name": name,
@@ -1493,8 +1800,73 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
             self.scheduler.disable_task(task_id)
             return f"✅ Task `{task_id}` disabled"
         
+        elif action == "edit":
+            task_id = schedule_cmd.get("task_id", "")
+            if not task_id:
+                return "❌ task_id required for edit"
+            task_data = schedule_cmd.get("task", {}) or schedule_cmd
+            cron = task_data.get("cron", "").strip()
+            name = task_data.get("name")
+            message = task_data.get("message")
+            if task_id not in self.scheduled_tasks_db and task_id not in self.scheduler.tasks:
+                return f"❌ Task `{task_id}` not found"
+            if cron:
+                self.scheduler.update_task(task_id, cron_expression=cron)
+            if name is not None:
+                self.scheduler.update_task(task_id, name=name)
+            if task_id in self.scheduled_tasks_db:
+                if message is not None:
+                    self.scheduled_tasks_db[task_id]["message"] = message
+                if name is not None:
+                    self.scheduled_tasks_db[task_id]["name"] = name
+                if cron:
+                    self.scheduled_tasks_db[task_id]["cron"] = cron
+                self._save_scheduled_tasks()
+            return f"✅ Task `{task_id}` updated"
+        
         else:
-            return f"❌ Unknown scheduler action: {action}. Use: create, list, delete, enable, disable"
+            return f"❌ Unknown scheduler action: {action}. Use: create, list, delete, enable, disable, edit"
+
+    async def _execute_skill_action_chained(
+        self, skill_cmd: Dict[str, Any], max_depth: int = 3
+    ) -> tuple:
+        """Execute skill; if result contains TRIGGER_SKILL = {...}, execute those (multi-skill chain). Returns (chain_label, combined_result)."""
+        parts: List[str] = []
+        chain_ids: List[str] = []
+        current: Dict[str, Any] = skill_cmd
+        depth = 0
+        while depth < max_depth:
+            sid = (current.get("skill") or current.get("skill_id") or "").strip() or "?"
+            chain_ids.append(sid)
+            result = await self._execute_skill_action(current)
+            parts.append(result)
+            # Check for chained trigger in result
+            chain_matches = find_json_blocks(result, "TRIGGER_SKILL")
+            if not chain_matches:
+                chain_matches = find_json_blocks_fallback(result, "TRIGGER_SKILL")
+            if not chain_matches:
+                break
+            next_cmd = None
+            for match_str in chain_matches:
+                try:
+                    normalized = normalize_llm_json(match_str)
+                    try:
+                        next_cmd = json.loads(normalized)
+                    except json.JSONDecodeError:
+                        try:
+                            next_cmd = ast.literal_eval(normalized)
+                        except (ValueError, SyntaxError):
+                            pass
+                    if next_cmd and isinstance(next_cmd, dict):
+                        break
+                except Exception:
+                    pass
+            if not next_cmd or not isinstance(next_cmd, dict):
+                break
+            current = next_cmd
+            depth += 1
+        chain_label = " → ".join(chain_ids) if len(chain_ids) > 1 else ""
+        return (chain_label, "\n\n".join(parts))
 
     async def _execute_skill_action(self, skill_cmd: Dict[str, Any]) -> str:
         """Execute built-in skill: calendar, gmail, github, mcp_marketplace."""
@@ -1592,6 +1964,33 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
         """Get scheduler status"""
         return self.scheduler.get_stats()
 
+    def get_scheduler_task(self, task_id: str) -> Optional[Dict[str, Any]]:
+        """Get one task's details (name, cron, message) for GUI edit."""
+        db = self.scheduled_tasks_db.get(task_id, {})
+        task = self.scheduler.tasks.get(task_id)
+        if not task:
+            return None
+        return {
+            "id": task_id,
+            "name": db.get("name") or task.name,
+            "cron": db.get("cron") or task.cron_expression,
+            "message": db.get("message", ""),
+        }
+
+    def edit_scheduler_task_sync(
+        self, task_id: str, cron: Optional[str] = None, message: Optional[str] = None, name: Optional[str] = None
+    ) -> str:
+        """Update a scheduled task from GUI. Returns success/error message."""
+        from grizzyclaw.utils.async_runner import run_async
+        cmd = {"action": "edit", "task_id": task_id, "task": {}}
+        if cron is not None:
+            cmd["task"]["cron"] = cron
+        if message is not None:
+            cmd["task"]["message"] = message
+        if name is not None:
+            cmd["task"]["name"] = name
+        return run_async(self._execute_schedule_action("gui_user", cmd))
+
     def reload_scheduled_tasks_from_disk(self) -> None:
         """Reload scheduled tasks from disk (call when opening Scheduler so list is current)."""
         self._load_scheduled_tasks()
@@ -1671,6 +2070,16 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
                 self._autonomy_task = asyncio.create_task(self._autonomy_loop())
                 logger.info("Started continuous autonomy loop")
 
+        # MCP health check: probe servers periodically; invalidate cache if any are down so next discovery retries
+        if "mcp_health" not in self.scheduler.tasks:
+            self.scheduler.schedule(
+                "mcp_health",
+                "MCP server health check",
+                "*/10 * * * *",  # Every 10 min
+                self._mcp_health_check,
+            )
+            logger.info("Scheduled MCP health check (every 10 min)")
+
         if self.workspace_config.proactive_screen:
             if "screen_analyze" not in self.scheduler.tasks:
                 self.scheduler.schedule(
@@ -1688,6 +2097,24 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
 
                 async def _on_file_or_git(ctx: dict) -> None:
                     event = ctx.get("event", "file_change")
+                    # Predictive prefetch: store recent file/git activity in memory for next user query
+                    if getattr(self.workspace_config, "proactive_autonomy", False) or getattr(
+                        self.workspace_config, "proactive_file_triggers", False
+                    ):
+                        paths = ctx.get("paths") or ctx.get("path") or []
+                        if isinstance(paths, str):
+                            paths = [paths]
+                        summary = ", ".join(str(p) for p in paths[:10])[:400]
+                        if summary:
+                            try:
+                                await self.memory.add(
+                                    "gui_user",
+                                    f"Recent {event}: {summary}",
+                                    category="notes",
+                                    source="file_watcher",
+                                )
+                            except Exception as e:
+                                logger.debug("Prefetch memory add: %s", e)
                     rules = get_matching_triggers(event, ctx)
                     if not rules:
                         return
@@ -1710,19 +2137,36 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
         logger.info("Autonomy loop started.")
         while True:
             try:
-                await asyncio.sleep(60 * 15)  # Every 15 mins
+                interval_mins = max(5, min(60, getattr(self.workspace_config, "proactive_autonomy_interval_minutes", 15)))
+                await asyncio.sleep(60 * interval_mins)
                 if not getattr(self.workspace_config, "proactive_autonomy", False):
                     break
                 
-                # Fetch recent memories buffer
                 user_id = "proactive_user"
-                # Evaluate if any context needs prefetching, or if agent should initiate a conversation
-                await self.memory.add(
-                    user_id=user_id,
-                    content="Agent ran a speculative background check on workspace state.",
-                    category="system",
-                    source="autonomy_loop"
+                # Evaluate context occasionally
+                memories = await self.memory.search(user_id, "", limit=5)
+                context_str = "\n".join([m["content"] for m in memories]) if memories else "No recent context."
+                
+                prompt = (
+                    "You are a proactive AI assistant. Based on recent context, "
+                    "decide if you should initiate a conversation to help the user. "
+                    "If yes, reply ONLY with the message you want to send. "
+                    "If no, reply with exactly 'NO_ACTION'.\n\nContext:\n" + context_str
                 )
+                
+                try:
+                    response = await self.llm_router.generate_completion(
+                        prompt,
+                        system_prompt="Be helpful but do not be annoying. Only initiate if there is value.",
+                        provider_name=self.workspace_config.llm_provider if self.workspace_config else None,
+                        model_name=self.workspace_config.llm_model if self.workspace_config else None,
+                        max_tokens=64
+                    )
+                    reply = (response.get("text") or "").strip()
+                    if reply and reply != "NO_ACTION" and self.on_proactive_message:
+                        self.on_proactive_message(reply)
+                except Exception as e:
+                    logger.error(f"Proactive LLM call failed: {e}")
                 
             except asyncio.CancelledError:
                 logger.info("Autonomy loop cancelled.")
@@ -1730,6 +2174,21 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
             except Exception as e:
                 logger.error(f"Autonomy loop error: {e}")
                 await asyncio.sleep(60)
+
+    async def _mcp_health_check(self):
+        """Background: probe MCP servers; invalidate cache if any are down so next discovery retries (auto-recovery)."""
+        mcp_file = Path(self.settings.mcp_servers_file).expanduser()
+        if not mcp_file.exists():
+            return
+        try:
+            from grizzyclaw.mcp_client import health_check_servers, invalidate_tools_cache
+            status = await health_check_servers(mcp_file)
+            down = [n for n, ok in status.items() if not ok]
+            if down:
+                logger.warning("MCP health check: servers down %s; invalidating cache for next discovery.", down)
+                invalidate_tools_cache(mcp_file)
+        except Exception as e:
+            logger.debug("MCP health check error: %s", e)
 
     async def _habit_analyzer(self):
         """Analyze memory patterns (memuBot-style) and auto-schedule habit-based actions."""

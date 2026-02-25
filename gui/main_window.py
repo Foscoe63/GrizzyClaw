@@ -31,6 +31,8 @@ from .sessions_dialog import SessionsDialog
 from .workspace_dialog import WorkspaceDialog
 from .canvas_widget import CanvasWidget
 from .usage_dashboard_dialog import UsageDashboardDialog
+from .swarm_activity_dialog import SwarmActivityDialog
+from .conversation_history_dialog import ConversationHistoryDialog
 from grizzyclaw.workspaces import WorkspaceManager
 
 
@@ -1008,6 +1010,8 @@ class ChatWidget(QWidget):
         mw = self.window()
         if mw and hasattr(mw, "status_bar"):
             mw.status_bar.showMessage("New conversation started")
+        if mw and hasattr(mw, "_update_session_status"):
+            mw._update_session_status()
 
     def _set_loading(self, loading: bool):
         """Enable/disable send during streaming, show Stop button when loading."""
@@ -1153,6 +1157,9 @@ class ChatWidget(QWidget):
             sender = "You" if is_user else self._workspace_display_name
             self.add_message(content, is_user=is_user, sender=sender)
         QTimer.singleShot(0, self._scroll_to_bottom_if_near)
+        mw = self.window()
+        if mw and hasattr(mw, "_update_session_status"):
+            mw._update_session_status()
 
     def apply_compact_mode(self, compact: bool):
         """Apply compact UI density: smaller margins, spacing, and fonts."""
@@ -1227,15 +1234,24 @@ class ChatWidget(QWidget):
             sandbox = getattr(self.agent.settings, "exec_sandbox_enabled", False)
             def _run_and_set():
                 try:
+                    import sys
+                    import os
+                    # Literal \n in command (from JSON) → real newlines so python -c "line1\nline2" works
+                    cmd = command.replace("\\n", "\n")
+                    # Use the same Python as the app (so pytest, mypy, ruff are found) when not sandboxed
+                    if not sandbox:
+                        if "python3 " in cmd:
+                            cmd = cmd.replace("python3 ", sys.executable + " ", 1)
+                        elif "python " in cmd:
+                            cmd = cmd.replace("python ", sys.executable + " ", 1)
                     cwd_path = Path(cwd).expanduser() if cwd else Path.home()
                     if not cwd_path.exists():
                         cwd_path = Path.home()
                     run_env = None
                     if sandbox:
-                        import os
                         run_env = {**os.environ, "PATH": "/usr/bin:/bin"}
                     result = subprocess.run(
-                        command,
+                        cmd,
                         shell=True,
                         capture_output=True,
                         text=True,
@@ -1333,7 +1349,10 @@ class ChatWidget(QWidget):
             self.message_added.emit(response_text, False, self._workspace_display_name)
         else:
             self.message_received.emit(response_text, False)
-    
+        mw = self.window()
+        if mw and hasattr(mw, "_update_session_status"):
+            mw._update_session_status()
+
     def on_error(self, error_message):
         """Handle errors from the worker thread."""
         self._set_loading(False)
@@ -1570,7 +1589,7 @@ class SidebarWidget(QWidget):
             getattr(self, name, None)
             for name in (
                 "chat_btn", "workspaces_btn", "memory_btn", "scheduler_btn",
-                "browser_btn", "sessions_btn", "usage_btn", "settings_btn",
+                "browser_btn", "sessions_btn", "swarm_btn", "conv_history_btn", "usage_btn", "settings_btn",
             )
         ]
         for btn in nav_buttons:
@@ -1683,6 +1702,8 @@ class SidebarWidget(QWidget):
         self.scheduler_btn = self.create_nav_button("⏰", "Scheduler")
         self.browser_btn = self.create_nav_button("🌐", "Browser")
         self.sessions_btn = self.create_nav_button("👥", "Sessions")
+        self.swarm_btn = self.create_nav_button("🐝", "Swarm activity")
+        self.conv_history_btn = self.create_nav_button("📜", "Conversation history")
         self.usage_btn = self.create_nav_button("📊", "Usage")
         self.settings_btn = self.create_nav_button("⚙️", "Settings")
         
@@ -1697,6 +1718,10 @@ class SidebarWidget(QWidget):
         layout.addWidget(self.browser_btn)
         layout.addSpacing(4)
         layout.addWidget(self.sessions_btn)
+        layout.addSpacing(4)
+        layout.addWidget(self.swarm_btn)
+        layout.addSpacing(4)
+        layout.addWidget(self.conv_history_btn)
         layout.addSpacing(4)
         layout.addWidget(self.usage_btn)
         layout.addSpacing(4)
@@ -1822,7 +1847,8 @@ class GrizzyClawApp(QMainWindow):
             )
         else:
             self.agent = AgentCore(self.settings)
-        
+        self._wire_agent_proactive(self.agent)
+
         self.telegram_bot = None
         self._stop_worker = None
         self.user_id = "gui_user"
@@ -1880,6 +1906,8 @@ class GrizzyClawApp(QMainWindow):
         self.sidebar.scheduler_btn.clicked.connect(self.show_scheduler)
         self.sidebar.browser_btn.clicked.connect(self.show_browser)
         self.sidebar.sessions_btn.clicked.connect(self.show_sessions)
+        self.sidebar.swarm_btn.clicked.connect(self.show_swarm_activity)
+        self.sidebar.conv_history_btn.clicked.connect(self.show_conversation_history)
         self.sidebar.usage_btn.clicked.connect(self.show_usage_dashboard)
         self.sidebar.settings_btn.clicked.connect(self.show_settings)
         layout.addWidget(self.sidebar)
@@ -1918,10 +1946,26 @@ class GrizzyClawApp(QMainWindow):
             }
         """)
         self.setStatusBar(self.status_bar)
+        self.session_status_label = QLabel("")
+        self.session_status_label.setStyleSheet("color: #8E8E93; font-size: 12px;")
+        self.status_bar.addPermanentWidget(self.session_status_label)
         if getattr(self, "_config_load_failed", False):
             self.status_bar.showMessage("Config load failed (check logs). Using defaults.")
         else:
             self.status_bar.showMessage("Ready")
+        QTimer.singleShot(500, self._update_session_status)
+    
+    def _update_session_status(self):
+        """Update the permanent status bar label with session message/token estimate."""
+        if not hasattr(self, "chat_widget") or not self.chat_widget or not getattr(self.chat_widget, "agent", None):
+            self.session_status_label.setText("")
+            return
+        agent = self.chat_widget.agent
+        user_id = getattr(self.chat_widget, "user_id", "gui_user")
+        summary = getattr(agent, "get_session_summary", lambda _: {"messages": 0, "approx_tokens": 0})(user_id)
+        n = summary.get("messages", 0)
+        tok = summary.get("approx_tokens", 0)
+        self.session_status_label.setText(f"~{n} msgs, ~{tok // 1000}k tokens")
     
     def setup_menu(self):
         menubar = self.menuBar()
@@ -1975,6 +2019,12 @@ class GrizzyClawApp(QMainWindow):
         usage_action = QAction("Usage Dashboard", self)
         usage_action.triggered.connect(self.show_usage_dashboard)
         view_menu.addAction(usage_action)
+        swarm_activity_action = QAction("Swarm activity", self)
+        swarm_activity_action.triggered.connect(self.show_swarm_activity)
+        view_menu.addAction(swarm_activity_action)
+        conv_history_action = QAction("Conversation history", self)
+        conv_history_action.triggered.connect(self.show_conversation_history)
+        view_menu.addAction(conv_history_action)
         
         # Help menu
         help_menu = menubar.addMenu("Help")
@@ -2106,6 +2156,24 @@ class GrizzyClawApp(QMainWindow):
         dialog = UsageDashboardDialog(self.workspace_manager, self.settings, self)
         dialog.exec()
 
+    def show_swarm_activity(self):
+        dialog = SwarmActivityDialog(self.workspace_manager, self)
+        dialog.exec()
+
+    def show_conversation_history(self):
+        if not getattr(self, "chat_widget", None) or not getattr(self.chat_widget, "agent", None):
+            return
+        on_clear = getattr(self.chat_widget, "_new_chat", None)
+        on_load = getattr(self.chat_widget, "restore_session_from_agent", None)
+        dialog = ConversationHistoryDialog(
+            self.chat_widget.agent,
+            getattr(self.chat_widget, "user_id", "gui_user"),
+            on_clear=on_clear,
+            on_load=on_load,
+            parent=self,
+        )
+        dialog.exec()
+
     def show_workspaces(self):
         dialog = WorkspaceDialog(
             self.workspace_manager, self,
@@ -2124,6 +2192,7 @@ class GrizzyClawApp(QMainWindow):
         )
         if new_agent:
             self.agent = new_agent
+            self._wire_agent_proactive(self.agent)
             # Update chat widget with new agent and restore this workspace's session
             self.chat_widget.agent = new_agent
             self.chat_widget.restore_session_from_agent()
@@ -2145,9 +2214,30 @@ class GrizzyClawApp(QMainWindow):
         new_agent = self.workspace_manager.create_agent_for_workspace(workspace_id, self.settings)
         if new_agent:
             self.agent = new_agent
+            self._wire_agent_proactive(self.agent)
             self.chat_widget.agent = new_agent
             self.status_bar.showMessage("Workspace saved. Chat now uses this workspace's provider and model.")
-    
+
+    def _on_proactive_message(self, text: str):
+        """Show a proactive (autonomy-loop) message from the agent in the chat."""
+        if not text or not hasattr(self, "chat_widget") or self.chat_widget is None:
+            return
+        sender = "Assistant"
+        active_ws = self.workspace_manager.get_active_workspace() if self.workspace_manager else None
+        if active_ws:
+            sender = f"{active_ws.icon} {active_ws.name}"
+        self.chat_widget.add_message(text, is_user=False, sender=sender)
+        self.status_bar.showMessage("Proactive message from agent", 3000)
+
+    def _wire_agent_proactive(self, agent):
+        """Wire agent.on_proactive_message so autonomy-loop messages appear in the chat (main-thread safe)."""
+        if agent is None:
+            return
+        # Autonomy loop runs in asyncio; callback must run on Qt main thread
+        def callback(msg: str):
+            QTimer.singleShot(0, lambda m=msg: self._on_proactive_message(m))
+        agent.on_proactive_message = callback
+
     def show_settings(self):
         resolved = self._resolve_theme(self.settings.theme)
         theme_colors = self.get_theme_colors(resolved)
@@ -2171,6 +2261,7 @@ class GrizzyClawApp(QMainWindow):
                 new_agent = AgentCore(self.settings)
             if new_agent:
                 self.agent = new_agent
+                self._wire_agent_proactive(self.agent)
                 self.chat_widget.agent = new_agent
             # Start or restart Telegram when token is present
             if self.settings.telegram_bot_token:

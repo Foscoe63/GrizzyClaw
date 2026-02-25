@@ -3,7 +3,7 @@
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QListWidget,
     QListWidgetItem, QPushButton, QMessageBox, QLineEdit,
-    QFormLayout, QGroupBox, QComboBox
+    QFormLayout, QGroupBox, QComboBox, QTextEdit,
 )
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont
@@ -140,6 +140,10 @@ class SchedulerDialog(QDialog):
         refresh_btn = QPushButton("🔄 Refresh")
         refresh_btn.clicked.connect(self.refresh)
         btn_layout.addWidget(refresh_btn)
+
+        edit_btn = QPushButton("✏️ Edit")
+        edit_btn.clicked.connect(self.edit_selected)
+        btn_layout.addWidget(edit_btn)
 
         delete_btn = QPushButton("🗑️ Delete Selected")
         delete_btn.clicked.connect(self.delete_selected)
@@ -287,3 +291,53 @@ class SchedulerDialog(QDialog):
 
             except Exception as e:
                 QMessageBox.warning(self, "Error", str(e))
+
+    def edit_selected(self):
+        """Edit the selected task (cron, message, name)"""
+        current = self.task_list.currentItem()
+        if not current:
+            QMessageBox.warning(self, "No Selection", "Select a task to edit.")
+            return
+        task_id = current.data(Qt.ItemDataRole.UserRole)
+        if not task_id:
+            return
+        task = getattr(self.agent, "get_scheduler_task", lambda _: None)(task_id)
+        if not task:
+            QMessageBox.warning(self, "Error", "Task not found or no details available.")
+            return
+        d = QDialog(self)
+        d.setWindowTitle("Edit Task")
+        layout = QVBoxLayout(d)
+        form = QFormLayout()
+        name_edit = QLineEdit()
+        name_edit.setText(task.get("name", ""))
+        form.addRow("Name:", name_edit)
+        cron_edit = QLineEdit()
+        cron_edit.setPlaceholderText("* * * * *")
+        cron_edit.setText(task.get("cron", ""))
+        form.addRow("Cron:", cron_edit)
+        msg_edit = QLineEdit()
+        msg_edit.setText(task.get("message", ""))
+        msg_edit.setPlaceholderText("Reminder message")
+        form.addRow("Message:", msg_edit)
+        layout.addLayout(form)
+        btn_layout = QHBoxLayout()
+        ok_btn = QPushButton("Save")
+        ok_btn.clicked.connect(d.accept)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(d.reject)
+        btn_layout.addWidget(ok_btn)
+        btn_layout.addWidget(cancel_btn)
+        layout.addLayout(btn_layout)
+        if d.exec() == QDialog.DialogCode.Accepted:
+            result = self.agent.edit_scheduler_task_sync(
+                task_id,
+                cron=cron_edit.text().strip() or None,
+                message=msg_edit.text().strip() or None,
+                name=name_edit.text().strip() or None,
+            )
+            if "✅" in result:
+                QMessageBox.information(self, "Updated", result)
+                self.refresh()
+            else:
+                QMessageBox.warning(self, "Error", result)

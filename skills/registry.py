@@ -20,6 +20,8 @@ class SkillMetadata:
     config_schema: Optional[Dict[str, Any]] = None
     source: str = "builtin"  # builtin, local, hf
     executor: Optional[Any] = None  # Callable for dynamic execution
+    version: Optional[str] = None  # e.g. "1.0.0"
+    update_url: Optional[str] = None  # URL to check for newer version (e.g. GitHub raw)
 
 
 # Built-in skills registry
@@ -30,6 +32,14 @@ SKILL_REGISTRY: Dict[str, SkillMetadata] = {
         description="Search the web for real-time information via DuckDuckGo",
         icon="🔍",
         source="builtin",
+        version="1.0.0",
+        config_schema={
+            "type": "object",
+            "properties": {
+                "api_key": {"type": "string", "title": "Optional API Key", "description": "Leave blank for default DuckDuckGo"},
+                "region": {"type": "string", "title": "Region", "description": "e.g. wt-wt for worldwide"},
+            },
+        },
     ),
     "filesystem": SkillMetadata(
         id="filesystem",
@@ -44,6 +54,12 @@ SKILL_REGISTRY: Dict[str, SkillMetadata] = {
         description="Query library documentation via Context7",
         icon="📚",
         source="builtin",
+        config_schema={
+            "type": "object",
+            "properties": {
+                "endpoint": {"type": "string", "title": "Context7 endpoint", "description": "Override default if needed"},
+            },
+        },
     ),
     "browser": SkillMetadata(
         id="browser",
@@ -178,3 +194,28 @@ def save_user_skills(skills: Dict[str, Dict[str, Any]], data_dir: Optional[Path]
     except Exception as e:
         logger.error(f"Could not save skills.json: {e}")
         return False
+
+
+def get_skill_version(skill_id: str) -> Optional[str]:
+    """Return the declared version of a skill, if any."""
+    meta = get_skill(skill_id)
+    return getattr(meta, "version", None) if meta else None
+
+
+def check_skill_update(skill_id: str) -> Optional[tuple]:
+    """Check if a newer version exists. Returns (current_version, latest_version) or None.
+    Requires skill to have version and update_url (e.g. URL to a raw text file containing version)."""
+    meta = get_skill(skill_id)
+    if not meta or not getattr(meta, "update_url", None) or not getattr(meta, "version", None):
+        return None
+    current = meta.version
+    try:
+        from urllib.request import urlopen
+        from urllib.error import URLError, HTTPError
+        with urlopen(meta.update_url, timeout=5) as resp:
+            latest = resp.read().decode("utf-8").strip()
+        if latest and latest != current:
+            return (current, latest)
+    except Exception:
+        pass
+    return None
