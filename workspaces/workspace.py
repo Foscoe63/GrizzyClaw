@@ -58,6 +58,13 @@ class WorkspaceConfig:
     swarm_auto_delegate: bool = False  # Leader: parse response for @mentions and run delegations
     swarm_consensus: bool = False      # Leader: after delegations, synthesize specialist replies into one
 
+    # Sub-agents (agent-spawned child runs: parallel tasks, orchestrator pattern)
+    subagents_enabled: bool = False
+    subagents_max_depth: int = 2        # Main=0, depth 1 can spawn; depth 2 cannot (or set 3 for one more level)
+    subagents_max_children: int = 5    # Max concurrent child runs per parent
+    subagents_run_timeout_seconds: int = 0   # 0 = no timeout; default for spawned runs
+    subagents_model: Optional[str] = None    # Optional model override for sub-agent runs
+
     # Channels (which channels this workspace responds to)
     telegram_enabled: bool = False
     telegram_bot_token: Optional[str] = None

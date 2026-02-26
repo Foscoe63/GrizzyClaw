@@ -8,6 +8,40 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+_file_handler: Optional[logging.FileHandler] = None
+
+def setup_file_logging(level: str = "INFO", log_path: Optional[str] = None) -> None:
+    """Configure file logging with specified level. Call with level='OFF' to disable."""
+    global _file_handler
+    root = logging.getLogger()
+    
+    # Remove existing file handler if any
+    if _file_handler is not None:
+        root.removeHandler(_file_handler)
+        _file_handler.close()
+        _file_handler = None
+    
+    if level.upper() in ("OFF", "NONE"):
+        return
+    
+    # Determine log path
+    if log_path:
+        path = Path(log_path)
+    else:
+        path = Path.home() / ".grizzyclaw" / "debug.log"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Map level string to logging constant
+    level_map = {"DEBUG": logging.DEBUG, "INFO": logging.INFO, "WARNING": logging.WARNING, "ERROR": logging.ERROR}
+    log_level = level_map.get(level.upper(), logging.INFO)
+    
+    _file_handler = logging.FileHandler(path, mode="a", encoding="utf-8")
+    _file_handler.setLevel(log_level)
+    _file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    root.addHandler(_file_handler)
+    root.setLevel(min(root.level or logging.DEBUG, log_level))
+    logger.info("File logging enabled: level=%s path=%s", level, path)
+
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTextEdit, QLineEdit, QPlainTextEdit, QPushButton, QLabel, QSystemTrayIcon,
@@ -15,7 +49,7 @@ from PyQt6.QtWidgets import (
     QFrame, QScrollArea, QToolBar, QStatusBar, QSizePolicy,
     QFileDialog, QStackedWidget, QDialog,
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QMimeData
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, pyqtSlot, QTimer, QSize, QMimeData
 from PyQt6.QtGui import QAction, QIcon, QFont, QPalette, QColor, QKeySequence, QShortcut, QDragEnterEvent, QDropEvent, QKeyEvent
 
 
@@ -32,6 +66,7 @@ from .workspace_dialog import WorkspaceDialog
 from .canvas_widget import CanvasWidget
 from .usage_dashboard_dialog import UsageDashboardDialog
 from .swarm_activity_dialog import SwarmActivityDialog
+from .subagents_dialog import SubagentsDialog
 from .conversation_history_dialog import ConversationHistoryDialog
 from grizzyclaw.workspaces import WorkspaceManager
 
@@ -1598,7 +1633,7 @@ class SidebarWidget(QWidget):
             getattr(self, name, None)
             for name in (
                 "chat_btn", "workspaces_btn", "memory_btn", "scheduler_btn",
-                "browser_btn", "sessions_btn", "swarm_btn", "conv_history_btn", "usage_btn", "settings_btn",
+                "browser_btn", "sessions_btn", "swarm_btn", "subagents_btn", "conv_history_btn", "usage_btn", "settings_btn",
             )
         ]
         for btn in nav_buttons:
@@ -1712,6 +1747,7 @@ class SidebarWidget(QWidget):
         self.browser_btn = self.create_nav_button("🌐", "Browser")
         self.sessions_btn = self.create_nav_button("👥", "Sessions")
         self.swarm_btn = self.create_nav_button("🐝", "Swarm activity")
+        self.subagents_btn = self.create_nav_button("🤖", "Sub-agents")
         self.conv_history_btn = self.create_nav_button("📜", "Conversation history")
         self.usage_btn = self.create_nav_button("📊", "Usage")
         self.settings_btn = self.create_nav_button("⚙️", "Settings")
@@ -1729,6 +1765,8 @@ class SidebarWidget(QWidget):
         layout.addWidget(self.sessions_btn)
         layout.addSpacing(4)
         layout.addWidget(self.swarm_btn)
+        layout.addSpacing(4)
+        layout.addWidget(self.subagents_btn)
         layout.addSpacing(4)
         layout.addWidget(self.conv_history_btn)
         layout.addSpacing(4)
@@ -1845,6 +1883,9 @@ class GrizzyClawApp(QMainWindow):
                 logger.warning("Failed to load config from %s: %s", config_path, e)
                 self._config_load_failed = True
         
+        # Setup file logging based on settings
+        setup_file_logging(getattr(self.settings, "log_level", "INFO"))
+        
         # Initialize workspace manager
         self.workspace_manager = WorkspaceManager()
         
@@ -1856,6 +1897,9 @@ class GrizzyClawApp(QMainWindow):
             )
         else:
             self.agent = AgentCore(self.settings)
+            # Ensure agent has the shared subagent_registry even without a workspace
+            self.agent.subagent_registry = self.workspace_manager.subagent_registry
+        self._subagent_registry_for_ui = getattr(self.agent, "subagent_registry", None) or self.workspace_manager.subagent_registry
         self._wire_agent_proactive(self.agent)
 
         self.telegram_bot = None
@@ -1916,6 +1960,7 @@ class GrizzyClawApp(QMainWindow):
         self.sidebar.browser_btn.clicked.connect(self.show_browser)
         self.sidebar.sessions_btn.clicked.connect(self.show_sessions)
         self.sidebar.swarm_btn.clicked.connect(self.show_swarm_activity)
+        self.sidebar.subagents_btn.clicked.connect(self.show_subagents)
         self.sidebar.conv_history_btn.clicked.connect(self.show_conversation_history)
         self.sidebar.usage_btn.clicked.connect(self.show_usage_dashboard)
         self.sidebar.settings_btn.clicked.connect(self.show_settings)
@@ -2031,6 +2076,9 @@ class GrizzyClawApp(QMainWindow):
         swarm_activity_action = QAction("Swarm activity", self)
         swarm_activity_action.triggered.connect(self.show_swarm_activity)
         view_menu.addAction(swarm_activity_action)
+        subagents_action = QAction("Sub-agents", self)
+        subagents_action.triggered.connect(self.show_subagents)
+        view_menu.addAction(subagents_action)
         conv_history_action = QAction("Conversation history", self)
         conv_history_action.triggered.connect(self.show_conversation_history)
         view_menu.addAction(conv_history_action)
@@ -2169,6 +2217,10 @@ class GrizzyClawApp(QMainWindow):
         dialog = SwarmActivityDialog(self.workspace_manager, self)
         dialog.exec()
 
+    def show_subagents(self):
+        dialog = SubagentsDialog(self.workspace_manager, self)
+        dialog.exec()
+
     def show_conversation_history(self):
         if not getattr(self, "chat_widget", None) or not getattr(self.chat_widget, "agent", None):
             return
@@ -2201,6 +2253,7 @@ class GrizzyClawApp(QMainWindow):
         )
         if new_agent:
             self.agent = new_agent
+            self._subagent_registry_for_ui = getattr(new_agent, "subagent_registry", None)
             self._wire_agent_proactive(self.agent)
             # Update chat widget with new agent and restore this workspace's session
             self.chat_widget.agent = new_agent
@@ -2223,6 +2276,7 @@ class GrizzyClawApp(QMainWindow):
         new_agent = self.workspace_manager.create_agent_for_workspace(workspace_id, self.settings)
         if new_agent:
             self.agent = new_agent
+            self._subagent_registry_for_ui = getattr(new_agent, "subagent_registry", None)
             self._wire_agent_proactive(self.agent)
             self.chat_widget.agent = new_agent
             self.status_bar.showMessage("Workspace saved. Chat now uses this workspace's provider and model.")
@@ -2238,14 +2292,48 @@ class GrizzyClawApp(QMainWindow):
         self.chat_widget.add_message(text, is_user=False, sender=sender)
         self.status_bar.showMessage("Proactive message from agent", 3000)
 
+    @pyqtSlot(str, str, str, str)
+    def _handle_subagent_complete_slot(self, run_id: str, label: str, result: str, status: str):
+        """Slot for thread-safe subagent completion (invoked via QMetaObject)."""
+        self._on_subagent_complete(run_id, label, result, status)
+
+    def _on_subagent_complete(self, run_id: str, label: str, result: str, status: str):
+        """Append sub-agent completion to chat (run on Qt main thread)."""
+        if not hasattr(self, "chat_widget") or self.chat_widget is None:
+            return
+        preview = (result[:600] + "…") if len(result) > 600 else result
+        if status == "completed":
+            text = f"**🤖 Sub-agent** ({label or run_id}) **completed:**\n\n{preview}"
+        elif status == "timed_out":
+            text = f"**🤖 Sub-agent** ({label or run_id}) **timed out.**"
+        elif status == "failed":
+            text = f"**🤖 Sub-agent** ({label or run_id}) **failed:** {preview}"
+        else:
+            text = f"**🤖 Sub-agent** ({label or run_id}): {status}"
+        active_ws = self.workspace_manager.get_active_workspace() if self.workspace_manager else None
+        sender = f"{active_ws.icon} {active_ws.name}" if active_ws else "Assistant"
+        self.chat_widget.add_message(text, is_user=False, sender=sender)
+        self.status_bar.showMessage("Sub-agent completed", 3000)
+
     def _wire_agent_proactive(self, agent):
-        """Wire agent.on_proactive_message so autonomy-loop messages appear in the chat (main-thread safe)."""
+        """Wire agent.on_proactive_message and on_subagent_complete for chat (main-thread safe)."""
         if agent is None:
             return
         # Autonomy loop runs in asyncio; callback must run on Qt main thread
         def callback(msg: str):
             QTimer.singleShot(0, lambda m=msg: self._on_proactive_message(m))
         agent.on_proactive_message = callback
+        # Sub-agent completion: run on main thread (called from dedicated subagent thread)
+        # Use QMetaObject.invokeMethod for thread-safe cross-thread invocation
+        def subagent_callback(run_id: str, label: str, result: str, status: str):
+            # Capture variables by value to avoid closure issues
+            from PyQt6.QtCore import QMetaObject, Qt as QtCore_Qt, Q_ARG
+            QMetaObject.invokeMethod(
+                self, "_handle_subagent_complete_slot",
+                QtCore_Qt.ConnectionType.QueuedConnection,
+                Q_ARG(str, run_id), Q_ARG(str, label), Q_ARG(str, result), Q_ARG(str, status)
+            )
+        agent.on_subagent_complete = subagent_callback
 
     def show_settings(self):
         resolved = self._resolve_theme(self.settings.theme)
@@ -2260,6 +2348,8 @@ class GrizzyClawApp(QMainWindow):
         if dialog.exec():
             self.settings = dialog.get_settings()
             self.apply_appearance_settings()
+            # Update file logging based on new log_level
+            setup_file_logging(getattr(self.settings, "log_level", "INFO"))
             # Recreate agent so it uses updated LLM URLs (e.g. remote LM Studio at 192.168.x.x)
             active_ws = self.workspace_manager.get_active_workspace()
             if active_ws:
@@ -2268,8 +2358,11 @@ class GrizzyClawApp(QMainWindow):
                 )
             else:
                 new_agent = AgentCore(self.settings)
+                # Ensure agent has the shared subagent_registry even without a workspace
+                new_agent.subagent_registry = self.workspace_manager.subagent_registry
             if new_agent:
                 self.agent = new_agent
+                self._subagent_registry_for_ui = getattr(new_agent, "subagent_registry", None) or self.workspace_manager.subagent_registry
                 self._wire_agent_proactive(self.agent)
                 self.chat_widget.agent = new_agent
             # Start or restart Telegram when token is present

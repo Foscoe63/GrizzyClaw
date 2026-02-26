@@ -4,6 +4,7 @@ import json
 import logging
 from pathlib import Path
 import asyncio
+from datetime import datetime
 from typing import Dict, List, Optional, Any, TYPE_CHECKING
 
 from grizzyclaw.config import Settings
@@ -33,6 +34,8 @@ class WorkspaceManager:
         self.workspaces: Dict[str, Workspace] = {}
         self.active_workspace_id: Optional[str] = None
         self.swarm_event_bus = SwarmEventBus()
+        from grizzyclaw.agent.subagent_registry import SubagentRegistry
+        self.subagent_registry = SubagentRegistry()
 
         # Load existing workspaces or create default
         self._load_workspaces()
@@ -176,28 +179,27 @@ class WorkspaceManager:
         return None
     
     def update_workspace_config(
-        self, 
-        workspace_id: str, 
-        config_updates: Dict[str, Any]
+        self,
+        workspace_id: str,
+        config_updates: Dict[str, Any],
     ) -> Optional[Workspace]:
-        """Update workspace configuration
-        
-        Args:
-            workspace_id: Workspace ID
-            config_updates: Config attributes to update
-        
-        Returns:
-            Updated workspace or None
+        """Update workspace configuration.
+
+        Merges config_updates into the full config and replaces workspace.config
+        so all keys (including newly added ones like subagents_*) persist correctly.
         """
         workspace = self.workspaces.get(workspace_id)
-        if workspace:
-            for key, value in config_updates.items():
-                if hasattr(workspace.config, key):
-                    setattr(workspace.config, key, value)
-            workspace.updated_at = workspace.updated_at.__class__.now()
-            self._save_workspaces()
-            return workspace
-        return None
+        if not workspace:
+            return None
+        # Merge current config (as dict) with updates so no key is lost
+        full = workspace.config.to_dict()
+        for key, value in config_updates.items():
+            if hasattr(workspace.config, key):
+                full[key] = value
+        workspace.config = WorkspaceConfig.from_dict(full)
+        workspace.updated_at = datetime.now()
+        self._save_workspaces()
+        return workspace
     
     def delete_workspace(self, workspace_id: str) -> bool:
         """Delete a workspace
@@ -354,6 +356,7 @@ class WorkspaceManager:
         agent.workspace_id = workspace_id
         agent.workspace_config = config
         agent.swarm_event_bus = self.swarm_event_bus
+        agent.subagent_registry = self.subagent_registry
         workspace.agent = agent
         agent._ensure_swarm_subscriptions()
 

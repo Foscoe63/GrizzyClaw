@@ -150,7 +150,7 @@ class GeneralTab(SettingsTab):
         form.addRow("Max Context:", self.context_spin)
         self.log_combo = QComboBox()
         self.log_combo.setEditable(False)
-        self.log_combo.addItems(["DEBUG", "INFO", "WARNING", "ERROR"])
+        self.log_combo.addItems(["None", "DEBUG", "INFO", "WARNING", "ERROR"])
         self.log_combo.setCurrentText(self.settings.log_level)
         self.log_combo.setFixedHeight(32)
         form.addRow("Log Level:", self.log_combo)

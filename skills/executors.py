@@ -8,11 +8,86 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 # Default ClawHub-style MCP server list (when no marketplace URL is set)
+# Organized by category for better discoverability in the marketplace
+# ⭐ = Featured/recommended servers for common use cases
 DEFAULT_MCP_MARKETPLACE = [
-    {"name": "playwright-mcp", "command": "npx", "args": ["-y", "@anthropic-ai/playwright-mcp"], "description": "Browser automation"},
-    {"name": "filesystem", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "."], "description": "Read/write files"},
-    {"name": "ddg-search", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-ddg-search"], "description": "DuckDuckGo search"},
-    {"name": "github", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"], "description": "GitHub repos, issues, PRs"},
+    # 🌐 Web & Search (Featured: playwright-mcp, ddg-search, fetch)
+    {"name": "playwright-mcp", "command": "npx", "args": ["-y", "@anthropic-ai/playwright-mcp"], "description": "⭐ Browser automation with Playwright - navigate, click, fill forms, take screenshots", "featured": True},
+    {"name": "puppeteer", "command": "npx", "args": ["-y", "@anthropic-ai/puppeteer-mcp"], "description": "Browser automation with Puppeteer for web scraping and testing"},
+    {"name": "ddg-search", "command": "npx", "args": ["-y", "@anthropic-ai/ddg-search-mcp"], "description": "⭐ DuckDuckGo web search - privacy-focused search engine, no API key needed", "featured": True},
+    {"name": "brave-search", "command": "npx", "args": ["-y", "@anthropic-ai/brave-search-mcp"], "description": "Brave Search API for web search (requires API key)"},
+    {"name": "fetch", "command": "npx", "args": ["-y", "@anthropic-ai/fetch-mcp"], "description": "⭐ Fetch web pages and convert HTML to markdown for reading articles", "featured": True},
+    {"name": "exa", "command": "npx", "args": ["-y", "@anthropic-ai/exa-mcp"], "description": "Exa AI-powered search - semantic search for research (requires API key)"},
+    {"name": "tavily", "command": "npx", "args": ["-y", "mcp-tavily"], "description": "Tavily AI search - optimized for AI agents (requires API key)"},
+    
+    # 📁 Files & Storage (Featured: filesystem)
+    {"name": "filesystem", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "."], "description": "⭐ Read/write local files and directories - essential for file operations", "featured": True},
+    {"name": "google-drive", "command": "npx", "args": ["-y", "@anthropic-ai/google-drive-mcp"], "description": "Google Drive - list, read, search files (requires OAuth)"},
+    {"name": "dropbox", "command": "npx", "args": ["-y", "mcp-dropbox"], "description": "Dropbox file storage - upload, download, share files"},
+    {"name": "s3", "command": "npx", "args": ["-y", "mcp-s3"], "description": "AWS S3 - cloud storage operations (requires AWS credentials)"},
+    
+    # 🔧 Development (Featured: github, sequential-thinking)
+    {"name": "github", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"], "description": "⭐ GitHub - repos, issues, PRs, branches, commits, code search", "featured": True},
+    {"name": "gitlab", "command": "npx", "args": ["-y", "@anthropic-ai/gitlab-mcp"], "description": "GitLab - projects, merge requests, issues, CI/CD"},
+    {"name": "sequential-thinking", "command": "npx", "args": ["-y", "@anthropic-ai/sequential-thinking-mcp"], "description": "⭐ Step-by-step reasoning and problem decomposition for complex tasks", "featured": True},
+    {"name": "docker", "command": "npx", "args": ["-y", "mcp-docker"], "description": "Docker container management - build, run, manage containers"},
+    {"name": "kubernetes", "command": "npx", "args": ["-y", "mcp-kubernetes"], "description": "Kubernetes cluster management - pods, deployments, services"},
+    {"name": "npm", "command": "npx", "args": ["-y", "mcp-npm"], "description": "NPM package management - search, info, publish packages"},
+    {"name": "linear", "command": "npx", "args": ["-y", "@anthropic-ai/linear-mcp"], "description": "Linear issue tracking - create, update, search issues"},
+    {"name": "sentry", "command": "npx", "args": ["-y", "mcp-sentry"], "description": "Sentry error monitoring - view and manage error reports"},
+    
+    # 📊 Data & Databases
+    {"name": "sqlite", "command": "npx", "args": ["-y", "@anthropic-ai/sqlite-mcp"], "description": "SQLite database operations - query, create tables, insert data"},
+    {"name": "postgres", "command": "npx", "args": ["-y", "@anthropic-ai/postgres-mcp"], "description": "PostgreSQL database - queries, schema inspection, migrations"},
+    {"name": "mysql", "command": "npx", "args": ["-y", "mcp-mysql"], "description": "MySQL database - queries, schema management"},
+    {"name": "mongodb", "command": "npx", "args": ["-y", "mcp-mongodb"], "description": "MongoDB - document queries, aggregations, collections"},
+    {"name": "redis", "command": "npx", "args": ["-y", "mcp-redis"], "description": "Redis - key-value operations, caching, pub/sub"},
+    {"name": "supabase", "command": "npx", "args": ["-y", "mcp-supabase"], "description": "Supabase - database, auth, storage, realtime"},
+    
+    # 📝 Productivity
+    {"name": "slack", "command": "npx", "args": ["-y", "@anthropic-ai/slack-mcp"], "description": "Slack - send messages, read channels, search (requires bot token)"},
+    {"name": "discord", "command": "npx", "args": ["-y", "mcp-discord"], "description": "Discord - send messages, manage servers, read channels"},
+    {"name": "notion", "command": "npx", "args": ["-y", "mcp-notion"], "description": "Notion - pages, databases, blocks, search (requires API key)"},
+    {"name": "google-maps", "command": "npx", "args": ["-y", "@anthropic-ai/google-maps-mcp"], "description": "Google Maps - directions, places, geocoding (requires API key)"},
+    {"name": "google-calendar", "command": "npx", "args": ["-y", "mcp-google-calendar"], "description": "Google Calendar - events, reminders, scheduling (requires OAuth)"},
+    {"name": "todoist", "command": "npx", "args": ["-y", "mcp-todoist"], "description": "Todoist - task management, projects, labels"},
+    {"name": "asana", "command": "npx", "args": ["-y", "mcp-asana"], "description": "Asana - project management, tasks, workspaces"},
+    {"name": "trello", "command": "npx", "args": ["-y", "mcp-trello"], "description": "Trello - boards, cards, lists, checklists"},
+    {"name": "airtable", "command": "npx", "args": ["-y", "mcp-airtable"], "description": "Airtable - spreadsheet-database hybrid, bases, records"},
+    
+    # 🤖 AI & Utilities (Featured: memory)
+    {"name": "memory", "command": "npx", "args": ["-y", "@anthropic-ai/memory-mcp"], "description": "⭐ Persistent memory and knowledge base - remember context across sessions", "featured": True},
+    {"name": "everart", "command": "npx", "args": ["-y", "@anthropic-ai/everart-mcp"], "description": "AI image generation with EverArt"},
+    {"name": "replicate", "command": "npx", "args": ["-y", "mcp-replicate"], "description": "Replicate AI - run ML models in the cloud"},
+    {"name": "huggingface", "command": "npx", "args": ["-y", "mcp-huggingface"], "description": "Hugging Face - models, datasets, inference API"},
+    {"name": "openai", "command": "npx", "args": ["-y", "mcp-openai"], "description": "OpenAI - GPT, DALL-E, embeddings, assistants API"},
+    {"name": "anthropic", "command": "npx", "args": ["-y", "mcp-anthropic"], "description": "Anthropic Claude API - chat, completions"},
+    {"name": "context7", "command": "npx", "args": ["-y", "mcp-context7"], "description": "Context7 - library documentation search and code examples"},
+    
+    # 🔌 System & Tools
+    {"name": "time", "command": "npx", "args": ["-y", "@anthropic-ai/time-mcp"], "description": "Current time and timezone conversions"},
+    {"name": "shell", "command": "npx", "args": ["-y", "mcp-shell"], "description": "Execute shell commands (use with caution)"},
+    {"name": "macos", "command": "npx", "args": ["-y", "mcp-macos"], "description": "macOS system control - apps, notifications, system info"},
+    {"name": "windows", "command": "npx", "args": ["-y", "mcp-windows"], "description": "Windows system control - apps, processes, registry"},
+    {"name": "screenshot", "command": "npx", "args": ["-y", "mcp-screenshot"], "description": "Take screenshots of desktop or specific windows"},
+    {"name": "clipboard", "command": "npx", "args": ["-y", "mcp-clipboard"], "description": "Clipboard operations - read, write, monitor"},
+    
+    # 📧 Communication
+    {"name": "gmail", "command": "npx", "args": ["-y", "mcp-gmail"], "description": "Gmail - send, read, search emails (requires OAuth)"},
+    {"name": "outlook", "command": "npx", "args": ["-y", "mcp-outlook"], "description": "Outlook - email, calendar, contacts (requires Microsoft Graph)"},
+    {"name": "twilio", "command": "npx", "args": ["-y", "mcp-twilio"], "description": "Twilio - SMS, voice calls, messaging"},
+    {"name": "sendgrid", "command": "npx", "args": ["-y", "mcp-sendgrid"], "description": "SendGrid - email delivery, templates, campaigns"},
+    
+    # 📈 Analytics & Monitoring
+    {"name": "google-analytics", "command": "npx", "args": ["-y", "mcp-google-analytics"], "description": "Google Analytics - website traffic, reports, metrics"},
+    {"name": "mixpanel", "command": "npx", "args": ["-y", "mcp-mixpanel"], "description": "Mixpanel - product analytics, user tracking"},
+    {"name": "datadog", "command": "npx", "args": ["-y", "mcp-datadog"], "description": "Datadog - monitoring, metrics, logs, APM"},
+    {"name": "grafana", "command": "npx", "args": ["-y", "mcp-grafana"], "description": "Grafana - dashboards, visualization, alerting"},
+    
+    # 💳 Finance & Commerce
+    {"name": "stripe", "command": "npx", "args": ["-y", "mcp-stripe"], "description": "Stripe - payments, subscriptions, invoices"},
+    {"name": "shopify", "command": "npx", "args": ["-y", "mcp-shopify"], "description": "Shopify - store management, products, orders"},
+    {"name": "coinbase", "command": "npx", "args": ["-y", "mcp-coinbase"], "description": "Coinbase - cryptocurrency trading, wallets"},
 ]
 
 

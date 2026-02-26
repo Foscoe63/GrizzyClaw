@@ -344,6 +344,30 @@ class WorkspaceDialog(QDialog):
         self.swarm_consensus_cb = QCheckBox("Leader: synthesize specialist replies into one consensus answer")
         self.swarm_consensus_cb.setToolTip("After delegations, call the leader again to combine specialist responses into a single recommendation.")
         swarm_layout.addRow(self.swarm_consensus_cb)
+        # Sub-agents (agent-spawned background runs)
+        subagent_group = QGroupBox("Sub-agents")
+        subagent_layout = QFormLayout(subagent_group)
+        self.subagents_enabled_cb = QCheckBox("Enable sub-agents (SPAWN_SUBAGENT)")
+        self.subagents_enabled_cb.setToolTip("Allow this agent to spawn background sub-agent runs for parallel or delegated tasks. Results are announced when complete.")
+        subagent_layout.addRow(self.subagents_enabled_cb)
+        self.subagents_max_depth_spin = QSpinBox()
+        self.subagents_max_depth_spin.setRange(1, 5)
+        self.subagents_max_depth_spin.setValue(2)
+        self.subagents_max_depth_spin.setToolTip("Max spawn depth: 1 = only main can spawn; 2 = main and one level of children can spawn.")
+        subagent_layout.addRow("Max spawn depth:", self.subagents_max_depth_spin)
+        self.subagents_max_children_spin = QSpinBox()
+        self.subagents_max_children_spin.setRange(1, 20)
+        self.subagents_max_children_spin.setValue(5)
+        self.subagents_max_children_spin.setToolTip("Max concurrent child runs per parent.")
+        subagent_layout.addRow("Max children per parent:", self.subagents_max_children_spin)
+        self.subagents_timeout_spin = QSpinBox()
+        self.subagents_timeout_spin.setRange(0, 86400)
+        self.subagents_timeout_spin.setSuffix(" s")
+        self.subagents_timeout_spin.setValue(0)
+        self.subagents_timeout_spin.setSpecialValueText("No timeout")
+        self.subagents_timeout_spin.setToolTip("Default run timeout for spawned sub-agents (0 = no timeout).")
+        subagent_layout.addRow("Default run timeout:", self.subagents_timeout_spin)
+        swarm_layout.addRow(subagent_group)
         # Proactivity (memuBot-style)
         proact_group = QGroupBox("Proactivity")
         proact_layout = QFormLayout(proact_group)
@@ -599,6 +623,10 @@ class WorkspaceDialog(QDialog):
         self.use_shared_memory_cb.setChecked(getattr(workspace.config, "use_shared_memory", False))
         self.swarm_auto_delegate_cb.setChecked(getattr(workspace.config, "swarm_auto_delegate", False))
         self.swarm_consensus_cb.setChecked(getattr(workspace.config, "swarm_consensus", False))
+        self.subagents_enabled_cb.setChecked(getattr(workspace.config, "subagents_enabled", False))
+        self.subagents_max_depth_spin.setValue(max(1, min(5, getattr(workspace.config, "subagents_max_depth", 2))))
+        self.subagents_max_children_spin.setValue(max(1, min(20, getattr(workspace.config, "subagents_max_children", 5))))
+        self.subagents_timeout_spin.setValue(max(0, getattr(workspace.config, "subagents_run_timeout_seconds", 0) or 0))
         self.proactive_habits_cb.setChecked(getattr(workspace.config, "proactive_habits", False))
         self.proactive_screen_cb.setChecked(getattr(workspace.config, "proactive_screen", False))
         self.proactive_autonomy_cb.setChecked(getattr(workspace.config, "proactive_autonomy", False))
@@ -698,6 +726,10 @@ class WorkspaceDialog(QDialog):
             "use_shared_memory": self.use_shared_memory_cb.isChecked(),
             "swarm_auto_delegate": self.swarm_auto_delegate_cb.isChecked(),
             "swarm_consensus": self.swarm_consensus_cb.isChecked(),
+            "subagents_enabled": self.subagents_enabled_cb.isChecked(),
+            "subagents_max_depth": self.subagents_max_depth_spin.value(),
+            "subagents_max_children": self.subagents_max_children_spin.value(),
+            "subagents_run_timeout_seconds": self.subagents_timeout_spin.value() or 0,
             "proactive_habits": self.proactive_habits_cb.isChecked(),
             "proactive_screen": self.proactive_screen_cb.isChecked(),
             "proactive_autonomy": self.proactive_autonomy_cb.isChecked(),

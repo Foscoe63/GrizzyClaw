@@ -6,6 +6,7 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
+import httpx
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -78,19 +79,28 @@ class TelegramChannel(Channel):
                 )
             )
 
-            # Start bot
-            if self.config.get("webhook_url"):
-                await self.application.initialize()
-                await self.application.start()
-                await self.application.updater.start_webhook(
-                    listen="0.0.0.0",
-                    port=8443,
-                    webhook_url=self.config["webhook_url"],
-                )
-            else:
-                await self.application.initialize()
-                await self.application.start()
-                await self.application.updater.start_polling()
+            # Start bot (with one retry on connection failure for flaky networks)
+            for attempt in range(2):
+                try:
+                    if self.config.get("webhook_url"):
+                        await self.application.initialize()
+                        await self.application.start()
+                        await self.application.updater.start_webhook(
+                            listen="0.0.0.0",
+                            port=8443,
+                            webhook_url=self.config["webhook_url"],
+                        )
+                    else:
+                        await self.application.initialize()
+                        await self.application.start()
+                        await self.application.updater.start_polling()
+                    break
+                except httpx.ConnectError as e:
+                    if attempt == 0:
+                        logger.warning("Telegram first connection attempt failed, retrying in 2s: %s", e)
+                        await asyncio.sleep(2)
+                    else:
+                        raise
 
             self.status = ChannelStatus.CONNECTED
             await self.emit("connected")
@@ -107,6 +117,16 @@ class TelegramChannel(Channel):
             await self.application.stop()
             await self.application.shutdown()
 
+        except httpx.ConnectError as e:
+            logger.error("Telegram: cannot reach api.telegram.org — %s", e)
+            self.status = ChannelStatus.ERROR
+            msg = (
+                "Cannot reach Telegram servers (api.telegram.org). "
+                "Check firewall, VPN, or proxy; ensure this app can make outbound HTTPS connections. "
+                "Original error: " + str(e)
+            )
+            await self.emit("error", error=msg)
+            raise RuntimeError(msg) from e
         except Exception as e:
             logger.error(f"Failed to start Telegram channel: {e}", exc_info=True)
             self.status = ChannelStatus.ERROR

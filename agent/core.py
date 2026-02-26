@@ -2,9 +2,11 @@ import ast
 import asyncio
 import json
 import logging
+import threading
+import traceback
 import uuid
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Tuple
 
 from grizzyclaw.automation import CronScheduler, PLAYWRIGHT_AVAILABLE
 from grizzyclaw.config import Settings
@@ -30,6 +32,7 @@ from .command_parsers import (
     find_tool_call_blocks_relaxed,
     find_write_file_path_content_blocks,
     normalize_llm_json,
+    repair_json_single_quotes,
     strip_response_blocks,
 )
 from .context_utils import trim_session
@@ -149,6 +152,32 @@ def _session_filename(workspace_id: str, user_id: str) -> str:
     return f"{safe_ws}_{safe_user}.json"
 
 
+def _run_subagent_in_dedicated_thread(
+    agent: "AgentCore",
+    run_id: str,
+    task: str,
+    label: str,
+    parent_user_id: str,
+    spawn_depth: int,
+    run_timeout_seconds: Optional[int],
+) -> None:
+    """Run subagent in a dedicated thread with its own event loop so it is never cancelled by the message worker's loop closing."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(
+            agent._run_subagent_background(
+                run_id, task, label, parent_user_id, spawn_depth, run_timeout_seconds
+            )
+        )
+    except Exception as e:
+        logger.exception("Subagent thread run_id=%s failed", run_id)
+        if agent.subagent_registry:
+            agent.subagent_registry.fail(run_id, str(e))
+    finally:
+        loop.close()
+
+
 class AgentCore:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -165,6 +194,8 @@ class AgentCore:
         self.workspace_id: str = ""
         self.workspace_config: Optional[WorkspaceConfig] = None
         self.swarm_event_bus: Optional[Any] = None  # Set by WorkspaceManager for swarm event broadcast/subscribe
+        self.subagent_registry: Optional[Any] = None  # Set by WorkspaceManager for sub-agent spawn tracking
+        self.on_subagent_complete: Optional[Callable[[str, str, str, str], None]] = None  # (run_id, label, result, status) for GUI announce
         self.scheduled_tasks_db: Dict[str, Dict] = {}  # Store task metadata
         self._file_watcher = None
         self._load_scheduled_tasks()
@@ -182,6 +213,8 @@ class AgentCore:
         self.on_proactive_message = None
         # One-time swarm subscription for dynamic role allocation (subtask claim)
         self._swarm_subscribed = False
+        # Pending subagent tasks so callers (e.g. GUI worker) can wait before closing the event loop
+        self._pending_subagent_tasks: List[asyncio.Task[Any]] = []
         # Last browser state for GUI (current URL, last action summary)
         self._last_browser_url: Optional[str] = None
         self._last_browser_action: Optional[str] = None
@@ -807,6 +840,14 @@ When you receive tool results in a follow-up message, use them to continue your 
 To ask the user a clarifying question, output ASK_USER = {{ \"question\": \"...\" }}. You will get their reply in the next message.
 To delegate to a specialist role, output DELEGATE = {{ \"role\": \"researcher\" | \"writer\" | \"coder\", \"message\": \"...\" }}. You will get their response and can synthesize it.
 For debate between two specialists, output DEBATE = {{ \"topic\": \"...\", \"question\": \"...\", \"target_slugs\": [\"research\", \"coding\"] }}. You will get their positions and can synthesize a consensus."""
+            if self.workspace_config and getattr(self.workspace_config, "subagents_enabled", False):
+                system_content += """
+
+## SUB-AGENTS (parallel or delegated work)
+You can spawn a sub-agent to run a task in the background. The result will be announced when it finishes; do not wait or poll.
+Output SPAWN_SUBAGENT = {{ \"task\": \"clear instruction for the sub-agent\", \"label\": \"optional short label (e.g. Research topic X)\" }}.
+Optional: \"run_timeout_seconds\": N (0 = no timeout), \"model\": \"provider/model\" (override model for this run).
+Use for: parallel research, long-running summaries, or any focused subtask. The sub-agent runs in isolation; you will receive the result when it completes."""
             if not discovered_tools_map and mcp_list:
                 system_content += "\n\nNote: MCP tools were not discovered (servers may be offline). You can still use skills and memory."
             for s in unavailable_mcp_servers:
@@ -886,6 +927,11 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
         try:
             max_iterations = self._get_max_agentic_iterations()
             for iteration in range(max_iterations):
+                # Subagent cancel: if GUI requested kill, stop this run
+                if context and context.get("subagent_run_id") and self.subagent_registry:
+                    if self.subagent_registry.is_cancel_requested(context["subagent_run_id"]):
+                        yield "\n[Cancelled by user.]\n"
+                        return
                 content_filter = None
                 if getattr(self.settings, "safety_content_filter", True):
                     policy = getattr(self.settings, "safety_policy", None)
@@ -1476,6 +1522,114 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
                     logger.exception("Skill action error")
                     yield f"**❌ Skill error: {str(e)}**\n\n"
 
+            # Parse SPAWN_SUBAGENT (spawn a child agent run; non-blocking, result announced when done)
+            ctx = context or {}
+            current_spawn_depth = ctx.get("spawn_depth", 0)
+            if not isinstance(current_spawn_depth, (int, float)):
+                current_spawn_depth = 0
+            else:
+                current_spawn_depth = int(current_spawn_depth)
+            parent_run_id_ctx = ctx.get("parent_run_id")
+            # Ensure parent_run_id is str or None so registry/count_active_children never see a dict
+            if parent_run_id_ctx is not None and not isinstance(parent_run_id_ctx, str):
+                parent_run_id_ctx = None
+            if (
+                self.workspace_manager
+                and self.workspace_config
+                and getattr(self.workspace_config, "subagents_enabled", False)
+                and self.subagent_registry
+            ):
+                spawn_matches = find_json_blocks(response_text, "SPAWN_SUBAGENT")
+                if not spawn_matches:
+                    spawn_matches = find_json_blocks_fallback(response_text, "SPAWN_SUBAGENT")
+                for match_str in spawn_matches:
+                    try:
+                        normalized = normalize_llm_json(match_str)
+                        logger.debug("SPAWN_SUBAGENT raw match: %r", match_str[:500])
+                        logger.debug("SPAWN_SUBAGENT normalized: %r", normalized[:500])
+                        spawn_cmd = None
+                        try:
+                            spawn_cmd = json.loads(normalized)
+                        except json.JSONDecodeError as je:
+                            logger.debug("SPAWN_SUBAGENT json.loads failed: %s", je)
+                            # Retry after converting Python-style single-quoted strings to JSON double-quoted
+                            try:
+                                spawn_cmd = json.loads(repair_json_single_quotes(normalized))
+                            except json.JSONDecodeError as je2:
+                                logger.debug("SPAWN_SUBAGENT repair_json also failed: %s", je2)
+                                pass
+                        if not spawn_cmd or not isinstance(spawn_cmd, dict):
+                            logger.warning("SPAWN_SUBAGENT invalid JSON, raw=%r", match_str[:300])
+                            yield "**❌ SPAWN_SUBAGENT: invalid JSON.**\n\n"
+                            continue
+                        task = (spawn_cmd.get("task") or "").strip()
+                        if not task:
+                            yield "**❌ SPAWN_SUBAGENT requires a non-empty \"task\" field.**\n\n"
+                            continue
+                        label = (spawn_cmd.get("label") or "").strip() or ""
+                        run_timeout = spawn_cmd.get("run_timeout_seconds") or spawn_cmd.get("run_timeout")
+                        if isinstance(run_timeout, (int, float)) and run_timeout > 0:
+                            run_timeout = int(run_timeout)
+                        else:
+                            run_timeout = getattr(self.workspace_config, "subagents_run_timeout_seconds", 0) or None
+                        model_override = (spawn_cmd.get("model") or "").strip() or None
+                        max_depth = getattr(self.workspace_config, "subagents_max_depth", 2)
+                        if current_spawn_depth >= max_depth:
+                            yield f"**❌ SPAWN_SUBAGENT not allowed at this depth ({current_spawn_depth} >= {max_depth}).**\n\n"
+                            continue
+                        max_children = getattr(self.workspace_config, "subagents_max_children", 5)
+                        n_children = self.subagent_registry.count_active_children(parent_run_id_ctx, self.workspace_id or "")
+                        if n_children >= max_children:
+                            yield f"**❌ SPAWN_SUBAGENT: max concurrent children reached ({n_children}/{max_children}).**\n\n"
+                            continue
+                        run = self.subagent_registry.register(
+                            task=task,
+                            workspace_id=self.workspace_id or "",
+                            parent_run_id=parent_run_id_ctx,
+                            spawn_depth=current_spawn_depth + 1,
+                            label=label or task[:60] + ("…" if len(task) > 60 else ""),
+                            model_override=model_override,
+                            run_timeout_seconds=run_timeout,
+                        )
+                        logger.info(
+                            "SPAWN_SUBAGENT registered run_id=%s registry_id=%s workspace_id=%s",
+                            run.run_id, id(self.subagent_registry), self.workspace_id or "",
+                        )
+                        if self.swarm_event_bus:
+                            await self.swarm_event_bus.emit(
+                                SwarmEventTypes.SUBAGENT_STARTED,
+                                {
+                                    "run_id": run.run_id,
+                                    "task_summary": run.task_summary,
+                                    "label": run.label,
+                                    "spawn_depth": run.spawn_depth,
+                                },
+                                workspace_id=self.workspace_id,
+                                channel=getattr(self.workspace_config, "inter_agent_channel", None),
+                            )
+                        # Run in a dedicated thread with its own event loop so completion is never lost when the message worker's loop closes
+                        thread = threading.Thread(
+                            target=_run_subagent_in_dedicated_thread,
+                            args=(
+                                self,
+                                run.run_id,
+                                task,
+                                run.label,
+                                user_id,
+                                run.spawn_depth,
+                                run_timeout,
+                            ),
+                            daemon=True,
+                            name=f"subagent-{run.run_id}",
+                        )
+                        thread.start()
+                        yield f"\n\n**🤖 Sub-agent spawned** — run_id=`{run.run_id}`" + (f" — {run.label}" if run.label else "") + "\n"
+                    except Exception as e:
+                        logger.exception("SPAWN_SUBAGENT error")
+                        tb = traceback.format_exc()
+                        logger.error("SPAWN_SUBAGENT full traceback:\n%s", tb)
+                        yield f"**❌ Sub-agent spawn error: {str(e)}**\n\n"
+
             # Parse EXEC_COMMAND (shell commands - requires approval when exec_commands_enabled)
             if getattr(self.settings, "exec_commands_enabled", False):
                 exec_matches = find_json_blocks(response_text, "EXEC_COMMAND")
@@ -1566,6 +1720,98 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
             logger.exception("Error generating response")
             err_msg = str(e).strip() or "Unknown error"
             yield f"Sorry, I encountered an error. {err_msg}"
+
+    async def _run_subagent_background(
+        self,
+        run_id: str,
+        task: str,
+        label: str,
+        parent_user_id: str,
+        spawn_depth: int,
+        run_timeout_seconds: Optional[int],
+    ) -> None:
+        """Run a sub-agent in the background; on completion update registry, emit event, and call GUI callback."""
+        child_user_id = f"subagent_{run_id}"
+        child_context: Dict[str, Any] = {
+            "subagent_run_id": run_id,
+            "spawn_depth": spawn_depth,
+            "parent_run_id": run_id,
+        }
+
+        async def collect_chunks() -> str:
+            out: List[str] = []
+            async for chunk in self.process_message(child_user_id, task, context=child_context):
+                if self.subagent_registry and self.subagent_registry.is_cancel_requested(run_id):
+                    break
+                out.append(chunk)
+            return "".join(out)
+
+        try:
+            if run_timeout_seconds and run_timeout_seconds > 0:
+                full_result = await asyncio.wait_for(
+                    collect_chunks(),
+                    timeout=float(run_timeout_seconds),
+                )
+            else:
+                full_result = await collect_chunks()
+            full_result = full_result.strip()
+            if self.subagent_registry:
+                if self.subagent_registry.is_cancel_requested(run_id):
+                    self.subagent_registry.cancel(run_id)
+                else:
+                    self.subagent_registry.complete(run_id, full_result)
+            if self.swarm_event_bus and self.workspace_config:
+                await self.swarm_event_bus.emit(
+                    SwarmEventTypes.SUBAGENT_COMPLETED,
+                    {
+                        "run_id": run_id,
+                        "label": label,
+                        "task_summary": (task.strip().split("\n")[0][:120] or ""),
+                        "result_preview": full_result[:500] + "…" if len(full_result) > 500 else full_result,
+                    },
+                    workspace_id=self.workspace_id,
+                    channel=getattr(self.workspace_config, "inter_agent_channel", None),
+                )
+            if self.on_subagent_complete:
+                try:
+                    logger.info("Calling on_subagent_complete callback run_id=%s status=completed", run_id)
+                    self.on_subagent_complete(run_id, label, full_result, "completed")
+                except Exception as cb_e:
+                    logger.warning("on_subagent_complete callback error: %s", cb_e)
+            else:
+                logger.warning("on_subagent_complete callback not set for run_id=%s", run_id)
+        except asyncio.TimeoutError:
+            if self.subagent_registry:
+                self.subagent_registry.timeout(run_id)
+            if self.swarm_event_bus and self.workspace_config:
+                await self.swarm_event_bus.emit(
+                    SwarmEventTypes.SUBAGENT_FAILED,
+                    {"run_id": run_id, "label": label, "error": "Run timed out"},
+                    workspace_id=self.workspace_id,
+                    channel=getattr(self.workspace_config, "inter_agent_channel", None),
+                )
+            if self.on_subagent_complete:
+                try:
+                    self.on_subagent_complete(run_id, label, "", "timed_out")
+                except Exception as cb_e:
+                    logger.warning("on_subagent_complete callback error: %s", cb_e)
+        except Exception as e:
+            err_msg = str(e).strip() or "Unknown error"
+            logger.exception("Sub-agent run %s failed", run_id)
+            if self.subagent_registry:
+                self.subagent_registry.fail(run_id, err_msg)
+            if self.swarm_event_bus and self.workspace_config:
+                await self.swarm_event_bus.emit(
+                    SwarmEventTypes.SUBAGENT_FAILED,
+                    {"run_id": run_id, "label": label, "error": err_msg},
+                    workspace_id=self.workspace_id,
+                    channel=getattr(self.workspace_config, "inter_agent_channel", None),
+                )
+            if self.on_subagent_complete:
+                try:
+                    self.on_subagent_complete(run_id, label, err_msg, "failed")
+                except Exception as cb_e:
+                    logger.warning("on_subagent_complete callback error: %s", cb_e)
 
     def _session_path(self, user_id: str) -> Path:
         return _sessions_dir() / _session_filename(self.workspace_id or "default", user_id)

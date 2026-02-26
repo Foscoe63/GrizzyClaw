@@ -177,6 +177,7 @@ async def _list_tools_http(config: Dict[str, Any]) -> List[Tuple[str, str]]:
     try:
         import httpx
 
+        # Allow moderate connection pooling for repeated calls
         async with httpx.AsyncClient(
             headers=headers,
             timeout=httpx.Timeout(15.0),
@@ -228,9 +229,17 @@ async def _call_tool_http(
     try:
         import httpx
 
+        # Per-server timeout override (clamped)
+        t_override = 0
+        try:
+            t_override = int(config.get("timeout_s", 0) or 0)
+        except Exception:
+            t_override = 0
+        effective_timeout = max(5, min(300, t_override or 30))
+
         async with httpx.AsyncClient(
             headers=headers,
-            timeout=httpx.Timeout(30.0),
+            timeout=httpx.Timeout(float(effective_timeout)),
         ) as http_client:
             async with streamable_http_client(mcp_url, http_client=http_client) as (
                 read,
@@ -495,26 +504,34 @@ async def call_mcp_tool(
                         parts.append(content.text)
                 return "\n".join(parts) if parts else "(No output)"
 
+    # Per-server timeout override (clamped)
+    t_override = 0
+    try:
+        t_override = int(config.get("timeout_s", 0) or 0)
+    except Exception:
+        t_override = 0
+    effective_timeout = max(5, min(300, t_override or DEFAULT_TOOL_CALL_TIMEOUT))
+
     async def _call_with_retry() -> str:
         try:
-            return await asyncio.wait_for(_run_stdio_call(), timeout=DEFAULT_TOOL_CALL_TIMEOUT)
+            return await asyncio.wait_for(_run_stdio_call(), timeout=effective_timeout)
         except FileNotFoundError:
             raise
         except (asyncio.TimeoutError, ConnectionError, OSError) as e:
             logger.warning("MCP transient error (will retry once): %s", e)
             await asyncio.sleep(1.5)
-            return await asyncio.wait_for(_run_stdio_call(), timeout=DEFAULT_TOOL_CALL_TIMEOUT)
+            return await asyncio.wait_for(_run_stdio_call(), timeout=effective_timeout)
         except Exception as e:
             if "timeout" in str(e).lower() or "connection" in str(e).lower():
                 logger.warning("MCP transient error (will retry once): %s", e)
                 await asyncio.sleep(1.5)
-                return await asyncio.wait_for(_run_stdio_call(), timeout=DEFAULT_TOOL_CALL_TIMEOUT)
+                return await asyncio.wait_for(_run_stdio_call(), timeout=effective_timeout)
             raise
 
     try:
         return await _call_with_retry()
     except asyncio.TimeoutError:
-        return f"**❌ MCP tool call timed out** (>{DEFAULT_TOOL_CALL_TIMEOUT}s). Server '{mcp_name}' may be stuck."
+        return f"**❌ MCP tool call timed out** (>{effective_timeout}s). Server '{mcp_name}' may be stuck."
     except FileNotFoundError:
         base = cmd.split("/")[-1].split()[0] if cmd else "command"
         return (

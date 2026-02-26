@@ -100,8 +100,8 @@ def _find_block_ranges(text: str, prefix: str) -> list[tuple[int, int]]:
 
 
 def strip_response_blocks(text: str) -> str:
-    """Remove SKILL_ACTION, TOOL_CALL, EXEC_COMMAND, SCHEDULE_TASK blocks so the user sees only pertinent text and tool results."""
-    prefixes = ("SKILL_ACTION", "TOOL_CALL", "EXEC_COMMAND", "SCHEDULE_TASK")
+    """Remove SKILL_ACTION, TOOL_CALL, EXEC_COMMAND, SCHEDULE_TASK, SPAWN_SUBAGENT blocks so the user sees only pertinent text and tool results."""
+    prefixes = ("SKILL_ACTION", "TOOL_CALL", "EXEC_COMMAND", "SCHEDULE_TASK", "SPAWN_SUBAGENT")
     all_ranges: list[tuple[int, int]] = []
     for prefix in prefixes:
         all_ranges.extend(_find_block_ranges(text, prefix))
@@ -378,9 +378,12 @@ def strip_code_fence(s: str) -> str:
 
 
 def normalize_llm_json(s: str) -> str:
-    """Fix common LLM JSON: backslashes before quotes, smart quotes, code fences."""
+    """Fix common LLM JSON: backslashes before quotes, smart quotes, code fences, double braces."""
     s = strip_code_fence(s)
     s = strip_json_comments(s)
+    # Fix double braces {{ }} -> { } (LLMs copy from escaped prompt templates)
+    s = re.sub(r'\{\{', '{', s)
+    s = re.sub(r'\}\}', '}', s)
     # Normalize all Unicode quote chars to ASCII (models often emit „ " " etc.)
     for _o, _r in [
         ("\u201c", '"'), ("\u201d", '"'), ("\u201e", '"'), ("\u201f", '"'),
@@ -404,3 +407,61 @@ def normalize_llm_json(s: str) -> str:
     s = re.sub(r',\s*}', '}', s)
     s = re.sub(r',\s*]', ']', s)
     return s
+
+
+def repair_json_single_quotes(s: str) -> str:
+    """Convert Python-style single-quoted strings to JSON double-quoted so json.loads accepts it.
+    Handles 'key': 'value' and escaped quotes inside single-quoted strings.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(s)
+    while i < n:
+        c = s[i]
+        if c == '"':
+            # Double-quoted string: keep as-is, skip to closing "
+            out.append(c)
+            i += 1
+            while i < n:
+                c2 = s[i]
+                if c2 == "\\":
+                    out.append(s[i : i + 2])
+                    i += 2
+                    continue
+                if c2 == '"':
+                    out.append(c2)
+                    i += 1
+                    break
+                out.append(c2)
+                i += 1
+            continue
+        if c == "'":
+            # Single-quoted string: convert to "..."
+            start = i
+            i += 1
+            content: list[str] = []
+            while i < n:
+                c2 = s[i]
+                if c2 == "\\":
+                    if i + 1 < n:
+                        content.append(s[i : i + 2])
+                        i += 2
+                    else:
+                        content.append("\\")
+                        i += 1
+                    continue
+                if c2 == "'":
+                    i += 1
+                    break
+                content.append(c2)
+                i += 1
+            # JSON-escape content: \ -> \\, " -> \"
+            raw = "".join(content)
+            escaped = raw.replace("\\", "\\\\").replace('"', '\\"')
+            out.append('"')
+            out.append(escaped)
+            out.append('"')
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)

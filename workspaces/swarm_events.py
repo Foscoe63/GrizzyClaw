@@ -66,6 +66,9 @@ class SwarmEventBus:
         channel: Optional[str] = None,
     ) -> None:
         """Emit an event to subscribers. Subscribers for this type (and optionally this channel) are notified."""
+        # Ensure channel is hashable (str or None); handler keys use (event_type, channel)
+        if channel is not None and not isinstance(channel, str):
+            channel = None
         event = SwarmEvent(
             type=event_type,
             data=data,
@@ -116,3 +119,7 @@ class SwarmEventTypes:
     DEBATE_RESPONSE = "debate_response"
     CONSENSUS_READY = "consensus_ready"
     REQUEST_TO_SPECIALIST = "request_to_specialist"  # One specialist asks another (target_slug, message, from_slug)
+    # Sub-agent lifecycle (spawned by agent via SPAWN_SUBAGENT)
+    SUBAGENT_STARTED = "subagent_started"
+    SUBAGENT_COMPLETED = "subagent_completed"
+    SUBAGENT_FAILED = "subagent_failed"
