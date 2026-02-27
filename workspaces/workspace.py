@@ -271,4 +271,19 @@ WORKSPACE_TEMPLATES = {
             proactive_habits=False
         )
     ),
+    "designer": Workspace(
+        name="Designer",
+        description="Design, UI/UX, and visual creativity",
+        icon="🎨",
+        color="#AF52DE",
+        config=WorkspaceConfig(
+            max_tokens=131072,
+            system_prompt="You are a design assistant. Help with UI/UX design, visual design, layout, color and typography choices, design systems, and creative direction. Suggest improvements for clarity, accessibility, and aesthetics. When discussing code (HTML/CSS/SwiftUI etc.), provide concrete examples.\n\n## SPECIALIST_DESIGN\nFocus on design and visual tasks. Respond concisely. If needed, @leader with summary.",
+            temperature=0.7,
+            enable_inter_agent=True,
+            use_shared_memory=True,
+            swarm_role="specialist_design",
+            proactive_habits=False
+        )
+    ),
 }

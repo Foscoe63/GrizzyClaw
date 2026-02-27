@@ -720,12 +720,19 @@ Output EXEC_COMMAND in your first response. Default cwd is home directory. Safe 
         
         # Build skill list for prompt
         skill_examples = ""
+        reference_skills_content = ""
         if self.settings.enabled_skills:
-            from grizzyclaw.skills.registry import get_skill
+            from grizzyclaw.skills.registry import get_skill, get_skill_reference_content
             for s_id in self.settings.enabled_skills:
                 skill = get_skill(s_id)
                 if skill:
                     skill_examples += f"- {skill.name}: {skill.description}\\n"
+                    if getattr(skill, "reference_dir", None):
+                        ref_text = get_skill_reference_content(s_id)
+                        if ref_text:
+                            reference_skills_content += f"\n\n## {skill.name} (reference skill)\n\n{ref_text}"
+        if reference_skills_content:
+            reference_skills_content = "\n\n## REFERENCE SKILLS (follow this guidance when relevant)" + reference_skills_content
         mcp_list = []
         discovered_tools_map: Dict[str, List[Tuple[str, str]]] = {}
         unavailable_mcp_servers: List[str] = []
@@ -799,6 +806,7 @@ Current date: {_today}. When the user says "today", "just today", "this morning"
 Enabled skills: {skills_str}
 
 {skill_examples.strip() if skill_examples else ""}
+{reference_skills_content}
 
 ## BUILT-IN SKILLS
 

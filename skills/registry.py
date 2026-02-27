@@ -18,10 +18,11 @@ class SkillMetadata:
     description: str
     icon: str = "⚡"
     config_schema: Optional[Dict[str, Any]] = None
-    source: str = "builtin"  # builtin, local, hf
+    source: str = "builtin"  # builtin, local, hf, plugin
     executor: Optional[Any] = None  # Callable for dynamic execution
     version: Optional[str] = None  # e.g. "1.0.0"
     update_url: Optional[str] = None  # URL to check for newer version (e.g. GitHub raw)
+    reference_dir: Optional[str] = None  # Path to folder with SKILL.md (Agent Skills format); content injected into prompt when enabled
 
 
 # Built-in skills registry
@@ -141,6 +142,12 @@ def load_dynamic_skills(data_dir: Optional[Path] = None):
                     meta = module.SKILL_METADATA
                     if isinstance(meta, dict):
                         skill_id = meta.get("id", py_file.stem)
+                        ref_dir = meta.get("reference_dir")
+                        if ref_dir:
+                            ref_path = Path(ref_dir)
+                            if not ref_path.is_absolute():
+                                ref_path = (py_file.parent / ref_path).resolve()
+                            ref_dir = str(ref_path)
                         DYNAMIC_SKILL_REGISTRY[skill_id] = SkillMetadata(
                             id=skill_id,
                             name=meta.get("name", skill_id),
@@ -148,7 +155,8 @@ def load_dynamic_skills(data_dir: Optional[Path] = None):
                             icon=meta.get("icon", "🔌"),
                             config_schema=meta.get("config_schema"),
                             source="plugin",
-                            executor=getattr(module, "execute", None)
+                            executor=getattr(module, "execute", None),
+                            reference_dir=ref_dir or None,
                         )
                         logger.info(f"Loaded dynamic skill plugin: {skill_id}")
         except Exception as e:
@@ -156,6 +164,13 @@ def load_dynamic_skills(data_dir: Optional[Path] = None):
 
 # Call it once on import
 load_dynamic_skills()
+
+
+def reload_dynamic_skills(data_dir: Optional[Path] = None) -> None:
+    """Clear plugin skills and reload from plugins dir (e.g. after installing from URL)."""
+    DYNAMIC_SKILL_REGISTRY.clear()
+    load_dynamic_skills(data_dir=data_dir)
+
 
 def get_available_skills() -> List[SkillMetadata]:
     """Return all skills in the registry."""
@@ -165,6 +180,38 @@ def get_available_skills() -> List[SkillMetadata]:
 def get_skill(id: str) -> Optional[SkillMetadata]:
     """Get skill metadata by id."""
     return SKILL_REGISTRY.get(id) or DYNAMIC_SKILL_REGISTRY.get(id)
+
+
+def get_skill_reference_content(skill_id: str, max_chars: int = 120000) -> str:
+    """Read SKILL.md and references/*.md from a skill's reference_dir (Agent Skills format). Returns concatenated markdown or empty string."""
+    meta = get_skill(skill_id)
+    if not meta or not getattr(meta, "reference_dir", None):
+        return ""
+    ref_path = Path(meta.reference_dir)
+    if not ref_path.exists():
+        return ""
+    out: List[str] = []
+    total = 0
+    skill_md = ref_path / "SKILL.md"
+    if skill_md.exists():
+        try:
+            text = skill_md.read_text(encoding="utf-8", errors="replace")
+            out.append(f"# {meta.name} (SKILL.md)\n\n{text}")
+            total += len(text)
+        except Exception as e:
+            logger.warning("Could not read SKILL.md for %s: %s", skill_id, e)
+    refs_dir = ref_path / "references"
+    if refs_dir.exists() and refs_dir.is_dir() and total < max_chars:
+        for f in sorted(refs_dir.glob("*.md")):
+            if total >= max_chars:
+                break
+            try:
+                text = f.read_text(encoding="utf-8", errors="replace")
+                out.append(f"\n\n# Reference: {f.stem}\n\n{text}")
+                total += len(text)
+            except Exception as e:
+                logger.warning("Could not read %s: %s", f, e)
+    return "\n".join(out)[:max_chars] if out else ""
 
 
 def load_user_skills(data_dir: Optional[Path] = None) -> Dict[str, Dict[str, Any]]:

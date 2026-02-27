@@ -31,6 +31,7 @@ class WorkspaceManager:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         
         self.workspaces_file = self.data_dir / "workspaces.json"
+        self._user_templates_file = self.data_dir / "workspace_templates.json"
         self.workspaces: Dict[str, Workspace] = {}
         self.active_workspace_id: Optional[str] = None
         self.swarm_event_bus = SwarmEventBus()
@@ -88,6 +89,49 @@ class WorkspaceManager:
         except Exception as e:
             logger.error(f"Failed to save workspaces: {e}")
     
+    def get_all_templates(self) -> Dict[str, Workspace]:
+        """Return built-in templates merged with user-defined templates from workspace_templates.json."""
+        out = dict(WORKSPACE_TEMPLATES)
+        if self._user_templates_file.exists():
+            try:
+                with open(self._user_templates_file, "r") as f:
+                    data = json.load(f)
+                for key, t in data.items():
+                    if isinstance(t, dict) and "name" in t and "config" in t:
+                        out[key] = Workspace(
+                            name=t["name"],
+                            description=t.get("description", ""),
+                            icon=t.get("icon", "🤖"),
+                            color=t.get("color", "#007AFF"),
+                            config=WorkspaceConfig.from_dict(t["config"]),
+                        )
+            except Exception as e:
+                logger.warning("Failed to load user workspace templates: %s", e)
+        return out
+
+    def add_user_template(self, key: str, workspace: Workspace) -> None:
+        """Save a workspace as a user-defined template. Key must be a valid identifier (e.g. designer, my_template)."""
+        key = key.strip().lower().replace(" ", "_")
+        if not key:
+            raise ValueError("Template key cannot be empty")
+        data = {}
+        if self._user_templates_file.exists():
+            try:
+                with open(self._user_templates_file, "r") as f:
+                    data = json.load(f)
+            except Exception:
+                pass
+        data[key] = {
+            "name": workspace.name,
+            "description": workspace.description or "",
+            "icon": workspace.icon or "🤖",
+            "color": workspace.color or "#007AFF",
+            "config": workspace.config.to_dict(),
+        }
+        with open(self._user_templates_file, "w") as f:
+            json.dump(data, f, indent=2)
+        logger.info("Saved user template: %s", key)
+
     def create_workspace(
         self,
         name: str,
@@ -104,21 +148,23 @@ class WorkspaceManager:
             description: Description
             icon: Emoji icon
             color: Color hex code
-            template: Template name (default, coding, writing, research, personal, planning)
+            template: Template name (default, coding, writing, research, personal, planning, designer, or user-defined)
             config: Custom configuration (overrides template)
         
         Returns:
             Created workspace
         """
+        all_templates = self.get_all_templates()
         # Start from template if specified
-        if template and template in WORKSPACE_TEMPLATES:
+        if template and template in all_templates:
+            t = all_templates[template]
             workspace = Workspace(
                 name=name,
-                description=description or WORKSPACE_TEMPLATES[template].description,
-                icon=icon or WORKSPACE_TEMPLATES[template].icon,
-                color=color or WORKSPACE_TEMPLATES[template].color,
+                description=description or t.description,
+                icon=icon or t.icon,
+                color=color or t.color,
                 order=len(self.get_workspaces_sorted()),
-                config=WorkspaceConfig.from_dict(WORKSPACE_TEMPLATES[template].config.to_dict())
+                config=WorkspaceConfig.from_dict(t.config.to_dict())
             )
         else:
             workspace = Workspace(

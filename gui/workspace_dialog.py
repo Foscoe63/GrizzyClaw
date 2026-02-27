@@ -1041,19 +1041,20 @@ class WorkspaceDialog(QDialog):
 
 
 class TemplateDialog(QDialog):
-    """Dialog for selecting a workspace template"""
+    """Dialog for selecting a workspace template and optionally adding new ones."""
     
     def __init__(self, parent=None):
         super().__init__(parent)
         self.selected_template = None
         self.is_dark = False
+        self.manager = getattr(parent, "manager", None)
         
         # Get theme from parent (WorkspaceDialog)
         if parent and hasattr(parent, 'is_dark'):
             self.is_dark = parent.is_dark
         
         self.setWindowTitle("Create Workspace")
-        self.setMinimumSize(500, 400)
+        self.setMinimumSize(500, 480)
         self.setup_ui()
     
     def setup_ui(self):
@@ -1122,15 +1123,27 @@ class TemplateDialog(QDialog):
                 color: white;
             }}
         """)
-        
-        from grizzyclaw.workspaces.workspace import WORKSPACE_TEMPLATES
-        for key, template in WORKSPACE_TEMPLATES.items():
-            item = QListWidgetItem(f"{template.icon} {template.name}\n   {template.description}")
-            item.setData(Qt.ItemDataRole.UserRole, key)
-            self.template_list.addItem(item)
-        
-        self.template_list.setCurrentRow(0)
+        self._refresh_template_list()
         layout.addWidget(self.template_list, 1)
+        
+        # Add new template button (only when manager available)
+        if self.manager:
+            add_tpl_btn = QPushButton("➕ Add new template")
+            hover = "rgba(0,0,0,0.05)" if not self.is_dark else "rgba(255,255,255,0.08)"
+            add_tpl_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: transparent;
+                    color: {self.accent_color};
+                    border: 1px dashed {self.border_color};
+                    border-radius: 6px;
+                    padding: 8px 16px;
+                }}
+                QPushButton:hover {{
+                    background-color: {hover};
+                }}
+            """)
+            add_tpl_btn.clicked.connect(self._on_add_new_template)
+            layout.addWidget(add_tpl_btn)
         
         # Buttons
         btn_layout = QHBoxLayout()
@@ -1164,9 +1177,137 @@ class TemplateDialog(QDialog):
         
         layout.addLayout(btn_layout)
     
+    def _refresh_template_list(self):
+        """Reload template list from manager (built-in + user) or fallback to built-in only."""
+        self.template_list.clear()
+        if self.manager:
+            templates = self.manager.get_all_templates()
+        else:
+            from grizzyclaw.workspaces.workspace import WORKSPACE_TEMPLATES
+            templates = WORKSPACE_TEMPLATES
+        for key, template in templates.items():
+            item = QListWidgetItem(f"{template.icon} {template.name}\n   {template.description}")
+            item.setData(Qt.ItemDataRole.UserRole, key)
+            self.template_list.addItem(item)
+        self.template_list.setCurrentRow(0)
+
+    def _on_add_new_template(self):
+        """Open dialog to add a new user-defined template (based on currently selected template)."""
+        current = self.template_list.currentItem()
+        base_key = current.data(Qt.ItemDataRole.UserRole) if current else "default"
+        templates = self.manager.get_all_templates()
+        base = templates.get(base_key) or templates.get("default")
+        if not base:
+            QMessageBox.warning(self, "Add template", "No template to copy from.")
+            return
+        dialog = AddTemplateDialog(self, base, self.manager, self.is_dark)
+        if dialog.exec():
+            self._refresh_template_list()
+            # Select the newly added template
+            key = dialog.saved_key
+            for i in range(self.template_list.count()):
+                if self.template_list.item(i).data(Qt.ItemDataRole.UserRole) == key:
+                    self.template_list.setCurrentRow(i)
+                    break
+
     def accept_template(self):
         """Accept the selected template"""
         current = self.template_list.currentItem()
         if current:
             self.selected_template = current.data(Qt.ItemDataRole.UserRole)
         self.accept()
+
+
+class AddTemplateDialog(QDialog):
+    """Dialog to add a new workspace template (name, description, icon, color; config copied from selected)."""
+    
+    def __init__(self, parent=None, base_workspace=None, manager=None, is_dark=False):
+        super().__init__(parent)
+        self.base_workspace = base_workspace
+        self.manager = manager
+        self.saved_key = None
+        self.is_dark = is_dark
+        self.setWindowTitle("Add new template")
+        self.setMinimumSize(400, 320)
+        self._setup_ui()
+    
+    def _setup_ui(self):
+        if self.is_dark:
+            bg, fg, border, input_bg, accent = '#1E1E1E', '#FFFFFF', '#3A3A3C', '#3A3A3C', '#0A84FF'
+        else:
+            bg, fg, border, input_bg, accent = '#FFFFFF', '#1C1C1E', '#E5E5EA', '#FFFFFF', '#007AFF'
+        self.setStyleSheet(f"""
+            QDialog {{ background-color: {bg}; }}
+            QLabel {{ color: {fg}; }}
+            QLineEdit, QTextEdit {{
+                background-color: {input_bg}; color: {fg};
+                border: 1px solid {border}; border-radius: 4px; padding: 6px 8px;
+            }}
+        """)
+        layout = QFormLayout(self)
+        layout.setSpacing(12)
+        self.key_input = QLineEdit()
+        self.key_input.setPlaceholderText("e.g. designer, my_assistant (letters, numbers, underscores)")
+        layout.addRow("Template key:", self.key_input)
+        self.name_input = QLineEdit()
+        self.name_input.setPlaceholderText("Display name")
+        if self.base_workspace:
+            self.name_input.setText(self.base_workspace.name or "")
+        layout.addRow("Name:", self.name_input)
+        self.desc_input = QLineEdit()
+        self.desc_input.setPlaceholderText("Short description")
+        if self.base_workspace:
+            self.desc_input.setText(self.base_workspace.description or "")
+        layout.addRow("Description:", self.desc_input)
+        self.icon_input = QLineEdit()
+        self.icon_input.setPlaceholderText("e.g. 🎨")
+        if self.base_workspace:
+            self.icon_input.setText(self.base_workspace.icon or "🤖")
+        layout.addRow("Icon (emoji):", self.icon_input)
+        self.color_input = QLineEdit()
+        self.color_input.setPlaceholderText("#007AFF")
+        if self.base_workspace:
+            self.color_input.setText(self.base_workspace.color or "#007AFF")
+        layout.addRow("Color (hex):", self.color_input)
+        layout.addRow(QLabel("Config (system prompt, etc.) is copied from the template you had selected."))
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_layout.addWidget(cancel_btn)
+        save_btn = QPushButton("Save template")
+        save_btn.setStyleSheet(f"QPushButton {{ background-color: {accent}; color: white; border: none; border-radius: 6px; padding: 8px 20px; }}")
+        save_btn.clicked.connect(self._save)
+        btn_layout.addWidget(save_btn)
+        layout.addRow(btn_layout)
+    
+    def _save(self):
+        import re
+        key = (self.key_input.text() or "").strip().lower().replace(" ", "_")
+        if not key:
+            QMessageBox.warning(self, "Add template", "Please enter a template key (e.g. designer).")
+            return
+        if not re.match(r"^[a-z0-9_]+$", key):
+            QMessageBox.warning(self, "Add template", "Template key can only contain letters, numbers, and underscores.")
+            return
+        name = (self.name_input.text() or "").strip() or key.replace("_", " ").title()
+        desc = (self.desc_input.text() or "").strip()
+        icon = (self.icon_input.text() or "").strip() or "🤖"
+        color = (self.color_input.text() or "").strip() or "#007AFF"
+        if not self.base_workspace or not self.manager:
+            QMessageBox.warning(self, "Add template", "Cannot save: no base template or manager.")
+            return
+        workspace = Workspace(
+            name=name,
+            description=desc,
+            icon=icon,
+            color=color,
+            config=WorkspaceConfig.from_dict(self.base_workspace.config.to_dict()),
+        )
+        try:
+            self.manager.add_user_template(key, workspace)
+            self.saved_key = key
+            QMessageBox.information(self, "Add template", f"Template \"{name}\" saved. You can select it when creating a workspace.")
+            self.accept()
+        except Exception as e:
+            QMessageBox.warning(self, "Add template", f"Failed to save template: {e}")

@@ -98,6 +98,24 @@ def gui_command(args):
     gui_main()
 
 
+def skills_install_command(args):
+    """Install a reference skill from a GitHub URL (Agent Skills format)."""
+    from grizzyclaw.skills.install_from_url import install_skill_from_url
+    data_dir = Path(args.data_dir) if getattr(args, "data_dir", None) else None
+    try:
+        skill_id = install_skill_from_url(
+            url=args.url,
+            skill_folder=getattr(args, "skill_folder", None),
+            data_dir=data_dir,
+            skill_id=getattr(args, "skill_id", None),
+        )
+        print(f"✓ Installed skill: {skill_id}")
+        print("  Enable it in Settings → Integrations → Skills, then restart the app if it is already running.")
+    except Exception as e:
+        print(f"✗ Install failed: {e}")
+        sys.exit(1)
+
+
 def main():
     """Main CLI entry point"""
     parser = argparse.ArgumentParser(
@@ -121,6 +139,15 @@ def main():
     # Version command
     version_parser = subparsers.add_parser("version", help="Show version")
 
+    # Skills install (reference skills from GitHub)
+    skills_parser = subparsers.add_parser("skills", help="Manage skills")
+    skills_sub = skills_parser.add_subparsers(dest="skills_action")
+    install_parser = skills_sub.add_parser("install", help="Install a reference skill from a GitHub URL")
+    install_parser.add_argument("url", help="e.g. https://github.com/AvdLee/SwiftUI-Agent-Skill")
+    install_parser.add_argument("--skill-folder", default=None, help="Subfolder containing SKILL.md (e.g. swiftui-expert-skill)")
+    install_parser.add_argument("--skill-id", default=None, help="Skill id for the plugin (default: from folder name)")
+    install_parser.add_argument("--data-dir", default=None, help="Override data dir (default: ~/.grizzyclaw)")
+
     args, _ = parser.parse_known_args()
 
     # Setup logging
@@ -134,6 +161,8 @@ def main():
         daemon_command(args)
     elif args.command == "version":
         print(f"GrizzyClaw v{__version__}")
+    elif args.command == "skills" and getattr(args, "skills_action", None) == "install":
+        skills_install_command(args)
     else:
         # Default to GUI if no command specified
         gui_command(args)

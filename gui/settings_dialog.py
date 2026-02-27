@@ -2,6 +2,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import Optional
 import asyncio
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
@@ -97,6 +98,27 @@ class TelegramTestWorker(QThread):
             self.finished.emit(True, f"Connected successfully as @{username}")
         except Exception as e:
             self.finished.emit(False, str(e))
+
+
+class SkillInstallWorker(QThread):
+    """Run install_skill_from_url in background so UI stays responsive."""
+    finished = pyqtSignal(str, str)  # skill_id (empty on failure), error_message
+
+    def __init__(self, url: str, data_dir: Optional[Path], parent=None):
+        super().__init__(parent)
+        self.url = (url or "").strip()
+        self.data_dir = data_dir
+
+    def run(self):
+        if not self.url:
+            self.finished.emit("", "URL is empty.")
+            return
+        try:
+            from grizzyclaw.skills.install_from_url import install_skill_from_url
+            skill_id = install_skill_from_url(url=self.url, data_dir=self.data_dir)
+            self.finished.emit(skill_id, "")
+        except Exception as e:
+            self.finished.emit("", str(e))
 
 
 class SettingsTab(QWidget):
@@ -995,6 +1017,19 @@ class ClawHubTab(SettingsTab):
         skills_hint = QLabel("Skills: web_search, filesystem, documentation, browser, memory, scheduler, calendar, gmail, github, mcp_marketplace")
         skills_hint.setStyleSheet(f"color: {self.secondary_text}; font-size: 12px;")
         skills_layout.addWidget(skills_hint)
+        # Install from URL (runs grizzyclaw skills install <url>)
+        url_row = QHBoxLayout()
+        url_row.addWidget(QLabel("Install from URL:"))
+        self.skill_install_url = QLineEdit()
+        self.skill_install_url.setPlaceholderText("https://github.com/.../Skill-repo")
+        self.skill_install_url.setStyleSheet(self._input_style())
+        url_row.addWidget(self.skill_install_url, 1)
+        self.install_url_btn = QPushButton("Install")
+        self.install_url_btn.setToolTip("Clone repo and install as reference skill (SKILL.md). Requires git.")
+        self.install_url_btn.clicked.connect(self._on_install_skill_from_url)
+        self.install_url_btn.setStyleSheet(self._secondary_btn_style())
+        url_row.addWidget(self.install_url_btn)
+        skills_layout.addLayout(url_row)
         self.skills_list = QListWidget()
         self.skills_list.setFixedHeight(100)
         self.skills_list.setStyleSheet(self._list_style())
@@ -1039,6 +1074,42 @@ class ClawHubTab(SettingsTab):
         for skill in self.settings.enabled_skills:
             self.skills_list.addItem(skill)
         QMessageBox.information(self, "Refresh", "Skills list reloaded from settings.")
+
+    def _on_install_skill_from_url(self):
+        """Install a reference skill from the URL in skill_install_url (runs install_skill_from_url in a worker)."""
+        url = (self.skill_install_url.text() or "").strip()
+        if not url:
+            QMessageBox.information(
+                self, "Install from URL",
+                "Paste a GitHub repo URL (e.g. https://github.com/.../SwiftUI-Agent-Skill) and click Install.",
+            )
+            return
+        data_dir = Path(getattr(self.settings, "data_dir", None) or (Path.home() / ".grizzyclaw"))
+        self.install_url_btn.setEnabled(False)
+        self._skill_install_worker = SkillInstallWorker(url, data_dir, self)
+        self._skill_install_worker.finished.connect(self._skill_install_done)
+        self._skill_install_worker.start()
+
+    def _skill_install_done(self, skill_id: str, error_message: str):
+        """Handle result of Install from URL worker."""
+        self.install_url_btn.setEnabled(True)
+        self._skill_install_worker = None
+        if error_message:
+            QMessageBox.warning(
+                self, "Install from URL",
+                f"Install failed:\n\n{error_message}",
+            )
+            return
+        from grizzyclaw.skills.registry import reload_dynamic_skills
+        data_dir = Path(getattr(self.settings, "data_dir", None) or (Path.home() / ".grizzyclaw"))
+        reload_dynamic_skills(data_dir=data_dir)
+        enabled = [self.skills_list.item(i).text().strip().lower() for i in range(self.skills_list.count())]
+        if skill_id and skill_id.lower() not in enabled:
+            self.skills_list.addItem(skill_id)
+        QMessageBox.information(
+            self, "Install from URL",
+            f"Installed skill: {skill_id}. It has been added to your enabled list. Restart the app to use it in chat if it is already running.",
+        )
 
     def add_skill(self):
         _prompt = (
