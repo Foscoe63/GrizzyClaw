@@ -388,9 +388,10 @@ def _get_litellm_model(
     """Build LitellmModel from GrizzyClaw provider/model and settings."""
     _ensure_litellm_cost_map_in_bundle()
     try:
-        from agents.extensions.models.litellm_model import LitellmModel
-
+        # Import and configure litellm before LitellmModel so the Agents SDK's
+        # runtime check sees litellm as available (fixes bundled app / frozen build).
         _configure_litellm_for_sdk()
+        from agents.extensions.models.litellm_model import LitellmModel
     except (ImportError, FileNotFoundError) as e:
         logger.debug("LitellmModel import failed: %s", e)
         return None
@@ -454,6 +455,8 @@ def _load_mcp_server_instances(mcp_file: Path) -> List[Any]:
         for name, cfg in mcp_servers.items():
             if not isinstance(cfg, dict):
                 continue
+            if cfg.get("enabled", True) is False:
+                continue  # Disabled in settings: do not load for any model provider
             if "url" in cfg:
                 url = str(cfg.get("url", "")).rstrip("/")
                 if url.startswith("http"):

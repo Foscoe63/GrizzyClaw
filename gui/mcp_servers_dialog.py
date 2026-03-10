@@ -12,13 +12,14 @@ from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QComboBox,
     QSpinBox, QCheckBox, QPushButton, QMessageBox, QTextEdit, QFormLayout,
     QTreeWidget, QTreeWidgetItem, QWidget, QScrollArea, QFrame, QInputDialog,
-    QHeaderView, QPlainTextEdit, QFileDialog
+    QHeaderView, QPlainTextEdit, QFileDialog, QGridLayout
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QThread
-from PyQt6.QtGui import QFont, QShowEvent
+from PyQt6.QtGui import QFont, QShowEvent, QResizeEvent
 
 from grizzyclaw.mcp_client import (
     invalidate_tools_cache,
+    refresh_tools_cache_background,
     call_mcp_tool,
     validate_server_config,
     discover_one_server,
@@ -136,6 +137,9 @@ class MCPTab(QWidget):
     def showEvent(self, event: QShowEvent):
         super().showEvent(event)
         self.refresh_mcp_statuses()
+        QTimer.singleShot(0, self._update_mcp_scroll_max_width)
+        # Re-check status after a short delay so buttons show green when servers are still running (e.g. after switching tabs)
+        QTimer.singleShot(150, self.refresh_mcp_statuses)
         # Auto-start servers that were running when the app was last closed (once per launch)
         QTimer.singleShot(400, self._auto_start_saved_servers)
 
@@ -203,19 +207,22 @@ class MCPTab(QWidget):
         docs_link.setStyleSheet(f"color: {self.accent_color}; font-size: 12px;")
         mcp_layout.addWidget(docs_link)
         
-        # Server list: 4 columns (Server, Status, Tools, Test)
+        # Server list: 5 columns (Server, Use, Status, Tools, Test)
         self.mcp_servers_tree = QTreeWidget()
-        self.mcp_servers_tree.setHeaderLabels(["Server", "Status", "Tools", "Test"])
+        self.mcp_servers_tree.setHeaderLabels(["Server", "Use", "Status", "Tools", "Test"])
         header = self.mcp_servers_tree.header()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
-        self.mcp_servers_tree.setColumnWidth(1, 44)
-        self.mcp_servers_tree.setColumnWidth(2, 58)
-        self.mcp_servers_tree.setColumnWidth(3, 52)
-        self.mcp_servers_tree.setMinimumHeight(200)
-        self.mcp_servers_tree.setMaximumHeight(320)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
+        # Column widths and tree height: rows/controls at 80% scale; list a bit taller
+        self.mcp_servers_tree.setColumnWidth(1, 42)
+        self.mcp_servers_tree.setColumnWidth(2, 45)
+        self.mcp_servers_tree.setColumnWidth(3, 47)
+        self.mcp_servers_tree.setColumnWidth(4, 35)
+        self.mcp_servers_tree.setMinimumHeight(240)
+        self.mcp_servers_tree.setMaximumHeight(400)
         self.mcp_servers_tree.setUniformRowHeights(True)
         self.mcp_servers_tree.setAlternatingRowColors(True)
         self.mcp_servers_tree.setRootIsDecorated(False)
@@ -225,8 +232,8 @@ class MCPTab(QWidget):
         
         # Status legend
         legend = QLabel(
-            "🟢 Running  🔴 Stopped  •  Click status to toggle. "
-            "Local (stdio) servers are started automatically by the agent when you use their tools in chat; keeping them running here is optional."
+            "Use: enable/disable server for all model providers.  🟢 Running  🔴 Stopped  •  "
+            "Disabled servers are not loaded by LM Studio, OpenAI, or any other provider."
         )
         legend.setStyleSheet(f"color: {self.secondary_text}; font-size: 11px; padding: 4px 0; background: transparent;")
         mcp_layout.addWidget(legend)
@@ -246,16 +253,15 @@ class MCPTab(QWidget):
         quick_row.addStretch()
         mcp_layout.addLayout(quick_row)
 
-        # Button row
-        mcp_btns = QHBoxLayout()
-        mcp_btns.setSpacing(8)
-        
+        # Buttons in 2 rows so the card is not too wide
+        mcp_btns_grid = QGridLayout()
+        mcp_btns_grid.setSpacing(8)
+        row0 = QHBoxLayout()
+        row0.setSpacing(8)
         add_btn = QPushButton("+ Add Server")
         add_btn.clicked.connect(self.add_mcp)
         add_btn.setStyleSheet(self._primary_btn_style())
-        mcp_btns.addWidget(add_btn)
-        
-        # Marketplace dropdown menu
+        row0.addWidget(add_btn)
         self.marketplace_combo = QComboBox()
         self.marketplace_combo.addItem("📦 Add from Marketplace...")
         self.marketplace_combo.addItem("── Built-in ──", None)
@@ -277,54 +283,67 @@ class MCPTab(QWidget):
         self.marketplace_combo.setStyleSheet(self._combo_style())
         self.marketplace_combo.setToolTip("Select a marketplace source to browse and install MCP servers")
         self.marketplace_combo.currentIndexChanged.connect(self._on_marketplace_selected)
-        mcp_btns.addWidget(self.marketplace_combo)
-        
+        row0.addWidget(self.marketplace_combo)
         discover_btn = QPushButton("Discover on network")
         discover_btn.clicked.connect(self.discover_mcp_network)
         discover_btn.setStyleSheet(self._secondary_btn_style())
         discover_btn.setToolTip("Find MCP servers on the local network (mDNS / ZeroConf; servers must advertise _mcp._tcp.local.)")
-        mcp_btns.addWidget(discover_btn)
-        
+        row0.addWidget(discover_btn)
         edit_btn = QPushButton("Edit")
         edit_btn.clicked.connect(self.edit_mcp)
         edit_btn.setStyleSheet(self._secondary_btn_style())
-        mcp_btns.addWidget(edit_btn)
-        
+        row0.addWidget(edit_btn)
         remove_btn = QPushButton("Remove")
         remove_btn.clicked.connect(self.remove_mcp)
         remove_btn.setStyleSheet(self._secondary_btn_style())
-        mcp_btns.addWidget(remove_btn)
-        
-        mcp_btns.addStretch()
-        
+        row0.addWidget(remove_btn)
+        row0.addStretch()
+        mcp_btns_grid.addLayout(row0, 0, 0)
+        row1 = QHBoxLayout()
+        row1.setSpacing(8)
         refresh_btn = QPushButton("🔄 Refresh")
         refresh_btn.clicked.connect(self._on_refresh_mcp)
         refresh_btn.setToolTip("Refresh status and invalidate tool discovery cache")
         refresh_btn.setStyleSheet(self._secondary_btn_style())
-        mcp_btns.addWidget(refresh_btn)
-        
+        row1.addWidget(refresh_btn)
         test_btn = QPushButton("🧪 Test All")
         test_btn.clicked.connect(self.test_mcp)
         test_btn.setStyleSheet(self._secondary_btn_style())
-        mcp_btns.addWidget(test_btn)
-        
+        row1.addWidget(test_btn)
         errors_btn = QPushButton("📋 Error Log")
         errors_btn.clicked.connect(self._show_error_history)
         errors_btn.setToolTip("View recent errors for all MCP servers")
         errors_btn.setStyleSheet(self._secondary_btn_style())
-        mcp_btns.addWidget(errors_btn)
-        
-        mcp_layout.addLayout(mcp_btns)
+        row1.addWidget(errors_btn)
+        row1.addStretch()
+        mcp_btns_grid.addLayout(row1, 1, 0)
+        mcp_layout.addLayout(mcp_btns_grid)
         scroll_layout.addWidget(mcp_card)
         
         scroll_layout.addStretch()
         scroll.setWidget(scroll_content)
         layout.addWidget(scroll, 1)
-        
+        self._mcp_scroll_content = scroll_content
+        self._mcp_scroll = scroll
+        self._update_mcp_scroll_max_width()
+
         # Initialize MCP data
         self.mcp_file = Path(self.settings.mcp_servers_file).expanduser()
         self.mcp_servers_data = []
         self.load_mcp_list()
+
+    # Max width of the server list card so the circled area is narrower on open; still resizes with tab when smaller
+    MCP_SCROLL_MAX_WIDTH = 680
+
+    def _update_mcp_scroll_max_width(self):
+        """Keep the server list area narrower on open; cap width so it doesn't stretch too wide."""
+        if getattr(self, "_mcp_scroll_content", None) is not None and self.width() > 0:
+            w = min(self.width(), self.MCP_SCROLL_MAX_WIDTH)
+            self._mcp_scroll_content.setMaximumWidth(w)
+
+    def resizeEvent(self, event: QResizeEvent):
+        super().resizeEvent(event)
+        self._update_mcp_scroll_max_width()
     
     def _create_card(self, title, description):
         """Create a styled card widget"""
@@ -406,8 +425,8 @@ class MCPTab(QWidget):
                 alternate-background-color: {self.alt_row_bg};
             }}
             QTreeWidget::item {{
-                height: 32px;
-                padding: 0 10px;
+                height: 26px;
+                padding: 0 8px;
                 border-bottom: 1px solid {row_border};
                 color: {self.fg_color};
             }}
@@ -422,7 +441,7 @@ class MCPTab(QWidget):
                 background: {header_bg};
                 border: none;
                 border-bottom: 1px solid {header_border};
-                padding: 6px 8px;
+                padding: 5px 6px;
                 font-weight: 600;
                 font-size: 11px;
                 color: {self.secondary_text};
@@ -466,6 +485,28 @@ class MCPTab(QWidget):
             }}
             QPushButton:pressed {{
                 background: {btn_pressed};
+            }}
+        """
+    
+    def _test_btn_style(self):
+        """Yellow style for the 'Test server and show tool count' button in each MCP row."""
+        yellow_bg = '#B8860B' if self.is_dark else '#E6B800'
+        yellow_hover = '#D4A00C' if self.is_dark else '#F5C800'
+        yellow_pressed = '#9A7209' if self.is_dark else '#CC9F00'
+        return f"""
+            QPushButton {{
+                background: {yellow_bg};
+                color: #1C1C1E;
+                border: 1px solid {yellow_pressed};
+                border-radius: 3px;
+                font-size: 8px;
+                padding: 1px;
+            }}
+            QPushButton:hover {{
+                background: {yellow_hover};
+            }}
+            QPushButton:pressed {{
+                background: {yellow_pressed};
             }}
         """
     
@@ -546,46 +587,103 @@ Names: {names_str}"""
             display_name = server.get("name", "Unnamed MCP")
             if server.get("url"):
                 display_name += " 🌐"  # Remote indicator
-            item = QTreeWidgetItem([display_name, "", "", ""])
+            item = QTreeWidgetItem([display_name, "", "", "", ""])
             item.setData(0, 32, json.dumps(server))
             self.mcp_servers_tree.addTopLevelItem(item)
 
+            use_cb = QCheckBox()
+            use_cb.setChecked(server.get("enabled", True))
+            use_cb.setToolTip("Use this server for all model providers (LM Studio, OpenAI, etc.). Uncheck to disable.")
+            use_cb.setStyleSheet(self._use_checkbox_style())
+            use_cb.stateChanged.connect(lambda state, s=server: self._on_mcp_use_changed(s, state))
+            use_cell = QWidget()
+            use_cell_layout = QHBoxLayout(use_cell)
+            use_cell_layout.setContentsMargins(0, 0, 0, 0)
+            use_cell_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            use_cell_layout.addStretch()
+            use_cell_layout.addWidget(use_cb)
+            use_cell_layout.addStretch()
+            self.mcp_servers_tree.setItemWidget(item, 1, use_cell)
+
             btn = QPushButton("🔴")
-            btn.setFixedSize(32, 26)
+            btn.setFixedSize(26, 21)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             srv = server.copy()
             btn.clicked.connect(lambda checked=False, s=srv: self.toggle_mcp_connection(s))
             btn.setStyleSheet(self._stopped_btn_style())
-            self.mcp_servers_tree.setItemWidget(item, 1, btn)
+            status_cell = QWidget()
+            status_cell_layout = QHBoxLayout(status_cell)
+            status_cell_layout.setContentsMargins(0, 0, 0, 0)
+            status_cell_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            status_cell_layout.addStretch()
+            status_cell_layout.addWidget(btn)
+            status_cell_layout.addStretch()
+            self.mcp_servers_tree.setItemWidget(item, 2, status_cell)
 
             tools_label = QLabel("--")
             tools_label.setAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
-            tools_label.setFixedSize(52, 26)
+            tools_label.setFixedSize(42, 21)
             tools_label.setStyleSheet(self._tools_label_style())
-            self.mcp_servers_tree.setItemWidget(item, 2, tools_label)
+            self.mcp_servers_tree.setItemWidget(item, 3, tools_label)
 
             test_btn = QPushButton("Test")
-            test_btn.setFixedSize(48, 26)
+            test_btn.setFixedSize(26, 21)
             test_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            test_btn.setStyleSheet(self._secondary_btn_style())
+            test_btn.setStyleSheet(self._test_btn_style())
+            test_btn.setToolTip("Test server and show tool count")
             test_btn.clicked.connect(lambda checked=False, it=item: self._test_one_server(it))
-            self.mcp_servers_tree.setItemWidget(item, 3, test_btn)
+            self.mcp_servers_tree.setItemWidget(item, 4, test_btn)
         self.refresh_mcp_statuses()
 
+    def _on_mcp_use_changed(self, server: dict, state: int):
+        """Persist enabled/disabled for this server; applies to all model providers."""
+        server["enabled"] = state == Qt.CheckState.Checked.value
+        for i, s in enumerate(self.mcp_servers_data):
+            if s.get("name") == server.get("name"):
+                self.mcp_servers_data[i]["enabled"] = server["enabled"]
+                break
+        self._save_mcp_data()
+        invalidate_tools_cache(self.mcp_file)
+        # Warm caches so the next chat turn immediately sees updated tools
+        refresh_tools_cache_background(self.mcp_file)
+
     def _mcp_cell_widget(self, item: QTreeWidgetItem, column: int) -> QWidget | None:
-        """Return the widget for column 1 (button) or 2 (tools label)."""
-        return self.mcp_servers_tree.itemWidget(item, column)
+        """Return the widget for column 2 (status button), 3 (tools label), etc.
+        Columns 1 and 2 use a centering wrapper; return the inner control so callers can setText/setStyleSheet.
+        """
+        w = self.mcp_servers_tree.itemWidget(item, column)
+        if w is None:
+            return None
+        # Unwrap centering container: get the single QPushButton or QCheckBox child
+        children = w.findChildren(QPushButton) + w.findChildren(QCheckBox)
+        if len(children) == 1:
+            return children[0]
+        return w
+
+    def _use_checkbox_style(self):
+        """Style Use checkbox: green when checked (enabled), red when unchecked (disabled) to match status buttons."""
+        if self.is_dark:
+            return """
+                QCheckBox::indicator:unchecked { background-color: #3D2020; border: 1px solid #5D3030; border-radius: 3px; width: 14px; height: 14px; }
+                QCheckBox::indicator:checked { background-color: #1B3D1B; border: 1px solid #2D5D2D; border-radius: 3px; width: 14px; height: 14px; }
+                QCheckBox::indicator:hover { border-width: 2px; }
+            """
+        return """
+            QCheckBox::indicator:unchecked { background-color: #FFEBEE; border: 1px solid #EF9A9A; border-radius: 3px; width: 14px; height: 14px; }
+            QCheckBox::indicator:checked { background-color: #E8F5E9; border: 1px solid #A5D6A7; border-radius: 3px; width: 14px; height: 14px; }
+            QCheckBox::indicator:hover { border-width: 2px; }
+        """
 
     def _stopped_btn_style(self):
-        """Style for stopped (red) status button"""
+        """Style for stopped (red) status button (80% scale for row controls)"""
         if self.is_dark:
             return """
                 QPushButton {
                     background-color: #3D2020;
                     border: 1px solid #5D3030;
-                    border-radius: 4px;
-                    font-size: 10px;
-                    padding: 2px;
+                    border-radius: 3px;
+                    font-size: 8px;
+                    padding: 1px;
                 }
                 QPushButton:hover {
                     background-color: #4D2828;
@@ -597,9 +695,9 @@ Names: {names_str}"""
                 QPushButton {
                     background-color: #FFEBEE;
                     border: 1px solid #EF9A9A;
-                    border-radius: 4px;
-                    font-size: 10px;
-                    padding: 2px;
+                    border-radius: 3px;
+                    font-size: 8px;
+                    padding: 1px;
                 }
                 QPushButton:hover {
                     background-color: #FFCDD2;
@@ -608,15 +706,15 @@ Names: {names_str}"""
             """
     
     def _running_btn_style(self):
-        """Style for running (green) status button"""
+        """Style for running (green) status button (80% scale for row controls)"""
         if self.is_dark:
             return """
                 QPushButton {
                     background-color: #1B3D1B;
                     border: 1px solid #2D5D2D;
-                    border-radius: 4px;
-                    font-size: 10px;
-                    padding: 2px;
+                    border-radius: 3px;
+                    font-size: 8px;
+                    padding: 1px;
                 }
                 QPushButton:hover {
                     background-color: #254D25;
@@ -628,9 +726,9 @@ Names: {names_str}"""
                 QPushButton {
                     background-color: #E8F5E9;
                     border: 1px solid #A5D6A7;
-                    border-radius: 4px;
-                    font-size: 10px;
-                    padding: 2px;
+                    border-radius: 3px;
+                    font-size: 8px;
+                    padding: 1px;
                 }
                 QPushButton:hover {
                     background-color: #C8E6C9;
@@ -639,14 +737,14 @@ Names: {names_str}"""
             """
     
     def _tools_label_style(self):
-        """Style for tools count label (vertical alignment via wrapper layout)."""
+        """Style for tools count label (80% scale; text size unchanged)."""
         if self.is_dark:
             return """
                 QLabel {
                     background: #1A3A5C;
                     color: #64B5F6;
                     border-radius: 3px;
-                    padding: 5px 6px;
+                    padding: 4px 5px;
                     font-weight: 600;
                     font-size: 11px;
                 }
@@ -657,7 +755,7 @@ Names: {names_str}"""
                     background: #E3F2FD;
                     color: #1565C0;
                     border-radius: 3px;
-                    padding: 5px 6px;
+                    padding: 4px 5px;
                     font-weight: 600;
                     font-size: 11px;
                 }
@@ -741,6 +839,8 @@ Names: {names_str}"""
         dialog = MCPDialog(parent=self, edit_data=data)
         if dialog.exec():
             new_data = dialog.get_config()
+            if "enabled" not in new_data:
+                new_data["enabled"] = data.get("enabled", True)
             for j, d in enumerate(self.mcp_servers_data):
                 if d.get('name') == data.get('name'):
                     self.mcp_servers_data[j] = new_data
@@ -774,6 +874,8 @@ Names: {names_str}"""
         """Invalidate discovery cache then refresh status so next agent run gets fresh tools."""
         try:
             invalidate_tools_cache(self.mcp_file)
+            # Warm caches in background so tools appear immediately on next turn
+            refresh_tools_cache_background(self.mcp_file)
         except Exception:
             pass
         self.refresh_mcp_statuses()
@@ -1048,8 +1150,8 @@ Names: {names_str}"""
                 continue
             name = server_data.get('name', '')
 
-            # Update tools count label (set spinner while fetching)
-            tools_lbl = self._mcp_cell_widget(item, 2)
+            # Update tools count label (set spinner while fetching) — column 3 is Tools
+            tools_lbl = self._mcp_cell_widget(item, 3)
             if tools_lbl:
                 current = tools_lbl.text().strip()
                 if current in {"--", "0"}:
@@ -1058,17 +1160,17 @@ Names: {names_str}"""
                 if name and name not in self._tools_workers:
                     self._start_tools_count_worker(name)
             
-            # Check status
+            # Check status — column 2 is Status button (never show green for disabled servers)
+            is_enabled = server_data.get("enabled", True)
             is_remote = bool(server_data.get('url'))
             if is_remote:
                 status_icon = self._test_remote_connection(server_data)
             else:
                 status_icon = self._is_local_running(server_data)
-            
-            is_running = status_icon == "✓"
-            
-            # Update button appearance
-            btn = self._mcp_cell_widget(item, 1)
+            is_running = status_icon == "✓" and is_enabled
+
+            # Update status button appearance
+            btn = self._mcp_cell_widget(item, 2)
             if btn:
                 if is_running:
                     btn.setText("🟢")
@@ -1126,7 +1228,7 @@ Names: {names_str}"""
             except json.JSONDecodeError:
                 continue
             if server_data.get("name") == name:
-                lbl = self._mcp_cell_widget(item, 2)
+                lbl = self._mcp_cell_widget(item, 3)
                 if lbl:
                     lbl.setText(str(count))
                 break
@@ -1148,7 +1250,7 @@ Names: {names_str}"""
             try:
                 server_data = json.loads(data_str)
                 if server_data.get('name') == server_name:
-                    btn = self._mcp_cell_widget(item, 1)
+                    btn = self._mcp_cell_widget(item, 2)
                     if btn:
                         if is_running:
                             btn.setText("🟢")
@@ -1173,6 +1275,7 @@ Names: {names_str}"""
         """
         cmd = server_data.get('command', '')
         args = normalize_mcp_args(server_data.get('args', []))
+        name = (server_data.get('name') or '').strip()
         cmd_match = f"{cmd} {' '.join(map(str, args[:3]))}".strip()
         patterns = [cmd_match]
         if cmd == 'npx' and args:
@@ -1189,7 +1292,10 @@ Names: {names_str}"""
         elif cmd == 'node' and args:
             path = str(args[0])
             patterns.append(os.path.basename(path))
-        return [p for p in patterns if len(p) >= 10]
+        # Server name often appears in process command line (e.g. XcodeBuildMcp, mcp-macos)
+        if len(name) >= 10:
+            patterns.append(name)
+        return [p for p in patterns if p and len(p) >= 10]
 
     def _check_server_running_by_ps(self, server_data):
         """Check if local MCP server appears in ps. Uses same patterns as stop logic."""
@@ -1461,10 +1567,12 @@ Names: {names_str}"""
             with open(self.mcp_file, 'r') as f:
                 data = json.load(f)
             mcp_servers_obj = data.get("mcpServers", {})
-            servers_list = [
-                {"name": name, **cfg}
-                for name, cfg in mcp_servers_obj.items()
-            ]
+            servers_list = []
+            for name, cfg in mcp_servers_obj.items():
+                s = {"name": name, **cfg}
+                if "enabled" not in s:
+                    s["enabled"] = True
+                servers_list.append(s)
             return servers_list
         except Exception:
             return []
@@ -1493,6 +1601,7 @@ Names: {names_str}"""
                         cfg["timeout_s"] = s.get("timeout_s")
                     if isinstance(s.get("max_concurrency"), int) and s.get("max_concurrency") > 0:
                         cfg["max_concurrency"] = s.get("max_concurrency")
+                cfg["enabled"] = s.get("enabled", True)
                 mcp_dict[name] = cfg
             with open(self.mcp_file, 'w') as f:
                 json.dump({"mcpServers": mcp_dict}, f, indent=2)
@@ -1551,6 +1660,8 @@ Names: {names_str}"""
             server_data = self._get_server_data_by_name(name)
             if not server_data or server_data.get("url"):
                 continue  # remote or not in list
+            if not server_data.get("enabled", True):
+                continue  # don't auto-start disabled servers
             if self._is_local_running(server_data) == "✓":
                 continue
             self._start_server_silently(server_data)
@@ -1559,24 +1670,29 @@ Names: {names_str}"""
         """Save list of currently started servers to persist across restarts."""
         try:
             self.started_servers_file.parent.mkdir(parents=True, exist_ok=True)
-            # Get list of servers that are currently running (green buttons)
+            # Get list of servers that are currently running (green buttons) and enabled
             started = []
             for row in range(self.mcp_servers_tree.topLevelItemCount()):
                 item = self.mcp_servers_tree.topLevelItem(row)
-                btn = self._mcp_cell_widget(item, 1)
+                btn = self._mcp_cell_widget(item, 2)
                 if btn and btn.text() == '🟢':
                     data_str = item.data(0, 32)
                     if data_str:
                         try:
                             server_data = json.loads(data_str)
+                            if not server_data.get("enabled", True):
+                                continue  # don't persist started state for disabled servers
                             name = server_data.get('name', '')
                             if name:
                                 started.append(name)
                         except json.JSONDecodeError:
                             pass
-            # Also include servers we know we started this session
+            # Also include servers we know we started this session (only if still enabled)
             for name in self.running_processes.keys():
-                if name not in started:
+                if name in started:
+                    continue
+                server_data = self._get_server_data_by_name(name)
+                if server_data and server_data.get("enabled", True):
                     started.append(name)
             
             with open(self.started_servers_file, 'w') as f:

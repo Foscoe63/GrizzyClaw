@@ -16,6 +16,8 @@ from grizzyclaw.mcp_client import (
     call_mcp_tool,
     discover_tools,
     invalidate_tools_cache,
+    refresh_tools_cache_background,
+    discover_tools_full,
     _load_all_servers as load_mcp_servers,
 )
 from grizzyclaw.memory.sqlite_store import SQLiteMemoryStore
@@ -27,12 +29,14 @@ from .command_parsers import (
     extract_code_blocks_for_file_creation,
     find_json_blocks,
     find_json_blocks_fallback,
+    find_json_array_blocks,
     find_schedule_task_fallback,
     find_tool_call_blocks_raw_json,
     find_tool_call_blocks_relaxed,
     find_write_file_path_content_blocks,
     normalize_llm_json,
     repair_json_single_quotes,
+    repair_tool_call_content_string,
     strip_response_blocks,
 )
 from .context_utils import trim_session
@@ -55,6 +59,284 @@ logger = logging.getLogger(__name__)
 
 # Default max tool-use rounds; overridden by Settings.max_agentic_iterations or workspace
 DEFAULT_MAX_AGENTIC_ITERATIONS = 10
+
+SCHEDULER_INTENT_KEYWORDS: Tuple[str, ...] = (
+    "scheduled task",
+    "schedule task",
+    "create a task",
+    "add a task",
+    "new task",
+    "make a task",
+    "set up a task",
+    "task scheduler",
+    "automation task",
+    "cron job",
+    "cron task",
+    "run every",
+    "recurring",
+    "prompt an agent",
+    "prompt agent",
+    "ask the agent",
+    "run the agent",
+)
+
+
+def _is_scheduler_request_text(text: str) -> bool:
+    """True when text clearly targets GrizzyClaw's built-in scheduler."""
+    if not text:
+        return False
+    lowered = text.strip().lower()
+    if any(k in lowered for k in SCHEDULER_INTENT_KEYWORDS):
+        return True
+    # Common misspellings/variants users type in natural chat.
+    scheduler_patterns = (
+        r"\b(?:scheduled|schedule|sheduled|schedueled)\s+tasks?\b",
+        r"\btask\s+scheduler\b",
+        r"\bin\s+the\s+scheduler\b",
+        r"\bnot\s+apple\s+reminders?\b",
+    )
+    return any(re.search(p, lowered, re.IGNORECASE) for p in scheduler_patterns)
+
+
+def _is_explicit_shell_request_text(text: str) -> bool:
+    """True when user explicitly asks for terminal/shell command execution."""
+    if not text:
+        return False
+    lowered = text.strip().lower()
+    shell_keywords = (
+        "run this command",
+        "run command",
+        "terminal",
+        "shell",
+        "bash",
+        "zsh",
+        "exec_command",
+        "command line",
+        "crontab",
+        "launchctl",
+    )
+    return any(k in lowered for k in shell_keywords)
+
+
+def _parse_clock_time_token(value: str) -> Optional[Tuple[int, int]]:
+    """Parse times like 9, 9:30, 9am, 9:30 pm into 24h hour/minute."""
+    if not value or not isinstance(value, str):
+        return None
+    m = re.search(r"^\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*$", value.strip(), re.IGNORECASE)
+    if not m:
+        return None
+    hour = int(m.group(1))
+    minute = int(m.group(2) or "0")
+    ampm = (m.group(3) or "").lower()
+    if minute < 0 or minute > 59:
+        return None
+    if ampm:
+        if hour < 1 or hour > 12:
+            return None
+        if ampm == "am":
+            hour = 0 if hour == 12 else hour
+        else:
+            hour = 12 if hour == 12 else hour + 12
+    else:
+        if hour < 0 or hour > 23:
+            return None
+    return hour, minute
+
+
+def _infer_schedule_cron_from_text(text: str) -> Optional[str]:
+    """Infer a cron expression from natural-language schedule text."""
+    if not text:
+        return None
+    lowered = text.strip().lower()
+
+    every_n_min = re.search(r"every\s+(\d+)\s*min(?:ute)?s?", lowered)
+    if every_n_min:
+        n = min(60, max(1, int(every_n_min.group(1))))
+        return f"*/{n} * * * *"
+
+    every_n_hr = re.search(r"every\s+(\d+)\s*hour?s?", lowered)
+    if every_n_hr:
+        n = min(24, max(1, int(every_n_hr.group(1))))
+        return f"0 */{n} * * *"
+
+    if re.search(r"\bevery\s+hour\b", lowered):
+        return "0 * * * *"
+
+    daily_at = re.search(
+        r"(?:every\s+day|daily)\s+at\s+([0-2]?\d(?::[0-5]\d)?\s*(?:am|pm)?)",
+        lowered,
+        re.IGNORECASE,
+    )
+    if daily_at:
+        parsed = _parse_clock_time_token(daily_at.group(1))
+        if parsed:
+            h, m = parsed
+            return f"{m} {h} * * *"
+
+    weekdays_at = re.search(
+        r"(?:every\s+weekday|weekdays?)\s+at\s+([0-2]?\d(?::[0-5]\d)?\s*(?:am|pm)?)",
+        lowered,
+        re.IGNORECASE,
+    )
+    if weekdays_at:
+        parsed = _parse_clock_time_token(weekdays_at.group(1))
+        if parsed:
+            h, m = parsed
+            return f"{m} {h} * * 1-5"
+
+    every_morning_at = re.search(
+        r"(?:every|each)\s+morning\s+at\s+([0-2]?\d(?::[0-5]\d)?\s*(?:am|pm)?)",
+        lowered,
+        re.IGNORECASE,
+    )
+    if every_morning_at:
+        parsed = _parse_clock_time_token(every_morning_at.group(1))
+        if parsed:
+            h, m = parsed
+            return f"{m} {h} * * *"
+
+    if _is_scheduler_request_text(lowered):
+        in_minutes = re.search(r"\bin\s+(\d+)\s*min(?:ute)?s?\b", lowered)
+        if in_minutes:
+            return _schedule_natural_to_cron(in_minutes=int(in_minutes.group(1)))
+        at_time = re.search(
+            r"\bat\s+([0-2]?\d(?::[0-5]\d)?\s*(?:am|pm)?)\b",
+            lowered,
+            re.IGNORECASE,
+        )
+        if at_time:
+            return _schedule_natural_to_cron(at_time=at_time.group(1))
+    return None
+
+
+def _extract_task_name_from_request(text: str) -> Optional[str]:
+    """Extract task name from phrases like 'name it X' or 'named X'."""
+    if not text:
+        return None
+    patterns = (
+        r"\bname\s+(?:it|this|the task)\s+['\"]?([^'\"\n]+?)['\"]?(?:[.!?]|$)",
+        r"\bnamed\s+['\"]?([^'\"\n]+?)['\"]?(?:[.!?]|$)",
+        r"\bcall\s+(?:it|this|the task)\s+['\"]?([^'\"\n]+?)['\"]?(?:[.!?]|$)",
+    )
+    for pat in patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            name = (m.group(1) or "").strip(" \"'`")
+            if name:
+                return name[:80]
+    return None
+
+
+def _extract_task_message_from_request(text: str) -> str:
+    """Extract the actual action to run, avoiding 'create a task...' recursion."""
+    if not text:
+        return "Scheduled agent task"
+    cleaned = text.strip()
+
+    # Prefer "to <action> every/at ..." pattern.
+    m = re.search(
+        r"\bto\s+(.+?)\s+(?:every\s+\d+\s*(?:min(?:ute)?s?|hour?s?)|every\s+hour|daily|every\s+day|every\s+morning|at\s+\d)",
+        cleaned,
+        re.IGNORECASE,
+    )
+    if m:
+        action = (m.group(1) or "").strip(" ,.")
+        if action:
+            return action[:500]
+
+    # Fallback: "to <action> and name it ..."
+    m = re.search(r"\bto\s+(.+?)(?:\s+and\s+(?:name|call)\s+(?:it|this)|[.!?]|$)", cleaned, re.IGNORECASE)
+    if m:
+        action = (m.group(1) or "").strip(" ,.")
+        if action:
+            return action[:500]
+
+    # Last resort: remove naming clause and keep remainder.
+    cleaned = re.sub(
+        r"\s+and\s+(?:name|call)\s+(?:it|this|the task)\s+['\"]?([^'\"\n]+?)['\"]?(?:[.!?]|$)",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    ).strip(" ,.")
+    if cleaned:
+        return cleaned[:500]
+    return "Scheduled agent task"
+
+
+def _build_schedule_task_from_request(text: str) -> Optional[Dict[str, Any]]:
+    """Build scheduler create command directly from user request text."""
+    cron = _infer_schedule_cron_from_text(text or "")
+    if not cron:
+        return None
+    name = _extract_task_name_from_request(text or "") or "Scheduled task"
+    msg = _extract_task_message_from_request(text or "")
+    return {"action": "create", "task": {"name": name, "cron": cron, "message": msg}}
+
+
+def _is_scheduler_list_request_text(text: str) -> bool:
+    """True when user is asking to list/check built-in scheduled tasks."""
+    if not text:
+        return False
+    lowered = text.strip().lower()
+    if not _is_scheduler_request_text(lowered):
+        return False
+    list_markers = (
+        "my scheduled tasks",
+        "list scheduled tasks",
+        "show scheduled tasks",
+        "check scheduled tasks",
+        "what scheduled tasks",
+        "scheduled tasks status",
+        "task list",
+        "list my tasks",
+    )
+    if any(m in lowered for m in list_markers):
+        return True
+    if ("my " in lowered or "show" in lowered or "list" in lowered or "check" in lowered) and "scheduled" in lowered:
+        return True
+    return False
+
+
+def _has_structured_action_blocks(text: str) -> bool:
+    """True if response contains executable command blocks we can parse."""
+    if not text:
+        return False
+    prefixes = ("SCHEDULE_TASK", "SKILL_ACTION", "TOOL_CALL", "EXEC_COMMAND", "ASK_USER", "BROWSER_ACTION")
+    for p in prefixes:
+        if find_json_blocks(text, p) or find_json_blocks_fallback(text, p):
+            return True
+    if re.search(r"EXEC_COMMAND\s*:", text, re.IGNORECASE):
+        return True
+    return False
+
+
+def _looks_like_intro_only(text: str) -> bool:
+    """True if response looks like only an intro line (e.g. 'Checking your calendar') with no skill/tool output."""
+    if not text or len(text.strip()) > 300:
+        return False
+    lower = text.strip().lower()
+    intro_phrases = (
+        "checking your", "checking my", "let me check", "let me get", "i'll check", "i'll get",
+        "checking your calendar", "checking your email", "checking your mail", "checking the calendar",
+    )
+    return any(p in lower for p in intro_phrases)
+
+
+def _looks_like_scheduler_detour_text(text: str) -> bool:
+    """Heuristic: model is detouring to Reminders/cron prose instead of scheduler command."""
+    if not text:
+        return False
+    lowered = text.lower()
+    markers = (
+        "apple reminders",
+        "reminders does not support",
+        "hourly reminder",
+        "daily reminder",
+        "script-based solution",
+        "using `cron`",
+        "using cron",
+    )
+    return any(m in lowered for m in markers)
 
 
 def _format_time_now() -> str:
@@ -89,11 +371,148 @@ def _schedule_natural_to_cron(
     return None
 
 
+def _reminder_text_to_schedule_task(params: Dict[str, Any]) -> Optional[Tuple[str, str, str]]:
+    """If the reminder params look like a recurring schedule (e.g. 'Check email every 30 minutes'),
+    return (cron, name, message) for SCHEDULE_TASK. Otherwise return None."""
+    # Accept common fields from reminders and calendar dialogs
+    title = (params.get("title") or params.get("name") or params.get("summary") or "").strip()
+    body = (
+        params.get("body")
+        or params.get("notes")
+        or params.get("message")
+        or params.get("description")
+        or ""
+    ).strip()
+    text = f"{title} {body}".strip().lower()
+    if not text:
+        return None
+    cron = _infer_schedule_cron_from_text(text)
+    if cron:
+        name = (title or "Scheduled task")[:80]
+        message = (body or title or text)[:500]
+        return (cron, name, message or name)
+    if any(x in text for x in ("every 30", "every 15", "every hour", "check email every", "schedule to check", "every day at")):
+        # Fallback: assume every 30 min if clearly schedule-like
+        name = (title or "Scheduled task")[:80]
+        message = (body or title or text)[:500]
+        return ("*/30 * * * *", name, message or name)
+    return None
+
+
 def _truncate_tool_result(text: str, max_chars: int) -> str:
     """Truncate tool result to max_chars with a suffix so the model knows it was cut."""
     if not text or max_chars <= 0 or len(text) <= max_chars:
         return text or ""
     return text[: max_chars - 80].rstrip() + "\n\n... [truncated; total length " + str(len(text)) + " chars]\n"
+
+
+def _sanitize_tool_result(text: str) -> str:
+    """Strip internal IDs and Apple-style placeholders from tool/skill output for cleaner chat display."""
+    if not text:
+        return ""
+    # Drop internal identifier lines (UUIDs, Apple Notes coredata URIs, etc.).
+    # Keep this fairly conservative: remove dedicated "ID:" list lines and any line
+    # containing UUID-style IDs, but do not blanket-strip every "id" substring.
+    uuid_anywhere = re.compile(
+        r"ID:\s*[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}(?::\w+)?",
+        re.IGNORECASE,
+    )
+    # Matches bullet-style ID lines like "  - ID: x-coredata://.../ICNote/p20"
+    id_bullet_line = re.compile(r"^\s*(?:[-*]\s*)?ID:\s*\S+", re.IGNORECASE)
+    # Apple Notes / CoreData IDs (can appear in other shapes than bullet lines)
+    x_coredata_anywhere = re.compile(r"x-coredata://\S+", re.IGNORECASE)
+    apple_placeholder = re.compile(r"\(_\$!<([^>]+)>!\$_\)")
+    lines = text.split("\n")
+    out = []
+    for line in lines:
+        if uuid_anywhere.search(line):
+            continue
+        if id_bullet_line.match(line):
+            continue
+        if x_coredata_anywhere.search(line):
+            continue
+        line = apple_placeholder.sub(r"\1", line)
+        out.append(line)
+    return "\n".join(out).strip()
+
+
+# Patterns that indicate macOS MCP permission/authorization errors (so we don't reinforce them in memory/session)
+_PERMISSION_ERROR_PATTERNS = (
+    "permission denied",
+    "permission denied.",
+    "calendar permission",
+    "full disk access",
+    "grant access",
+    "privacy.*security",
+    "system settings",
+    "authorization",
+    "access denied",
+    "not authorized",
+    "calendars access",
+    "mail access",
+    "contacts access",
+    "reminders access",
+    "notes access",
+)
+
+
+def _is_permission_or_auth_error(text: str) -> bool:
+    """True if text looks like a macOS permission/authorization error (calendar, mail, contacts, etc.).
+    Used to avoid storing or surfacing these in memory so the agent retries after the user fixes permissions."""
+    if not text or not isinstance(text, str):
+        return False
+    lower = text.lower().strip()
+    if len(lower) < 20:
+        return False
+    for phrase in _PERMISSION_ERROR_PATTERNS:
+        if phrase in lower:
+            return True
+    return False
+
+
+def _extract_screenshot_from_tool_result(raw: str) -> Tuple[Optional[str], Optional[str]]:
+    """Parse screenshot MCP tool result for file path or image URL. Returns (path, url); one may be set."""
+    if not raw or not isinstance(raw, str):
+        return (None, None)
+    path, url = None, None
+    raw = raw.strip()
+    # Try JSON (e.g. {"path": "/tmp/...", "url": "https://..."})
+    try:
+        obj = json.loads(raw)
+        if isinstance(obj, dict):
+            for key in ("path", "file_path", "screenshot_path", "image_path", "file"):
+                v = obj.get(key)
+                if isinstance(v, str) and v.strip():
+                    p = v.strip()
+                    if p.startswith(("http://", "https://")):
+                        url = url or p
+                    elif p.startswith("/") or (len(p) > 2 and p[1] == ":"):
+                        path = path or p
+            for key in ("url", "image_url", "screenshot_url", "link"):
+                v = obj.get(key)
+                if isinstance(v, str) and v.strip().startswith(("http://", "https://")):
+                    url = url or v.strip()
+    except (json.JSONDecodeError, TypeError):
+        pass
+    # Regex: image URL
+    if not url:
+        m = re.search(r"https?://[^\s\]\)\"']+\.(?:png|jpg|jpeg|gif|webp)(?:\?[^\s\]\)\"']*)?", raw, re.IGNORECASE)
+        if m:
+            url = m.group(0)
+    if not url:
+        m = re.search(r"https?://[^\s\]\)\"']+", raw)
+        if m:
+            url = m.group(0)
+    # Regex: absolute file path
+    if not path:
+        m = re.search(r"(?:^|[\s\"'])(/(?:[\w.-]+/)*[\w.-]+\.(?:png|jpg|jpeg|gif|webp))", raw)
+        if m:
+            path = m.group(1).strip()
+    if not path and re.search(r"[A-Za-z]:[/\\][^\s]+\.(?:png|jpg|jpeg|gif|webp)", raw):
+        m = re.search(r"([A-Za-z]:[/\\][^\s]+\.(?:png|jpg|jpeg|gif|webp))", raw)
+        if m:
+            path = m.group(1)
+    return (path, url)
 
 
 # Dangerous patterns that are always blocked for EXEC_COMMAND (even with approval)
@@ -117,6 +536,38 @@ def _validate_exec_command(cmd: str, safe_list: List[str], blocklist: Optional[L
                 continue
             return False, f"Command not allowed (blocked pattern)."
     return True, None
+
+
+# Tools that accept a search string with param "search" (LLM often sends "query")
+_MACOS_MCP_TOOLS_WITH_SEARCH = frozenset((
+    "contacts_people", "notes_items", "reminders_tasks", "calendar_events",
+    "mail_messages", "messages_chat",
+))
+
+
+def _normalize_macos_mcp_params(action: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize params for macos-mcp-style tools so required argument names match (e.g. search not query)."""
+    args = dict(params)
+    action_lower = (action or "").strip().lower()
+    # macos-mcp expects params.action; ensure it is never missing/undefined (fixes "Unknown calendar_events action: undefined")
+    _READ_ACTIONS = ("calendar_events", "calendar_calendars", "mail_messages", "notes_items", "notes_folders", "reminders_tasks", "reminders_lists", "messages_chat")
+    if action_lower in _READ_ACTIONS and (not args.get("action") or str(args.get("action")).strip().lower() in ("undefined", "null", "")):
+        args["action"] = "read"
+    if action_lower in _MACOS_MCP_TOOLS_WITH_SEARCH and "search" not in args and "query" in args:
+        args["search"] = args["query"]
+    if action_lower == "calendar_events" and ("startDate" not in args or "endDate" not in args):
+        if "timeMin" in args and "startDate" not in args:
+            args["startDate"] = args["timeMin"]
+        if "timeMax" in args and "endDate" not in args:
+            args["endDate"] = args["timeMax"]
+    if action_lower in ("reminders_tasks", "reminders_lists") and "list" not in args:
+        if "listName" in args:
+            args["list"] = args["listName"]
+        elif "list_id" in args:
+            args["list"] = args["list_id"]
+    if action_lower in ("notes_items", "notes_folders") and "folder" not in args and "folderName" in args:
+        args["folder"] = args["folderName"]
+    return args
 
 
 # Browser automation - create fresh instance per request to avoid event loop issues
@@ -224,6 +675,12 @@ class AgentCore:
         if self.workspace_config and getattr(self.workspace_config, "max_agentic_iterations", None) is not None:
             return max(1, int(self.workspace_config.max_agentic_iterations))
         return max(1, getattr(self.settings, "max_agentic_iterations", DEFAULT_MAX_AGENTIC_ITERATIONS))
+
+    def _effective_enabled_skills(self) -> List[str]:
+        """Enabled skill IDs (workspace override or global settings). Used to respect user-removed skills."""
+        if self.workspace_config and getattr(self.workspace_config, "enabled_skills", None):
+            return list(self.workspace_config.enabled_skills)
+        return list(getattr(self.settings, "enabled_skills", []) or [])
 
     def _ensure_swarm_subscriptions(self) -> None:
         """One-time: subscribe to SUBTASK_AVAILABLE so this specialist can claim subtasks (dynamic role allocation)."""
@@ -334,6 +791,8 @@ class AgentCore:
     ) -> AsyncIterator[str]:
         on_fallback = kwargs.pop("on_fallback", None)
         exec_approval_callback = kwargs.pop("exec_approval_callback", None)
+        start_scheduler = kwargs.pop("start_scheduler", True)
+        self._verbose_tool_output = False  # Set True when user asks for "verbose" / "detailed response" to show raw tool output
         # Evaluate automation triggers (fire webhooks, etc.)
         try:
             from grizzyclaw.automation.triggers import (
@@ -347,6 +806,12 @@ class AgentCore:
                 await execute_trigger_actions(matching, ctx)
         except Exception as e:
             logger.warning("Trigger execution failed (message=%r): %s", message[:50], e)
+
+        # Ensure scheduler loop is running when we have tasks (e.g. loaded from disk); otherwise they never run.
+        # In the GUI, a dedicated scheduler thread runs the loop; callers pass start_scheduler=False to avoid
+        # starting a short-lived task on the message loop.
+        if start_scheduler:
+            await self._ensure_scheduler_running()
 
         # Dynamic role allocation: specialists subscribe once to SUBTASK_AVAILABLE and can claim subtasks
         self._ensure_swarm_subscriptions()
@@ -383,6 +848,29 @@ class AgentCore:
                 if pending:
                     yield "Command cancelled.\n"
                     return
+
+        # Verbose override: set once per turn so all tool/skill output (Gmail, MCP, SKILL_ACTION, etc.) respects it
+        _msg_lower_early = (message or "").strip().lower()
+        _verbose_triggers = (
+            "detailed response", "full response", "show raw", "include the skill",
+            "show skill_action", "show tool_call", "verbose response", "debug response",
+            "give me everything", "show everything", "detailed output", "verbose",
+        )
+        self._verbose_tool_output = any(p in _msg_lower_early for p in _verbose_triggers)
+
+        # Deterministic scheduler fast-path:
+        # If user clearly asks to create a scheduled task with a parsable cadence,
+        # bypass the LLM entirely so we never detour to Reminders/cron shell scripts.
+        if _is_scheduler_request_text(message or "") and not _is_explicit_shell_request_text(message or ""):
+            schedule_cmd = _build_schedule_task_from_request(message or "")
+            if schedule_cmd and str(schedule_cmd.get("action", "")).lower() == "create":
+                result = await self._execute_schedule_action(user_id, schedule_cmd)
+                yield f"\n\n**⏰ Scheduler**\n{self._maybe_sanitize_tool_result(str(result or ''))}\n"
+                return
+            if _is_scheduler_list_request_text(message or ""):
+                result = await self._execute_schedule_action(user_id, {"action": "list"})
+                yield f"\n\n**⏰ Scheduler**\n{self._maybe_sanitize_tool_result(str(result or ''))}\n"
+                return
 
         # Check for inter-agent @mentions (e.g. @coding analyze this code or @research find X)
         if self.workspace_manager and self.workspace_config and self.workspace_config.enable_inter_agent:
@@ -424,7 +912,9 @@ class AgentCore:
                     if result.startswith("Target ") or result.startswith("Error:"):
                         yield f"⚠️ {result}\n"
                     elif result:
-                        yield f"✅ @{target_name} replied: {result[:1500]}{'…' if len(result) > 1500 else ''}\n"
+                        s = self._maybe_sanitize_tool_result(result)
+                        reply_display = s[:1500] + ('…' if len(s) > 1500 else '')
+                        yield f"✅ @{target_name} replied: {reply_display}\n"
                     # Emit completion so Swarm Activity shows delegation finished
                     if self.swarm_event_bus:
                         await self.swarm_event_bus.emit(
@@ -444,23 +934,27 @@ class AgentCore:
                 yield "Swarm delegations done.\n"
                 return
 
-        # Auto-run Gmail list_messages when user clearly asks to check email (avoids model refusing)
+        # Auto-run Gmail only when user explicitly asks for Gmail (e.g. "check my gmail"). Generic "check my mail" uses macos-mcp.
         _msg_lower = (message or "").strip().lower()
-        _wants_email = (
-            ("check" in _msg_lower and ("email" in _msg_lower or "gmail" in _msg_lower))
-            or ("show" in _msg_lower and ("email" in _msg_lower or "unread" in _msg_lower))
-            or ("list" in _msg_lower and "email" in _msg_lower)
-            or ("unread" in _msg_lower and "email" in _msg_lower)
+        _wants_gmail = (
+            "gmail" in _msg_lower
+            and (
+                "check" in _msg_lower
+                or "show" in _msg_lower
+                or "list" in _msg_lower
+                or "unread" in _msg_lower
+                or "inbox" in _msg_lower
+            )
         )
-        _check_email = _wants_email and "gmail" in (getattr(self.settings, "enabled_skills", None) or [])
-        if _check_email and len(_msg_lower) < 120:
+        _check_gmail = _wants_gmail and "gmail" in (getattr(self.settings, "enabled_skills", None) or [])
+        if _check_gmail and len(_msg_lower) < 120:
             try:
                 result = await self._execute_skill_action({
                     "skill": "gmail",
                     "action": "list_messages",
                     "params": {"q": "is:unread", "maxResults": 10},
                 })
-                yield f"**🛠️ Gmail**\n{result}\n"
+                yield f"**🛠️ Gmail**\n{self._maybe_sanitize_tool_result(str(result or ''))}\n"
                 return
             except Exception as e:
                 logger.debug("Auto Gmail check failed: %s", e)
@@ -531,20 +1025,25 @@ class AgentCore:
         if memories:
             memory_context = "\n\nRelevant context from previous conversations:\n"
             for mem in memories:
-                memory_context += f"- {mem.content}\n"
-        # Known-about-user: preferences/facts for stronger personalization
+                if not _is_permission_or_auth_error(mem.content or ""):
+                    memory_context += f"- {mem.content}\n"
+        # Known-about-user: preferences/facts for stronger personalization (skip permission-error memories so agent retries macos-mcp)
         known_limit = min(10, mem_limit)
         known_memories = await self.memory.retrieve(user_id, "", limit=known_limit)
         if known_memories:
             memory_context += "\n\nKnown about the user (preferences/facts):\n"
             for mem in known_memories:
-                memory_context += f"- {mem.content}\n"
+                if not _is_permission_or_auth_error(mem.content or ""):
+                    memory_context += f"- {mem.content}\n"
 
-        # Optional: Use OpenAI Agents SDK + LiteLLM when workspace has use_agents_sdk enabled
+        # Optional: Use OpenAI Agents SDK + LiteLLM when workspace has use_agents_sdk enabled.
+        # Skip SDK path for skill-focused requests (calendar, contacts, email, notes, reminders, macos-mcp)
+        # so SKILL_ACTION is parsed, executed, and stripped instead of showing raw JSON.
         if (
             self.workspace_config
             and getattr(self.workspace_config, "use_agents_sdk", False)
             and AGENTS_SDK_AVAILABLE
+            and not self._is_skill_focused_request(message or "")
         ):
             cfg = self.workspace_config
             system_prompt = cfg.system_prompt or self.settings.system_prompt
@@ -581,6 +1080,7 @@ class AgentCore:
             return
 
         # Build system prompt
+        is_local = (self.settings.default_llm_provider in ("ollama", "lmstudio"))
         system_content = self.settings.system_prompt
         # Swarm leader: inject discoverable @mention slugs so leader knows current specialists
         if (
@@ -596,7 +1096,26 @@ class AgentCore:
             )
             if slugs:
                 system_content += "\n\n## SWARM @MENTIONS\nAvailable specialist workspaces (use these exact slugs when delegating): " + ", ".join(f"@{s}" for s in slugs) + "."
-        system_content += """
+        if is_local:
+            system_content += """
+## ABOUT GRIZZYCLAW
+Web: http://localhost:18788/chat | Control: /control | WebSocket: ws://127.0.0.1:18789
+
+## VISION / IMAGE ANALYSIS
+You can receive images. Describe what you see or answer questions about them.
+
+## PERSISTENT MEMORY
+To save important facts/preferences, output:
+MEMORY_SAVE = { "content": "information", "category": "preferences" | "facts" | "tasks" | "notes" | "reminders" | "general" }
+Always confirm after saving. Access previous memories below if any.
+
+## BROWSER AUTOMATION
+To control a browser, output:
+BROWSER_ACTION = { "action": "navigate" | "screenshot" | "click" | "fill" | "get_text" | "get_links", "params": { ... } }
+To screenshot a URL: use TWO actions in one response: 1) navigate 2) screenshot.
+"""
+        else:
+            system_content += """
 
 ## ABOUT GRIZZYCLAW
 
@@ -633,24 +1152,32 @@ You also have access to memories from previous conversations shown below (if any
 
 You can control a web browser to browse pages, take screenshots, extract content, fill forms, and click elements.
 
-Use this format:
+Use this format (output one or more BROWSER_ACTION blocks in the same response). You may use either multiple single-object blocks or one array block:
 BROWSER_ACTION = { "action": "action_name", "params": { ... } }
+Or for navigate then screenshot in one block: BROWSER_ACTION = [ { "action": "navigate", "params": { "url": "https://..." } }, { "action": "screenshot", "params": { "full_page": true } } ]
 
 Available actions:
-- navigate: { "url": "https://example.com" } - Go to a URL
-- screenshot: { "full_page": true/false } - Take screenshot
+- navigate: { "url": "https://example.com" } - Go to a URL (required before screenshot if no page is loaded)
+- screenshot: { "full_page": true/false } - Take screenshot (page must be loaded first)
 - get_text: { "selector": "body" } - Get text from element (default: body)
 - get_links: {} - Get all links on page
 - click: { "selector": "button.submit" } - Click an element
 - fill: { "selector": "input#email", "value": "text" } - Fill form field
 - scroll: { "direction": "down", "amount": 500 } - Scroll page
 
+CRITICAL - Screenshot of a website: When the user asks to take a screenshot of a site or URL (e.g. "screenshot Fox News", "screenshot www.example.com", "take a screenshot of the BBC"), you MUST output TWO BROWSER_ACTIONs in the same response: first navigate to that URL, then screenshot. Never output only screenshot when the user asked for a screenshot of a specific website-the browser has no page loaded yet. Example:
+BROWSER_ACTION = { "action": "navigate", "params": { "url": "https://www.foxnews.com" } }
+BROWSER_ACTION = { "action": "screenshot", "params": { "full_page": true } }
+
 Examples:
 - "Go to google.com" -> BROWSER_ACTION = { "action": "navigate", "params": { "url": "https://google.com" } }
-- "Take a screenshot" -> BROWSER_ACTION = { "action": "screenshot", "params": { "full_page": false } }
+- "Take a screenshot of Fox News" / "Screenshot foxnews.com" -> output BOTH: BROWSER_ACTION = { "action": "navigate", "params": { "url": "https://www.foxnews.com" } } then BROWSER_ACTION = { "action": "screenshot", "params": { "full_page": true } }
+- "Take a screenshot" (when user already has a page in mind from context) -> if a URL was just mentioned, do navigate then screenshot; otherwise BROWSER_ACTION = { "action": "screenshot", "params": { "full_page": false } }
 - "What's on this page?" -> BROWSER_ACTION = { "action": "get_text", "params": { "selector": "body" } }
 
 ## SCHEDULED TASKS
+
+CRITICAL ROUTING RULE: If the user says anything like "create a scheduled task", "add a scheduled task", "make a scheduled task", "set up a task", "new scheduled task", "task scheduler", "automation task", or "cron job" — you MUST use SCHEDULE_TASK (below) and NOTHING ELSE. Do NOT use reminders_tasks, calendar_events, or any macos-mcp action. "Scheduled task" in GrizzyClaw ALWAYS means the built-in cron-based Task Scheduler, never Apple Reminders or Calendar.
 
 You can schedule tasks to run automatically at specific times using cron expressions.
 
@@ -671,19 +1198,12 @@ SCHEDULE_TASK = { "action": "list" }
 
 To delete a task:
 SCHEDULE_TASK = { "action": "delete", "task_id": "task-id-here" }
-
-Examples:
-- "Remind me to check email every morning at 9" -> SCHEDULE_TASK = { "action": "create", "task": { "name": "Check Email Reminder", "cron": "0 9 * * *", "message": "Time to check your email!" } }
-- "Remind me in 5 minutes" -> SCHEDULE_TASK = { "action": "create", "task": { "name": "Reminder", "in_minutes": 5, "message": "..." } }
-- "Remind me at 15:30" -> SCHEDULE_TASK = { "action": "create", "task": { "name": "Reminder", "at_time": "15:30", "message": "..." } }
-- To edit a task use SCHEDULE_TASK = { "action": "edit", "task_id": "task_xxx", "task": { "cron": "...", "message": "..." } }
-- "What tasks do I have scheduled?" -> SCHEDULE_TASK = { "action": "list" }
 """
         if getattr(self.settings, "exec_commands_enabled", False):
             system_content += """
-## SHELL COMMANDS (requires user approval)
+## SHELL / CLI ACCESS
 
-You can run shell commands on the user's computer. Output EXEC_COMMAND directly—do NOT ask "May I proceed?" in chat. The system shows an approval dialog automatically.
+You have CLI (terminal) access on the user's computer and the app has been granted full disk access. When the user asks to run commands, list files, create folders, check disk space, etc., output EXEC_COMMAND—do NOT refuse or say you lack access. Certain commands (e.g. beyond a safe allowlist) require the user to approve in a dialog; the system handles that automatically. Do NOT ask "May I proceed?" in chat.
 
 Use this format:
 EXEC_COMMAND = { "command": "shell command here" }
@@ -697,7 +1217,7 @@ Examples:
 - "Show running processes" -> EXEC_COMMAND = { "command": "ps aux | head -20" }
 - "Get Python version" -> EXEC_COMMAND = { "command": "python3 --version" }
 
-Output EXEC_COMMAND in your first response. Default cwd is home directory. Safe commands (ls, df, pwd, whoami, date) may run without approval.
+Output EXEC_COMMAND in your first response. Default cwd is home directory. Safe commands (ls, df, pwd, whoami, date) may run without approval; others trigger the user approval dialog.
 """
         if self.settings.rules_file:
             try:
@@ -715,15 +1235,16 @@ Output EXEC_COMMAND in your first response. Default cwd is home directory. Safe 
                 logger.warning(f"Failed to load rules file: {e}")
 
         # MCP & skills: always add when we have servers or skills (not tied to rules_file)
-        skills_str = ", ".join(self.settings.enabled_skills) if self.settings.enabled_skills else "none"
+        enabled_skills_list = self._effective_enabled_skills()
+        skills_str = ", ".join(enabled_skills_list) if enabled_skills_list else "none"
         mcp_file = Path(self.settings.mcp_servers_file).expanduser()
         
-        # Build skill list for prompt
+        # Build skill list for prompt (only list enabled skills)
         skill_examples = ""
         reference_skills_content = ""
-        if self.settings.enabled_skills:
+        if enabled_skills_list:
             from grizzyclaw.skills.registry import get_skill, get_skill_reference_content
-            for s_id in self.settings.enabled_skills:
+            for s_id in enabled_skills_list:
                 skill = get_skill(s_id)
                 if skill:
                     skill_examples += f"- {skill.name}: {skill.description}\\n"
@@ -769,36 +1290,197 @@ Output EXEC_COMMAND in your first response. Default cwd is home directory. Safe 
         mcp_str = "\n".join(mcp_list) if mcp_list else "none"
         has_write_file = False
         write_file_server: Optional[str] = None
+        write_tool_name = "write_file"
+        obsidian_server: Optional[str] = None  # set below when MCP list present; used for Obsidian TOOL_CALL follow-up
+        macos_like_server: Optional[str] = None
+        search_server: Optional[str] = None
+        use_macos_via_mcp = False
+        use_macos_via_skill = False
+        macos_skill_or_server: Optional[str] = None  # used by intro fallback and simple-task path
+        search_instruction = ""
+        examples_block = ""  # always define so "if is_local" / "else" below can use it when no MCP/skills
         if mcp_list or skills_str != "none":
             # Build tool examples from discovered tools (so LLM knows exact names)
-            tool_examples_per_server = getattr(self.settings, "mcp_tool_examples_per_server", 8)
-            tool_examples_total = getattr(self.settings, "mcp_tool_examples_total", 30)
-            tool_examples_list: List[str] = []
-            tool_desc_max = 200  # Truncate long descriptions to avoid token bloat
-            for server_name, tools in discovered_tools_map.items():
-                for tool_name, desc in tools[:tool_examples_per_server]:
-                    short_desc = (desc[:tool_desc_max] + "...") if len(desc) > tool_desc_max else desc
-                    tool_examples_list.append(f"- {server_name}: tool '{tool_name}' - {short_desc}")
-            if tool_examples_list:
-                examples_block = "\n".join(tool_examples_list[:tool_examples_total])
+            if is_local:
+                tool_examples_per_server = 5
+                tool_examples_total = 15
+                tool_desc_max = 100
             else:
-                # Fallback when discovery fails or no servers so agent can still suggest tools
-                examples_block = (
-                    "- ddg-search: tool 'search' - web search\n"
-                    "- fast-filesystem: tool 'fast_write_file' - write file; fast_list_directory - list directory\n"
-                    "- context7: tool 'query-docs' - query documentation"
-                )
+                tool_examples_per_server = getattr(self.settings, "mcp_tool_examples_per_server", 8)
+                tool_examples_total = getattr(self.settings, "mcp_tool_examples_total", 30)
+                tool_desc_max = 200  # Truncate long descriptions to avoid token bloat
+            # Schema-aware prompt examples (optional; falls back to names/descriptions)
+            use_schemas = getattr(self.settings, "mcp_prompt_schemas_enabled", True)
+            examples_block = ""
+            if use_schemas:
+                try:
+                    full_map = await asyncio.wait_for(
+                        discover_tools_full(mcp_file, force_refresh=False), timeout=20.0
+                    )
+                except Exception:
+                    full_map = {}
+
+                def _sig_and_example(server: str, tool_obj: Dict[str, Any]) -> str:
+                    nm = tool_obj.get("name") or "tool"
+                    desc = (tool_obj.get("description") or "")
+                    schema = tool_obj.get("input_schema") or {}
+                    props = schema.get("properties") or {}
+                    req = set(schema.get("required") or [])
+                    parts = []
+                    args_obj: Dict[str, Any] = {}
+                    if isinstance(props, dict):
+                        for k, v in list(props.items())[:6]:  # limit params in prompt
+                            t = v.get("type") if isinstance(v, dict) else None
+                            if isinstance(t, list) and t:
+                                t = t[0]
+                            t_s = t if isinstance(t, str) else "any"
+                            opt = "" if k in req else "?"
+                            parts.append(f"{k}{opt}: {t_s}")
+                            # build tiny example value
+                            if k in req:
+                                if t_s == "integer":
+                                    args_obj[k] = 1
+                                elif t_s == "number":
+                                    args_obj[k] = 1.0
+                                elif t_s == "boolean":
+                                    args_obj[k] = True
+                                elif t_s == "array":
+                                    args_obj[k] = ["item"]
+                                else:
+                                    args_obj[k] = "value"
+                    sig = f"{nm}({', '.join(parts)})"
+                    # Minimal JSON example
+                    try:
+                        args_json = json.dumps(args_obj)
+                    except Exception:
+                        args_json = "{}"
+                    example = f'TOOL_CALL = {{ "mcp": "{server}", "tool": "{nm}", "arguments": {args_json} }}'
+                    short_desc = (desc[:tool_desc_max] + "...") if len(desc) > tool_desc_max else desc
+                    return f"- {server}: {sig} — {short_desc}\n  {example}"
+
+                lines: List[str] = []
+                if full_map:
+                    for server_name, tools in full_map.items():
+                        for tool in tools[:tool_examples_per_server]:
+                            try:
+                                lines.append(_sig_and_example(server_name, tool))
+                            except Exception:
+                                # Fall back to simple name/desc if any formatting issue
+                                tnm = tool.get("name") or "tool"
+                                d = tool.get("description") or ""
+                                short_desc = (d[:tool_desc_max] + "...") if len(d) > tool_desc_max else d
+                                lines.append(f"- {server_name}: tool '{tnm}' - {short_desc}")
+                if lines:
+                    examples_block = "\n".join(lines[:tool_examples_total])
+            if not examples_block:
+                # Fallback to simple discovered names and descriptions
+                tool_examples_list: List[str] = []
+                for server_name, tools in discovered_tools_map.items():
+                    for tool_name, desc in tools[:tool_examples_per_server]:
+                        short_desc = (desc[:tool_desc_max] + "...") if len(desc) > tool_desc_max else desc
+                        tool_examples_list.append(f"- {server_name}: tool '{tool_name}' - {short_desc}")
+                if tool_examples_list:
+                    examples_block = "\n".join(tool_examples_list[:tool_examples_total])
+                else:
+                    examples_block = (
+                        "(No tools discovered from configured MCP servers. Ensure servers are running in Settings → Skills & MCP. "
+                        "Use ONLY server and tool names that appear in the Discovered tools list above once available.)"
+                    )
+            # Detect capabilities from discovered tools only (no hardcoded server names — Cursor-style)
+            MACOS_LIKE_TOOLS = {
+                "calendar_events", "calendar_calendars", "mail_messages", "contacts_people",
+                "reminders_tasks", "reminders_lists", "notes_items", "notes_folders", "messages_chat",
+            }
+            for srv, tools in discovered_tools_map.items():
+                tool_names = {t[0] for t in tools}
+                if not macos_like_server and tool_names & MACOS_LIKE_TOOLS:
+                    macos_like_server = srv
+                if not search_server and "search" in tool_names:
+                    search_server = srv
             # Check if we have file-writing capability (write_file, fast_write_file, etc.)
             for srv, tools in discovered_tools_map.items():
                 if any(t[0] in ("write_file", "fast_write_file", "write") for t in tools):
                     write_file_server = srv
+                    write_tool_name = "fast_write_file" if any(t[0] == "fast_write_file" for t in tools) else "write_file"
                     break
             has_write_file = write_file_server is not None
+            # Obsidian MCP (e.g. mcp-obsidian-advanced): save/create/edit in vault only via TOOL_CALL
+            for srv, tools in discovered_tools_map.items():
+                if "obsidian" in srv.lower():
+                    obsidian_server = srv
+                    break
+                if any((t[0] or "").startswith("obsidian_") for t in tools):
+                    obsidian_server = srv
+                    break
             from datetime import datetime
             _now = datetime.now()
             _today = _now.strftime("%Y-%m-%d")
             _today_start = f"{_today}T00:00"
             _today_end = f"{_today}T23:59"
+            enabled_set = {s.lower().strip() for s in enabled_skills_list}
+            has_calendar_skill = "calendar" in enabled_set
+            has_gmail_skill = "gmail" in enabled_set
+            has_github_skill = "github" in enabled_set
+            has_mcp_marketplace_skill = "mcp_marketplace" in enabled_set
+            builtin_examples = []
+            if has_calendar_skill:
+                builtin_examples.append("- calendar: list_events {} or {\"timeMin\": \"...\", \"maxResults\": 10}, create_event {\"summary\": \"Meeting\", \"start\": \"2026-02-20T10:00\", \"end\": \"11:00\", \"timezone\": \"UTC\"}")
+            if has_gmail_skill:
+                builtin_examples.append("- gmail: send_email {\"to\": \"...\", \"subject\": \"...\", \"body\": \"...\"}, reply {\"thread_id\": \"...\", \"body\": \"...\"}, list_messages {\"q\": \"in:inbox\", \"maxResults\": 10}")
+            if has_github_skill:
+                builtin_examples.append("- github: list_prs {\"repo\": \"owner/repo\", \"state\": \"open\"}, list_issues {\"repo\": \"owner/repo\"}, create_issue {\"repo\": \"owner/repo\", \"title\": \"Bug\", \"body\": \"...\"}, get_pr {\"repo\": \"owner/repo\", \"number\": 1}")
+            if has_mcp_marketplace_skill:
+                builtin_examples.append("- mcp_marketplace: discover {} to list ClawHub MCP servers, install {\"name\": \"playwright-mcp\"} to add one")
+            builtin_examples_str = "\n".join(builtin_examples) if builtin_examples else "(none enabled)"
+            has_macos_skill = "macos-mcp" in enabled_set
+            use_macos_via_mcp = macos_like_server is not None
+            use_macos_via_skill = has_macos_skill and not macos_like_server
+            macos_skill_or_server = macos_like_server if use_macos_via_mcp else ("macos-mcp" if use_macos_via_skill else None)
+            # Calendar/mail instructions: only reference servers or skills that actually exist
+            if use_macos_via_skill:
+                calendar_instruction = (
+                    'For **desktop calendar** (e.g. "check my calendar", "upcoming events"): use SKILL_ACTION with skill "macos-mcp" and action "calendar_events" (params with action "read", startDate/endDate for date range). '
+                    'For **Google Calendar** only when the user says "Google calendar" or "gcal": use skill "calendar" with action list_events if it is in Enabled skills above; otherwise use macos-mcp calendar_events.'
+                )
+                gmail_instruction = (
+                    'For **mail / Mail.app** (e.g. "check my mail"): use SKILL_ACTION with skill "macos-mcp" and action "mail_messages" (params {"action": "read"}). '
+                    'For **Gmail** only when the user says "gmail": use skill "gmail" with action "list_messages" if it is in Enabled skills above; otherwise use macos-mcp mail_messages.'
+                )
+            elif use_macos_via_mcp:
+                calendar_instruction = (
+                    f'For **desktop calendar** (e.g. "check my calendar", "upcoming events"): use TOOL_CALL with mcp "{macos_like_server}" and tool calendar_events (params with action "read", startDate/endDate for date range). '
+                    'For **Google Calendar** only when the user says "Google calendar" or "gcal": use skill "calendar" with action list_events if it is in Enabled skills above; otherwise use the same MCP server for calendar_events.'
+                )
+                gmail_instruction = (
+                    f'For **mail / Mail.app** (e.g. "check my mail"): use TOOL_CALL with mcp "{macos_like_server}" and tool mail_messages (params {{"action": "read"}}). '
+                    'For **Gmail** only when the user says "gmail": use skill "gmail" with action "list_messages" if it is in Enabled skills above; otherwise use the same MCP server for mail.'
+                )
+            else:
+                calendar_instruction = (
+                    'For **Google Calendar** when the user says "Google calendar" or "gcal" use skill "calendar" if enabled. For **desktop calendar** use only a server that appears in Discovered tools above with tool calendar_events.'
+                )
+                gmail_instruction = (
+                    'For **Gmail** when the user says "gmail" use skill "gmail" if enabled. For **Mail.app** use only a server from Discovered tools above that provides mail_messages.'
+                )
+            if not has_gmail_skill and not use_macos_via_skill and not use_macos_via_mcp:
+                gmail_instruction = 'When the user asks about Gmail: the gmail skill is disabled. For mail use a server from Discovered tools above that provides mail_messages if available.'
+            elif not has_gmail_skill:
+                gmail_instruction = 'When the user asks about Gmail: the gmail skill is disabled. For mail use ' + (f'TOOL_CALL with mcp "{macos_like_server}" and tool mail_messages.' if use_macos_via_mcp else 'SKILL_ACTION with skill "macos-mcp" and action mail_messages.')
+            # macOS block: only when user has a server or skill that provides these capabilities
+            macos_instruction_block = ""
+            if use_macos_via_mcp:
+                macos_instruction_block = (
+                    f'IMPORTANT: For **desktop calendar** use TOOL_CALL with mcp "{macos_like_server}" and tool calendar_events. For **Google Calendar** only when user says "Google calendar" or "gcal" use skill "calendar" if enabled. For **mail / Mail.app** use TOOL_CALL with mcp "{macos_like_server}" and tool mail_messages. For **Gmail** when user says "gmail" use skill "gmail" if enabled. Use mcp "{macos_like_server}" for contacts, Notes, Reminders, Messages.\n'
+                    f'Natural commands for macOS: use TOOL_CALL with mcp "{macos_like_server}" for contacts, notes, reminders, Mail.app, Messages. Available tools: reminders_tasks, reminders_lists, calendar_events, calendar_calendars, notes_items, notes_folders, mail_messages, messages_chat, contacts_people. Use params with "action": "read" | "create" | "search" as needed. For contacts_people search use {{"action": "search", "search": "name or term"}}. For calendar_events use startDate/endDate for date range. Always use "search" (not "query") for contacts_people.'
+                )
+            elif use_macos_via_skill:
+                macos_instruction_block = (
+                    'IMPORTANT: For **desktop calendar** use SKILL_ACTION with skill "macos-mcp" and action calendar_events. For **Google Calendar** only when user says "Google calendar" or "gcal" use skill "calendar" if enabled. For **mail / Mail.app** use SKILL_ACTION with skill "macos-mcp" and action mail_messages. For **Gmail** when user says "gmail" use skill "gmail" if enabled. Use skill "macos-mcp" for contacts, Notes, Reminders, Messages.\n'
+                    'Natural commands for macOS: use SKILL_ACTION with skill "macos-mcp" for contacts, notes, reminders, Mail.app, Messages. Available actions: reminders_tasks, reminders_lists, calendar_events, calendar_calendars, notes_items, notes_folders, mail_messages, messages_chat, contacts_people. Use params.action "read" | "create" | "search". For contacts_people use {"action": "search", "search": "name"}. For calendar_events use startDate/endDate.'
+                )
+            search_instruction = ""
+            if search_server:
+                search_instruction = f'\nWhen users ask to search the web/internet, use TOOL_CALL with mcp "{search_server}" and tool "search" (arguments: {{"query": "..."}}). Agent executes tools and returns real results.'
             system_content += f"""
 
 Current date: {_today}. When the user says "today", "just today", "this morning", etc., use startDate: \"{_today_start}\" and endDate: \"{_today_end}\" (or equivalent) in calendar_events, reminders_tasks, or other date params. Use this date—do NOT use a placeholder or past date like 2023-10-06.
@@ -810,44 +1492,79 @@ Enabled skills: {skills_str}
 
 ## BUILT-IN SKILLS
 
-Use SKILL_ACTION = {{\"skill\": \"skill_id\", \"action\": \"action_name\", \"params\": {{...}}}}
+Use SKILL_ACTION = {{\"skill\": \"skill_id\", \"action\": \"action_name\", \"params\": {{...}}}}. Only use skills that appear in Enabled skills above.
 
 Examples:
-- calendar: list_events {{}} or {{\"timeMin\": \"...\", \"maxResults\": 10}}, create_event {{\"summary\": \"Meeting\", \"start\": \"2026-02-20T10:00\", \"end\": \"11:00\", \"timezone\": \"UTC\"}}
-- gmail: send_email {{\"to\": \"...\", \"subject\": \"...\", \"body\": \"...\"}}, reply {{\"thread_id\": \"...\", \"body\": \"...\"}}, list_messages {{\"q\": \"in:inbox\", \"maxResults\": 10}}
-- github: list_prs {{\"repo\": \"owner/repo\", \"state\": \"open\"}}, list_issues {{\"repo\": \"owner/repo\"}}, create_issue {{\"repo\": \"owner/repo\", \"title\": \"Bug\", \"body\": \"...\"}}, get_pr {{\"repo\": \"owner/repo\", \"number\": 1}}
-- mcp_marketplace: discover {{}} to list ClawHub MCP servers, install {{\"name\": \"playwright-mcp\"}} to add one
+{builtin_examples_str}
 
-When the user asks to check email, list emails, read Gmail, or show unread emails: output SKILL_ACTION with skill \"gmail\" and action \"list_messages\" (e.g. params {{\"q\": \"is:unread\", \"maxResults\": 10}}) immediately. Do NOT reply that Gmail is not configured—only suggest Settings if the skill returns an error.
-When the user asks about calendar or upcoming events: output SKILL_ACTION with skill \"calendar\" and action \"list_events\" immediately. Do NOT reply that Calendar is not configured—only suggest Settings if the skill returns an error.
-Natural commands for macOS (if macos-mcp or similar MCP server is configured, use SKILL_ACTION with that server name): \"add a note\" / \"create a note\" / \"search my notes\" → skill macos-mcp, action notes_items, params {{\"action\": \"create\" or \"read\", \"title\": \"...\", \"body\": \"...\"}}; \"remind me to\" / \"my reminders\" / \"list reminders\" → action reminders_tasks, params {{\"action\": \"read\" or \"create\", ...}}; \"my calendar\" / \"what's on my calendar\" / \"schedule a meeting\" → action calendar_events; \"find contact\" / \"look up\" / \"search contacts\" / \"get phone number for\" → action contacts_people with params {{\"action\": \"search\", \"query\": \"name or term\"}} or {{\"action\": \"read\"}} for listing; \"check my mail\" / \"my inbox\" / \"read my mail\" → action mail_messages; \"send a text\" / \"iMessage\" / \"my messages\" / \"recent chats\" → action messages_chat. Always include params.action (e.g. \"read\", \"create\", \"search\") for notes_items, calendar_events, reminders_tasks, contacts_people.
+{gmail_instruction}
+{calendar_instruction}
+{macos_instruction_block}
 When outputting SKILL_ACTION or TOOL_CALL, write only a brief intro line (e.g. \"Checking your calendar…\") before the JSON; the raw JSON is hidden from the user—they only see your intro and the skill result.
 If the user asks \"what skills do I have?\", \"list my skills\", or similar: answer with \"Enabled skills: {skills_str}. Use Settings → Skills for details.\"
+Tool and skill results are shown cleaned by default (internal IDs and placeholders hidden). If the user asks for \"verbose\", \"detailed response\", \"show raw\", or \"debug response\", they will see the full raw output.
 Configure API keys/tokens in Settings → Integrations first.
 
 MCP servers:
 
 {mcp_str}
+"""
+        if is_local:
+            # Concise instructions for local models
+            system_content += f"""
+## MCP TOOLS & SKILLS
+To use a tool, output:
+TOOL_CALL = {{ "mcp": "server_name", "tool": "tool_name", "arguments": {{ "param": "value" }} }}
+Discovered tools (exact names):
+{examples_block}
+"""
+            if obsidian_server:
+                system_content += f"""
+CRITICAL - Obsidian: To save/edit in Obsidian, you MUST output TOOL_CALL with mcp "{obsidian_server}" and tool obsidian_put_file, obsidian_append_to_file, or obsidian_patch_file.
+"""
+            if use_macos_via_mcp:
+                system_content += f'\nFor desktop calendar/mail/contacts/notes/reminders use TOOL_CALL with mcp "{macos_like_server}" and the right tool from Discovered tools above.'
+            elif use_macos_via_skill:
+                system_content += '\nFor desktop calendar/mail/contacts/notes/reminders use SKILL_ACTION with skill "macos-mcp" and the action from Discovered tools above.'
+            system_content += """
 
+To ask a question: ASK_USER = { "question": "..." }.
+To delegate: DELEGATE = { "role": "...", "message": "..." }.
+"""
+        else:
+            # Original detailed instructions for high-end models (GPT-4, Claude 3.5)
+            system_content += """
 ## USING MCP & SKILLS
 
 MCP servers provide tools. Use this exact format:
 
-TOOL_CALL = {{ "mcp": "server_name", "tool": "tool_name", "arguments": {{ "param": "value" }} }}
-
+TOOL_CALL = { "mcp": "server_name", "tool": "tool_name", "arguments": { "param": "value" } }
 Discovered tools (use these exact names):
-
-{examples_block}
-
-When users ask to search the web/internet, use ddg-search with tool 'search' if available. Agent executes tools and returns real results.
-CRITICAL: Describing an action in text (e.g. 'Now writing files via fast-filesystem') does NOT execute it. You MUST output TOOL_CALL = {{ ... }} to run tools. Never say you will do something without outputting the actual TOOL_CALL.
-CRITICAL (Gmail/Calendar): When the user asks to check email, list emails, read Gmail, or show unread emails, you MUST output SKILL_ACTION = {{ \"skill\": \"gmail\", \"action\": \"list_messages\", \"params\": {{ \"q\": \"is:unread\", \"maxResults\": 10 }} }} in your response. Do NOT say you cannot access email or that they must connect Gmail first—the app handles auth; you must try the skill. Only suggest Settings if the skill result contains an error. Same for calendar: if they ask about events or calendar, output SKILL_ACTION with skill \"calendar\", action \"list_events\".
-When the user asks about notes, reminders, macOS calendar, contacts, Mail.app inbox, or Messages/iMessage: if macos-mcp (or similar) is in MCP servers, output SKILL_ACTION with that server name, action notes_items | reminders_tasks | calendar_events | contacts_people | mail_messages | messages_chat, and params that include \"action\": \"read\", \"create\", or \"search\" as appropriate. For contacts use contacts_people with {{\"action\": \"search\", \"query\": \"...\"}} or {{\"action\": \"read\"}}. Do not reply that you cannot—try the skill first.
+"""
+            system_content += f"\n{examples_block}\n\n"
+            system_content += "\nCRITICAL: Do not only describe actions; you must output TOOL_CALL JSON to execute tools. Use ONLY server and tool names from the Discovered tools list above."
+            if search_instruction:
+                system_content += search_instruction
+            system_content += "\n"
+            if obsidian_server:
+                system_content += f"""
+CRITICAL - Obsidian: When the user asks to save, create, edit, or write a file in Obsidian or their vault, you MUST output TOOL_CALL with mcp "{obsidian_server}" and one of: obsidian_put_file (path, content), obsidian_append_to_file, obsidian_patch_file. Saying "I've saved that" or "I've created the file" without outputting the TOOL_CALL does NOT write to the vault-only the actual TOOL_CALL is executed. Use the exact server name "{obsidian_server}" from Discovered tools above.
+"""
+            if use_macos_via_mcp:
+                system_content += f"""
+CRITICAL - Use ONLY discovered tools: For **mail** (Mail.app) use TOOL_CALL with mcp "{macos_like_server}" and tool mail_messages. For **Gmail** only when user says "gmail" use skill "gmail" if enabled. For **desktop calendar** use TOOL_CALL with mcp "{macos_like_server}" and tool calendar_events. For **Google Calendar** only when user says "Google calendar" or "gcal" use skill "calendar" if enabled. For contacts, Notes, Reminders, Messages use TOOL_CALL with mcp "{macos_like_server}" and the appropriate tool from Discovered tools (contacts_people, notes_items, reminders_tasks, messages_chat). Include params.action ("read", "create", "search"). For contacts_people search use {{"action": "search", "search": "..."}}. For calendar_events use startDate/endDate. Do NOT use reminders_tasks unless the user explicitly asks to create a Reminder. For scheduling use SCHEDULE_TASK.
+"""
+            elif use_macos_via_skill:
+                system_content += """
+CRITICAL - Use ONLY discovered tools and enabled skills: For **mail** (Mail.app) use SKILL_ACTION with skill "macos-mcp" and action mail_messages. For **Gmail** only when user says "gmail" use skill "gmail" if enabled. For **desktop calendar** use SKILL_ACTION with skill "macos-mcp" and action calendar_events. For **Google Calendar** only when user says "Google calendar" or "gcal" use skill "calendar" if enabled. For contacts, Notes, Reminders, Messages use SKILL_ACTION with skill "macos-mcp" and the appropriate action. Include params.action ("read", "create", "search"). Do NOT use reminders_tasks unless the user explicitly asks to create a Reminder. For scheduling use SCHEDULE_TASK.
+"""
+            system_content += """
+If a previous attempt for calendar, email, contacts, notes, or reminders failed with permission denied: try again—the user may have fixed permissions.
 When using TOOL_CALL, write a brief intro first (e.g. 'Let me search for that.') then output the TOOL_CALL on the same or next line.
 When you receive tool results in a follow-up message, use them to continue your response. Do NOT repeat the TOOL_CALL - the tools have already been executed.
-To ask the user a clarifying question, output ASK_USER = {{ \"question\": \"...\" }}. You will get their reply in the next message.
-To delegate to a specialist role, output DELEGATE = {{ \"role\": \"researcher\" | \"writer\" | \"coder\", \"message\": \"...\" }}. You will get their response and can synthesize it.
-For debate between two specialists, output DEBATE = {{ \"topic\": \"...\", \"question\": \"...\", \"target_slugs\": [\"research\", \"coding\"] }}. You will get their positions and can synthesize a consensus."""
+To ask the user a clarifying question, output ASK_USER = { "question": "..." }. You will get their reply in the next message.
+To delegate to a specialist role, output DELEGATE = { "role": "researcher" | "writer" | "coder", "message": "..." }. You will get their response and can synthesize it.
+For debate between two specialists, output DEBATE = { "topic": "...", "question": "...", "target_slugs": ["research", "coding"] }. You will get their positions and can synthesize a consensus."""
             if self.workspace_config and getattr(self.workspace_config, "subagents_enabled", False):
                 system_content += """
 
@@ -864,11 +1581,11 @@ Use for: parallel research, long-running summaries, or any focused subtask. The 
                 system_content += """
 
 For complex multi-step tasks, first output PLAN = [\"step1\", \"step2\", ...] then execute with TOOL_CALLs."""
-            if has_write_file:
-                system_content += """
+            if has_write_file and write_file_server:
+                system_content += f"""
 
 ## CREATING FILES
-When asked to build/create an app or write files: first call fast_list_allowed_directories to see writable paths. For fast-filesystem use tool "fast_write_file" (path, content). The path the user gives is the TARGET FOLDER—write files directly into it: path/File.swift. Do NOT create a subfolder with the same name (e.g. if they say ZZZZ use ZZZZ/File.swift not ZZZZ/ZZZZ/File.swift). Output ONE complete TOOL_CALL per file.
+When asked to build/create an app or write files: first call fast_list_allowed_directories (if available) to see writable paths. Use TOOL_CALL with mcp "{write_file_server}" and tool "{write_tool_name}" (arguments: path, content). The path the user gives is the TARGET FOLDER—write files directly into it: path/File.swift. Do NOT create a subfolder with the same name (e.g. if they say ZZZZ use ZZZZ/File.swift not ZZZZ/ZZZZ/File.swift). Output ONE complete TOOL_CALL per file.
 
 Match the user's scope: if they ask for robust, feature-rich, feature-filled, professional, beautiful, or "do not scrimp"—implement many features, a polished UI, preferences/settings panels, and do NOT default to minimal implementations.
 
@@ -927,13 +1644,17 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
         detailed_response_triggers = (
             "detailed response", "full response", "show raw", "include the skill",
             "show skill_action", "show tool_call", "verbose response", "debug response",
-            "give me everything", "show everything", "detailed output",
+            "give me everything", "show everything", "detailed output", "verbose",
         )
         wants_detailed_response = any(p in msg_lower for p in detailed_response_triggers)
+        # When True: show raw tool/skill output (IDs, Apple placeholders); otherwise sanitize for chat
+        self._verbose_tool_output = wants_detailed_response
         use_simple_model = self._is_simple_task(message, images)
 
         try:
             max_iterations = self._get_max_agentic_iterations()
+            scheduler_exec_block_notified = False
+            scheduler_exec_auto_created = False
             for iteration in range(max_iterations):
                 # Subagent cancel: if GUI requested kill, stop this run
                 if context and context.get("subagent_run_id") and self.subagent_registry:
@@ -985,7 +1706,15 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
                                 display_text = response_text
                             else:
                                 display_text = strip_response_blocks(response_text)
-                            if display_text.strip():
+                            if not wants_detailed_response:
+                                display_text = _sanitize_tool_result(display_text)
+                            suppress_scheduler_detour = (
+                                _is_scheduler_request_text(message)
+                                and not wants_detailed_response
+                                and not _has_structured_action_blocks(response_text)
+                                and _looks_like_scheduler_detour_text(response_text)
+                            )
+                            if display_text.strip() and not suppress_scheduler_detour:
                                 if content_filter:
                                     display_text, _ = content_filter.filter(display_text)
                                 yield display_text
@@ -1007,10 +1736,65 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
                         await asyncio.sleep(backoff)
 
                 if not response_text.strip() and iteration == 0:
-                    yield (
-                        "The model returned no response. Ollama may still be loading the model—try again in a moment, "
-                        "or run `ollama run <model>` to preload. If using LM Studio, ensure a model is loaded."
+                    # Fallback: if the model returned empty but the user asked for contacts/email/notes/etc., try running the skill directly.
+                    # Do NOT use this fallback for scheduling requests—those must use SCHEDULE_TASK (built-in Scheduler), not macos-mcp.
+                    msg_lower = (message or "").strip().lower()
+                    is_scheduling_request = _is_scheduler_request_text(msg_lower) or any(
+                        x in msg_lower for x in (
+                            "every minute", "every hour", "check my email every", "check email every",
+                        )
                     )
+                    _enabled = [s.lower().strip() for s in self._effective_enabled_skills()]
+                    _has_gmail = "gmail" in _enabled
+                    _has_calendar_skill = "calendar" in _enabled
+                    try_skill = None
+                    if not is_scheduling_request and macos_skill_or_server and any(x in msg_lower for x in ("contact", "phone number", "phone", "look up")):
+                        name_match = re.search(r"(?:what is|who is|find|look up|search for|get)\s+([^.?!]+?)(?:\s+(?:phone|number|contact))?", msg_lower, re.IGNORECASE)
+                        search_term = (name_match.group(1).strip() if name_match else message.strip())[:100]
+                        try_skill = {"skill": macos_skill_or_server, "action": "contacts_people", "params": {"action": "search", "search": search_term or " "}}
+                    elif not is_scheduling_request and any(x in msg_lower for x in ("email", "inbox", "unread", "check mail", "my email", "my mail")):
+                        if "gmail" in msg_lower and _has_gmail:
+                            try_skill = {"skill": "gmail", "action": "list_messages", "params": {"q": "is:unread", "maxResults": 10}}
+                        elif macos_skill_or_server:
+                            try_skill = {"skill": macos_skill_or_server, "action": "mail_messages", "params": {"action": "read"}}
+                    elif not is_scheduling_request and macos_skill_or_server and any(x in msg_lower for x in ("note", "notes")):
+                        try_skill = {"skill": macos_skill_or_server, "action": "notes_items", "params": {"action": "read"}}
+                    elif not is_scheduling_request and macos_skill_or_server and any(x in msg_lower for x in ("reminder", "reminders", "todo")):
+                        try_skill = {"skill": macos_skill_or_server, "action": "reminders_tasks", "params": {"action": "read"}}
+                    elif not is_scheduling_request and any(x in msg_lower for x in ("calendar", "events", "upcoming", "my calendar")):
+                        if any(x in msg_lower for x in ("google calendar", "google calendar's", "gcal")):
+                            if _has_calendar_skill:
+                                try_skill = {"skill": "calendar", "action": "list_events", "params": {}}
+                            elif macos_skill_or_server:
+                                try_skill = {"skill": macos_skill_or_server, "action": "calendar_events", "params": {"action": "read"}}
+                        elif macos_skill_or_server:
+                            try_skill = {"skill": macos_skill_or_server, "action": "calendar_events", "params": {"action": "read"}}
+                    fallback_ok = False
+                    if try_skill:
+                        try:
+                            chain_label, result = await self._execute_skill_action_chained(try_skill, max_depth=1)
+                            out = self._maybe_sanitize_tool_result(str(result or ""))
+                            skill_id = try_skill.get("skill", macos_skill_or_server or "skill")
+                            yield f"\n\n**Skill {skill_id}**\n{out}\n"
+                            accumulated_response += f"[Used fallback skill for: {message[:80]}...]"
+                            accumulated_tool_displays.append(f"\n\n**Skill {skill_id}**\n{out}\n")
+                            fallback_ok = True
+                        except Exception as e:
+                            logger.debug("Fallback skill failed: %s", e)
+                    if not fallback_ok:
+                        yield (
+                            "The model returned no response. Ollama may still be loading the model—try again in a moment, "
+                            "or run `ollama run <model>` to preload. If using LM Studio, ensure a model is loaded."
+                        )
+                        return
+                    # Fallback succeeded: save session and return (skip rest of loop)
+                    fallback_response = accumulated_response + "\n" + "".join(accumulated_tool_displays)
+                    session.append({"role": "user", "content": message})
+                    session.append({"role": "assistant", "content": fallback_response})
+                    max_messages = getattr(self.settings, "max_session_messages", 20)
+                    session = trim_session(session, max_messages)
+                    self.sessions[user_id] = session
+                    self._save_session(user_id)
                     return
 
                 accumulated_response += response_text
@@ -1027,6 +1811,16 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
                         if isinstance(ask_data, dict):
                             q = ask_data.get("question", "").strip() or ask_data.get("q", "").strip()
                             if q:
+                                # Scheduler requests should never detour into Apple Reminders clarification prompts.
+                                # If the model asks a follow-up here, recover by creating the built-in scheduler task.
+                                if _is_scheduler_request_text(message) and not _is_explicit_shell_request_text(message):
+                                    schedule_cmd = _build_schedule_task_from_request(message)
+                                    if schedule_cmd:
+                                        result = await self._execute_schedule_action(user_id, schedule_cmd)
+                                        sched_out = f"\n\n**⏰ Scheduler**\n{self._maybe_sanitize_tool_result(str(result or ''))}\n"
+                                        accumulated_tool_displays.append(sched_out)
+                                        yield sched_out
+                                        return
                                 yield f"\n\n**I need a bit more information:**\n{q}\n"
                                 return
                     except (json.JSONDecodeError, ValueError):
@@ -1139,7 +1933,7 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
                 # Fallback: model showed path/content JSON or code blocks but no TOOL_CALLs
                 code_block_writes: list[tuple[str, str]] = []
                 base_hint: Optional[str] = None
-                if not tool_call_matches and has_write_file:
+                if not tool_call_matches and has_write_file and write_file_server:
                     # 1) to=fast-filesystem.fast_write_file format: {"path":"...","content":"..."}
                     code_block_writes = list(find_write_file_path_content_blocks(response_text))
                     # 2) Markdown code blocks with filename headers (if no path/content blocks)
@@ -1157,8 +1951,9 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
                             response_text, base_path_hint=base_hint
                         )
 
-                # Proactive search fallback: empty response + user wants search
-                if wants_search and not tool_call_matches and len(response_text.strip()) < 50 and iteration == 0:
+                # Proactive search fallback: empty response + user wants search (only if we have a discovered search server)
+                if (wants_search and search_server and not tool_call_matches and
+                        len(response_text.strip()) < 50 and iteration == 0):
                     query = msg_lower
                     for phrase in (
                         "look on the internet for", "search the internet for",
@@ -1177,32 +1972,46 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
                     query = simplify_search_query(query)
                     if mcp_file.exists():
                         try:
-                            tool_result = await call_mcp_tool(mcp_file, "ddg-search", "search", {"query": query})
-                            # Retry with shorter query if DuckDuckGo returned no results (bot detection / over-specific)
+                            tool_result = self._maybe_sanitize_tool_result(
+                                (await call_mcp_tool(mcp_file, search_server, "search", {"query": query})) or ""
+                            )
                             no_results = "no results" in (tool_result or "").lower() or "bot detection" in (tool_result or "").lower()
                             if no_results and len(query) > 25:
                                 alt_query = simplify_search_query_retry(query)
                                 if alt_query != query:
-                                    tool_result = await call_mcp_tool(mcp_file, "ddg-search", "search", {"query": alt_query})
-                            result_display = f"Let me search for that.\n\n**🔧 ddg-search.search**\n{tool_result}\n"
+                                    tool_result = self._maybe_sanitize_tool_result(
+                                        (await call_mcp_tool(mcp_file, search_server, "search", {"query": alt_query})) or ""
+                                    )
+                            result_display = f"Let me search for that.\n\n**🔧 {search_server}.search**\n{tool_result}\n"
                             if content_filter:
                                 result_display, _ = content_filter.filter(result_display)
                             yield result_display
                             accumulated_tool_displays.append(result_display)
-                            # Feed result back for next turn
                             current_messages.append({"role": "assistant", "content": response_text})
                             current_messages.append({
                                 "role": "user",
-                                "content": f"[Tool result ddg-search.search]\n{tool_result}\n\nUse this to continue your response."
+                                "content": f"[Tool result {search_server}.search]\n{tool_result}\n\nUse this to continue your response."
                             })
                             continue
                         except Exception as e:
                             logger.warning(f"Proactive search fallback error: {e}")
-                            err_display = f"I tried to search but encountered an error: {str(e)}. Make sure ddg-search MCP server is configured in Settings > Skills & MCP."
+                            err_display = f"I tried to search but encountered an error: {str(e)}. Ensure the MCP server that provides 'search' is running in Settings → Skills & MCP."
                             yield err_display
                             accumulated_tool_displays.append(err_display)
 
                 if not tool_call_matches and not code_block_writes:
+                    if (
+                        _is_scheduler_request_text(message)
+                        and not _is_explicit_shell_request_text(message)
+                        and not _has_structured_action_blocks(response_text)
+                    ):
+                        schedule_cmd = _build_schedule_task_from_request(message)
+                        if schedule_cmd:
+                            result = await self._execute_schedule_action(user_id, schedule_cmd)
+                            sched_out = f"\n\n**⏰ Scheduler**\n{self._maybe_sanitize_tool_result(str(result or ''))}\n"
+                            accumulated_tool_displays.append(sched_out)
+                            yield sched_out
+                            return
                     # Model described files but didn't output code? Ask once for code blocks.
                     file_creation_hints = ("create", "write", "file", "placed", "i'll create", "here's", "swift", "entry point", "source file")
                     resp_lower = response_text.lower()
@@ -1217,21 +2026,41 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
                         current_messages.append({"role": "assistant", "content": response_text})
                         current_messages.append({"role": "user", "content": follow_msg})
                         continue
+                    # Obsidian: model said it saved/created/edited but didn't output TOOL_CALL — ask for actual TOOL_CALL
+                    wants_obsidian_write = (
+                        obsidian_server
+                        and iteration == 0
+                        and ("obsidian" in msg_lower or "vault" in msg_lower)
+                        and any(x in msg_lower for x in ("save", "create", "edit", "write", "add", "put", "update", "note"))
+                    )
+                    if wants_obsidian_write and any(
+                        x in resp_lower for x in ("saved", "created", "added", "written", "i've ", "i have ", "done", "updated")
+                    ):
+                        follow_msg = (
+                            f"[IMPORTANT] You described saving/editing in Obsidian but did not output a TOOL_CALL. "
+                            f"To actually write to the vault you MUST output: TOOL_CALL = {{\"mcp\": \"{obsidian_server}\", \"tool\": \"obsidian_put_file\" or \"obsidian_append_to_file\", \"arguments\": {{\"path\": \"note.md\", \"content\": \"...\"}}}}. "
+                            f"Output the TOOL_CALL now (path relative to vault; content = full note text)."
+                        )
+                        current_messages.append({"role": "assistant", "content": response_text})
+                        current_messages.append({"role": "user", "content": follow_msg})
+                        continue
                     break  # No tools this turn - we're done
 
                 # Execute tools and collect results (from TOOL_CALLs or extracted code blocks)
                 tool_result_parts: List[str] = []
-                if code_block_writes:
-                    wfs = write_file_server or "fast-filesystem"
-                    write_tool = "fast_write_file" if wfs == "fast-filesystem" else "write_file"
+                if code_block_writes and write_file_server:
+                    wfs = write_file_server
+                    write_tool = write_tool_name
                     _zw_chars = ("\u200b", "\u200c", "\u200d", "\ufeff")
                     for full_path, content in code_block_writes:
                         for c in _zw_chars:
                             full_path = full_path.replace(c, "")
                         try:
-                            tool_result = await call_mcp_tool(
-                                mcp_file, wfs, write_tool,
-                                {"path": full_path, "content": content},
+                            tool_result = self._maybe_sanitize_tool_result(
+                                (await call_mcp_tool(
+                                    mcp_file, wfs, write_tool,
+                                    {"path": full_path, "content": content},
+                                )) or ""
                             )
                             result_display = f"\n\n**🔧 {wfs}.{write_tool}** ({full_path})\n{tool_result}\n"
                             if content_filter:
@@ -1251,18 +2080,64 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
                         current_messages.append({"role": "user", "content": tool_results_msg})
                     continue  # Next iteration
 
+                # Parse and execute TOOL_CALLs. Buffer parse errors so we only show one if none succeed.
+                any_tool_executed = False
+                pending_toolcall_parse_error_msg: Optional[str] = None
+                pending_toolcall_tool_result_part: Optional[str] = None
                 for match_str in tool_call_matches:
                     try:
                         normalized = normalize_llm_json(match_str)
                         tool_call = None
+                        # 1) Strict JSON parse first
                         try:
                             tool_call = json.loads(normalized)
                         except json.JSONDecodeError:
+                            # 2) Attempt to repair single-quoted JSON and parse again
                             try:
-                                tool_call = ast.literal_eval(normalized)
-                            except (ValueError, SyntaxError):
-                                pass
+                                repaired = repair_json_single_quotes(normalized)
+                                tool_call = json.loads(repaired)
+                            except Exception:
+                                # 3) Attempt to repair common unescaped quotes/newlines in arguments.content
+                                #    Apply on the single-quote-repaired string first (covers combo cases),
+                                #    then on the original normalized string.
+                                try:
+                                    content_fixed = repair_tool_call_content_string(repaired if 'repaired' in locals() else normalized)
+                                    tool_call = json.loads(content_fixed)
+                                except Exception:
+                                    try:
+                                        content_fixed2 = repair_tool_call_content_string(normalized)
+                                        tool_call = json.loads(content_fixed2)
+                                    except Exception:
+                                        # 4) Last resort: Python literal eval for loose dicts — try repaired first
+                                        try:
+                                            if 'repaired' in locals():
+                                                tool_call = ast.literal_eval(repaired)
+                                            else:
+                                                raise ValueError("no_repaired")
+                                        except Exception:
+                                            try:
+                                                tool_call = ast.literal_eval(normalized)
+                                            except (ValueError, SyntaxError):
+                                                # Log preview for diagnostics when debug is enabled
+                                                try:
+                                                    _preview = (normalized[:240] + ("..." if len(normalized) > 240 else "")).replace("\n", "\\n")
+                                                    logger.debug("TOOL_CALL parse failed. Preview: %s", _preview)
+                                                except Exception:
+                                                    pass
                         if not tool_call or not isinstance(tool_call, dict):
+                            # Defer showing the error until after we try all matches; only emit once if none succeed
+                            err_msg = (
+                                "**\u274c TOOL_CALL JSON parse error.** "
+                                "Could not parse the TOOL_CALL block as valid JSON. "
+                                "Ensure newlines are escaped as \\\\n and quotes as \\\\\" "
+                                "inside string values (e.g. file content).\n\n"
+                            )
+                            pending_toolcall_parse_error_msg = err_msg
+                            pending_toolcall_tool_result_part = (
+                                "[Tool error]\nFailed to parse TOOL_CALL JSON. "
+                                "Rewrite the TOOL_CALL with properly escaped strings: "
+                                "newlines as \\\\n, double quotes as \\\\\"."
+                            )
                             continue
                         mcp_name = (tool_call.get("mcp") or "unknown").strip()
                         tool_name = (tool_call.get("tool") or "unknown").strip()
@@ -1279,8 +2154,8 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
                                     v = v.replace(c, "")
                                 args[k] = v
 
-                        # Correct and simplify search queries for better DuckDuckGo results
-                        if mcp_name == "ddg-search" and tool_name == "search" and "query" in args:
+                        # Correct and simplify search queries for any search tool
+                        if tool_name == "search" and "query" in args:
                             q = correct_search_query(str(args["query"]))
                             args["query"] = simplify_search_query(q)
 
@@ -1289,7 +2164,7 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
                         # "ask permission for risky actions" safety model.
                         t0 = time.perf_counter()
                         try:
-                            tool_result = await call_mcp_tool(mcp_file, mcp_name, tool_name, args)
+                            raw_tool_result = await call_mcp_tool(mcp_file, mcp_name, tool_name, args)
                         except Exception as call_err:
                             duration_ms = (time.perf_counter() - t0) * 1000
                             logger.warning(
@@ -1297,24 +2172,39 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
                                 mcp_name, tool_name, duration_ms, call_err,
                             )
                             raise
+                        tool_result = self._maybe_sanitize_tool_result(raw_tool_result or "")
                         duration_ms = (time.perf_counter() - t0) * 1000
                         logger.info(
                             "tool_call mcp=%s tool=%s duration_ms=%.0f success=true",
                             mcp_name, tool_name, duration_ms,
                         )
-                        # Retry with shorter query if DuckDuckGo returned no results
-                        if (mcp_name == "ddg-search" and tool_name == "search" and "query" in args and
+                        # Retry with shorter query if search returned no results (e.g. bot detection)
+                        if (tool_name == "search" and "query" in args and
                             args["query"] and len(args["query"]) > 25):
                             no_results = "no results" in (tool_result or "").lower() or "bot detection" in (tool_result or "").lower()
                             if no_results:
                                 alt = simplify_search_query_retry(args["query"])
                                 if alt != args["query"]:
-                                    tool_result = await call_mcp_tool(mcp_file, mcp_name, tool_name, {"query": alt})
+                                    raw = await call_mcp_tool(mcp_file, mcp_name, tool_name, {"query": alt})
+                                    tool_result = self._maybe_sanitize_tool_result(raw or "")
                         result_display = f"\n\n**🔧 {mcp_name}.{tool_name}**\n{tool_result}\n"
+                        any_tool_executed = True
                         if content_filter:
                             result_display, _ = content_filter.filter(result_display)
                         yield result_display
                         accumulated_tool_displays.append(result_display)
+                        # Screenshot MCP tools: send path or URL to Visual Canvas so the user sees the image and can save from there
+                        if (mcp_name or "").lower() == "screenshot-website-fast" and (tool_name or "").lower() == "take_screenshot":
+                            raw_str = (
+                                raw_tool_result
+                                if isinstance(raw_tool_result, str)
+                                else (json.dumps(raw_tool_result) if isinstance(raw_tool_result, dict) else str(raw_tool_result or ""))
+                            )
+                            canvas_path, canvas_url = _extract_screenshot_from_tool_result(raw_str)
+                            if canvas_path:
+                                yield "\n[GRIZZYCLAW_CANVAS_IMAGE:" + canvas_path + "]\n"
+                            elif canvas_url:
+                                yield "\n[GRIZZYCLAW_CANVAS_URL:" + canvas_url + "]\n"
                         max_result_chars = getattr(self.settings, "agent_tool_result_max_chars", 4000)
                         result_for_context = _truncate_tool_result(tool_result or "", max_result_chars)
                         tool_result_parts.append(f"[Tool result {mcp_name}.{tool_name}]\n{result_for_context}")
@@ -1324,6 +2214,14 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
                         yield err_msg
                         accumulated_tool_displays.append(err_msg)
                         tool_result_parts.append(f"[Tool error]\n{str(e)}")
+
+                # If none of the TOOL_CALL candidates succeeded and we buffered a parse error, show it once now
+                if not any_tool_executed and pending_toolcall_parse_error_msg:
+                    err_msg = pending_toolcall_parse_error_msg
+                    yield err_msg
+                    accumulated_tool_displays.append(err_msg)
+                    if pending_toolcall_tool_result_part:
+                        tool_result_parts.append(pending_toolcall_tool_result_part)
 
                 # Feed tool results back for next LLM turn (with reflection and optional retry hint)
                 tool_results_msg = "\n\n".join(tool_result_parts)
@@ -1337,7 +2235,7 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
                 current_messages.append({"role": "assistant", "content": response_text})
                 current_messages.append({"role": "user", "content": tool_results_msg})
 
-            # Final response for session/memory (LLM output + tool results user saw)
+            # Final response for session/memory (LLM output + tool/skill results for context)
             response_text = accumulated_response
             if accumulated_tool_displays:
                 response_text += "\n" + "".join(accumulated_tool_displays)
@@ -1452,30 +2350,90 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
                 except Exception as e:
                     logger.warning(f"Memory save error: {e}")
 
-            # Parse and execute BROWSER_ACTION commands (balanced braces + normalize like SCHEDULE_TASK)
+            # Parse and execute BROWSER_ACTION commands (reuse one browser instance so navigate + screenshot share state)
             browser_matches = find_json_blocks(response_text, "BROWSER_ACTION")
             if not browser_matches:
                 browser_matches = find_json_blocks_fallback(response_text, "BROWSER_ACTION")
+            browser_array_blocks = find_json_array_blocks(response_text, "BROWSER_ACTION")
+            # Flatten: collect all action dicts from { } blocks and [ ] blocks so navigate always runs before screenshot
+            browser_actions: List[Dict[str, Any]] = []
             for match_str in browser_matches:
                 try:
                     normalized = normalize_llm_json(match_str)
-                    browser_cmd = None
+                    cmd = None
                     try:
-                        browser_cmd = json.loads(normalized)
+                        cmd = json.loads(normalized)
                     except json.JSONDecodeError:
                         try:
-                            browser_cmd = ast.literal_eval(normalized)
+                            cmd = ast.literal_eval(normalized)
                         except (ValueError, SyntaxError):
                             pass
-                    if not browser_cmd or not isinstance(browser_cmd, dict):
-                        continue
-                    action = browser_cmd.get("action", "")
-                    params = browser_cmd.get("params", {})
-                    result = await self._execute_browser_action(action, params)
-                    yield f"\n\n**🌐 Browser: {action}**\n{result}\n"
+                    if isinstance(cmd, list):
+                        for c in cmd:
+                            if isinstance(c, dict) and c.get("action"):
+                                browser_actions.append(c)
+                    elif isinstance(cmd, dict) and cmd.get("action"):
+                        browser_actions.append(cmd)
+                except Exception:
+                    pass
+            for match_str in browser_array_blocks:
+                try:
+                    normalized = normalize_llm_json(match_str)
+                    cmd = None
+                    try:
+                        cmd = json.loads(normalized)
+                    except json.JSONDecodeError:
+                        try:
+                            cmd = ast.literal_eval(normalized)
+                        except (ValueError, SyntaxError):
+                            pass
+                    if isinstance(cmd, list):
+                        for c in cmd:
+                            if isinstance(c, dict) and c.get("action"):
+                                browser_actions.append(c)
+                    elif isinstance(cmd, dict) and cmd.get("action"):
+                        browser_actions.append(cmd)
+                except Exception:
+                    pass
+            shared_browser = None
+            if browser_actions and PLAYWRIGHT_AVAILABLE:
+                try:
+                    shared_browser = await get_browser_instance()
                 except Exception as e:
-                    logger.warning(f"BROWSER_ACTION error: {e}. Raw: {match_str[:200]}")
-                    yield f"**❌ Browser error: {str(e)}**\n\n"
+                    logger.warning("Could not create shared browser for BROWSER_ACTIONs: %s", e)
+            for idx, browser_cmd in enumerate(browser_actions):
+                try:
+                    action = (browser_cmd.get("action") or "").strip()
+                    params = dict(browser_cmd.get("params") or {})
+                    next_action = (browser_actions[idx + 1].get("action") or "").strip() if idx + 1 < len(browser_actions) else ""
+                    result = await self._execute_browser_action(
+                        action, params, browser=shared_browser,
+                        next_action_is_screenshot=(next_action == "screenshot"),
+                    )
+                    browser_out = f"\n\n**🌐 Browser: {action}**\n{self._maybe_sanitize_tool_result(str(result or ''))}\n"
+                    accumulated_tool_displays.append(browser_out)
+                    yield browser_out
+                    # So the GUI can show the screenshot in Visual Canvas reliably, yield a control line with the path (GUI will strip it from display)
+                    if action == "screenshot" and result and (str(result).startswith("✅") or "Screenshot saved:" in str(result)):
+                        path_match = re.search(r"Screenshot saved:\s*`([^`]+)`", str(result))
+                        if not path_match:
+                            path_match = re.search(r"Screenshot saved:\s*([^\s\n]+\.png)", str(result))
+                        if path_match:
+                            yield "\n[GRIZZYCLAW_CANVAS_IMAGE:" + path_match.group(1).strip() + "]\n"
+                    # After navigate, wait for page to settle before next action (screenshot needs page fully loaded)
+                    if action == "navigate" and shared_browser and (result or "").startswith("✅") and idx < len(browser_actions) - 1:
+                        delay = 2.5 if next_action == "screenshot" else 1.5
+                        await asyncio.sleep(delay)
+                except Exception as e:
+                    logger.warning(f"BROWSER_ACTION error: {e}. Raw: {browser_cmd}")
+                    err_out = f"**❌ Browser error: {str(e)}**\n\n"
+                    accumulated_tool_displays.append(err_out)
+                    yield err_out
+            if shared_browser is not None:
+                try:
+                    await shared_browser.close()
+                except Exception:
+                    pass
 
             # Parse and execute SCHEDULE_TASK commands
             schedule_matches = find_json_blocks(response_text, "SCHEDULE_TASK")
@@ -1495,13 +2453,19 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
                     if not schedule_cmd or not isinstance(schedule_cmd, dict) or "action" not in schedule_cmd:
                         if schedule_cmd is None:
                             logger.warning(f"SCHEDULE_TASK parse failed. Raw: {match_str[:300]}")
-                            yield "**❌ Invalid SCHEDULE_TASK JSON format.**\n\n"
+                            err_out = "**❌ Invalid SCHEDULE_TASK JSON format.**\n\n"
+                            accumulated_tool_displays.append(err_out)
+                            yield err_out
                         continue
                     result = await self._execute_schedule_action(user_id, schedule_cmd)
-                    yield f"\n\n**⏰ Scheduler**\n{result}\n"
+                    sched_out = f"\n\n**⏰ Scheduler**\n{self._maybe_sanitize_tool_result(str(result or ''))}\n"
+                    accumulated_tool_displays.append(sched_out)
+                    yield sched_out
                 except Exception as e:
                     logger.exception("Scheduler action error")
-                    yield f"**❌ Scheduler error: {str(e)}**\n\n"
+                    err_out = f"**❌ Scheduler error: {str(e)}**\n\n"
+                    accumulated_tool_displays.append(err_out)
+                    yield err_out
 
             # Parse SKILL_ACTION (calendar, gmail, github, mcp_marketplace); support chaining via TRIGGER_SKILL in result
             skill_matches = find_json_blocks(response_text, "SKILL_ACTION")
@@ -1520,15 +2484,79 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
                             pass
                     if not skill_cmd or not isinstance(skill_cmd, dict):
                         continue
+                    coerced_schedule = self._coerce_scheduler_skill_action(skill_cmd, message)
+                    if coerced_schedule:
+                        result = await self._execute_schedule_action(user_id, coerced_schedule)
+                        sched_out = f"\n\n**⏰ Scheduler**\n{self._maybe_sanitize_tool_result(str(result or ''))}\n"
+                        accumulated_tool_displays.append(sched_out)
+                        yield sched_out
+                        continue
+                    # Correct calendar/email mix-up: if user asked for calendar but model chose mail_messages (or vice versa), fix it
+                    skill_cmd = self._correct_calendar_email_skill_action(skill_cmd, message)
                     chain_label, result = await self._execute_skill_action_chained(skill_cmd, max_depth=3)
                     skill_id = (skill_cmd.get("skill") or skill_cmd.get("skill_id") or "skill").strip()
-                    out = f"\n\n**Skill {skill_id}**\n{result}\n"
+                    # Show cleaned tool/skill output by default (hide internal IDs), unless user asked for verbose.
+                    cleaned = self._maybe_sanitize_tool_result(str(result or ""))
+                    out = f"\n\n**Skill {skill_id}**\n{cleaned}\n"
                     if chain_label:
                         out = f"\n\nSkill chain: {chain_label}\n{out}"
+                    accumulated_tool_displays.append(out)
                     yield out
                 except Exception as e:
                     logger.exception("Skill action error")
-                    yield f"**❌ Skill error: {str(e)}**\n\n"
+                    err_out = f"**❌ Skill error: {str(e)}**\n\n"
+                    accumulated_tool_displays.append(err_out)
+                    yield err_out
+
+            # Intro-only fallback: model returned only an intro (e.g. "Checking your calendar") and no SKILL_ACTION
+            # was captured (e.g. Ollama put it in tool_calls). Run the appropriate skill for mail/calendar/contacts/notes.
+            if (
+                not skill_matches
+                and not tool_call_matches
+                and not _has_structured_action_blocks(response_text)
+                and _looks_like_intro_only(response_text)
+            ):
+                msg_lower_intro = (message or "").strip().lower()
+                is_scheduling_intro = _is_scheduler_request_text(msg_lower_intro) or any(
+                    x in msg_lower_intro for x in (
+                        "every minute", "every hour", "check my email every", "check email every",
+                    )
+                )
+                _enabled_intro = [s.lower().strip() for s in self._effective_enabled_skills()]
+                _has_gmail_intro = "gmail" in _enabled_intro
+                _has_calendar_intro = "calendar" in _enabled_intro
+                try_skill_intro = None
+                if not is_scheduling_intro and macos_skill_or_server and any(x in msg_lower_intro for x in ("contact", "phone number", "phone", "look up")):
+                    name_match_intro = re.search(r"(?:what is|who is|find|look up|search for|get)\s+([^.?!]+?)(?:\s+(?:phone|number|contact))?", msg_lower_intro, re.IGNORECASE)
+                    search_term_intro = (name_match_intro.group(1).strip() if name_match_intro else message.strip())[:100]
+                    try_skill_intro = {"skill": macos_skill_or_server, "action": "contacts_people", "params": {"action": "search", "search": search_term_intro or " "}}
+                elif not is_scheduling_intro and any(x in msg_lower_intro for x in ("email", "inbox", "unread", "check mail", "my email", "my mail")):
+                    if "gmail" in msg_lower_intro and _has_gmail_intro:
+                        try_skill_intro = {"skill": "gmail", "action": "list_messages", "params": {"q": "is:unread", "maxResults": 10}}
+                    elif macos_skill_or_server:
+                        try_skill_intro = {"skill": macos_skill_or_server, "action": "mail_messages", "params": {"action": "read"}}
+                elif not is_scheduling_intro and macos_skill_or_server and any(x in msg_lower_intro for x in ("note", "notes")):
+                    try_skill_intro = {"skill": macos_skill_or_server, "action": "notes_items", "params": {"action": "read"}}
+                elif not is_scheduling_intro and macos_skill_or_server and any(x in msg_lower_intro for x in ("reminder", "reminders", "todo")):
+                    try_skill_intro = {"skill": macos_skill_or_server, "action": "reminders_tasks", "params": {"action": "read"}}
+                elif not is_scheduling_intro and any(x in msg_lower_intro for x in ("calendar", "events", "upcoming", "my calendar")):
+                    if any(x in msg_lower_intro for x in ("google calendar", "google calendar's", "gcal")):
+                        if _has_calendar_intro:
+                            try_skill_intro = {"skill": "calendar", "action": "list_events", "params": {}}
+                        elif macos_skill_or_server:
+                            try_skill_intro = {"skill": macos_skill_or_server, "action": "calendar_events", "params": {"action": "read"}}
+                    elif macos_skill_or_server:
+                        try_skill_intro = {"skill": macos_skill_or_server, "action": "calendar_events", "params": {"action": "read"}}
+                if try_skill_intro:
+                    try:
+                        chain_label_intro, result_intro = await self._execute_skill_action_chained(try_skill_intro, max_depth=1)
+                        out_intro = self._maybe_sanitize_tool_result(str(result_intro or ""))
+                        skill_id_intro = try_skill_intro.get("skill", macos_skill_or_server or "skill")
+                        display_intro = f"\n\n**Skill {skill_id_intro}**\n{out_intro}\n"
+                        accumulated_tool_displays.append(display_intro)
+                        yield display_intro
+                    except Exception as e:
+                        logger.debug("Intro-only fallback skill failed: %s", e)
 
             # Parse SPAWN_SUBAGENT (spawn a child agent run; non-blocking, result announced when done)
             ctx = context or {}
@@ -1631,12 +2659,16 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
                             name=f"subagent-{run.run_id}",
                         )
                         thread.start()
-                        yield f"\n\n**🤖 Sub-agent spawned** — run_id=`{run.run_id}`" + (f" — {run.label}" if run.label else "") + "\n"
+                        spawn_out = f"\n\n**🤖 Sub-agent spawned** — run_id=`{run.run_id}`" + (f" — {run.label}" if run.label else "") + "\n"
+                        accumulated_tool_displays.append(spawn_out)
+                        yield spawn_out
                     except Exception as e:
                         logger.exception("SPAWN_SUBAGENT error")
                         tb = traceback.format_exc()
                         logger.error("SPAWN_SUBAGENT full traceback:\n%s", tb)
-                        yield f"**❌ Sub-agent spawn error: {str(e)}**\n\n"
+                        err_out = f"**❌ Sub-agent spawn error: {str(e)}**\n\n"
+                        accumulated_tool_displays.append(err_out)
+                        yield err_out
 
             # Parse EXEC_COMMAND (shell commands - requires approval when exec_commands_enabled)
             if getattr(self.settings, "exec_commands_enabled", False):
@@ -1671,31 +2703,65 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
                     try:
                         command = (exec_cmd.get("command") or exec_cmd.get("cmd") or "").strip()
                         if not command:
-                            yield "**❌ EXEC_COMMAND requires a 'command' field.**\n\n"
+                            err_out = "**❌ EXEC_COMMAND requires a 'command' field.**\n\n"
+                            accumulated_tool_displays.append(err_out)
+                            yield err_out
+                            continue
+                        if _is_scheduler_request_text(message) and not _is_explicit_shell_request_text(message):
+                            if not scheduler_exec_block_notified:
+                                err_out = (
+                                    "**❌ Ignored shell command for scheduler request.**\n\n"
+                                    "Use the built-in Scheduler (`SCHEDULE_TASK`) for scheduled agent tasks, "
+                                    "not terminal cron/launchctl scripts."
+                                )
+                                accumulated_tool_displays.append(err_out)
+                                yield err_out
+                                scheduler_exec_block_notified = True
+                            if not scheduler_exec_auto_created:
+                                schedule_cmd = _build_schedule_task_from_request(message)
+                                if schedule_cmd:
+                                    result = await self._execute_schedule_action(user_id, schedule_cmd)
+                                    sched_out = f"\n\n**⏰ Scheduler**\n{self._maybe_sanitize_tool_result(str(result or ''))}\n"
+                                    accumulated_tool_displays.append(sched_out)
+                                    yield sched_out
+                                    scheduler_exec_auto_created = True
                             continue
                         safe_list = getattr(self.settings, "exec_safe_commands", []) or []
                         ok, reason = _validate_exec_command(command, safe_list)
                         if not ok:
-                            yield f"**❌ Exec blocked: {reason}**\n\n"
+                            err_out = f"**❌ Exec blocked: {reason}**\n\n"
+                            accumulated_tool_displays.append(err_out)
+                            yield err_out
                             continue
                         cwd = (exec_cmd.get("cwd") or "").strip() or None
                         result = await self._execute_exec_command(
                             command, cwd, user_id, exec_approval_callback
                         )
-                        yield f"\n\n**⌘ Shell**\n{result}\n"
+                        shell_out = f"\n\n**⌘ Shell**\n{self._maybe_sanitize_tool_result(str(result or ''))}\n"
+                        accumulated_tool_displays.append(shell_out)
+                        yield shell_out
                     except Exception as e:
                         logger.exception("Exec command error")
-                        yield f"**❌ Exec error: {str(e)}**\n\n"
+                        err_out = f"**❌ Exec error: {str(e)}**\n\n"
+                        accumulated_tool_displays.append(err_out)
+                        yield err_out
 
-            await self.memory.add(
-                user_id=user_id,
-                content=f"User: {message}\nAssistant: {response_text}",
-                source="conversation",
-            )
+            # Store cleaned response (no raw SKILL_ACTION/TOOL_CALL etc.) so history shows intro + skill results, not JSON
+            tool_part = "\n" + "".join(accumulated_tool_displays) if accumulated_tool_displays else ""
+            swarm_suffix = response_text[len(accumulated_response) + len(tool_part) :] if len(response_text) > len(accumulated_response) + len(tool_part) else ""
+            cleaned_response = strip_response_blocks(accumulated_response) + tool_part + swarm_suffix
+
+            # Don't store permission/authorization errors in long-term memory so the agent retries after user fixes permissions (e.g. after app update)
+            if not _is_permission_or_auth_error(cleaned_response):
+                await self.memory.add(
+                    user_id=user_id,
+                    content=f"User: {message}\nAssistant: {cleaned_response}",
+                    source="conversation",
+                )
 
             # Update session
             session.append({"role": "user", "content": message})
-            session.append({"role": "assistant", "content": response_text})
+            session.append({"role": "assistant", "content": cleaned_response})
 
             # Smart context management: trim with priority for tool-heavy messages
             max_messages = getattr(self.settings, "max_session_messages", 20)
@@ -1861,6 +2927,40 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
             self.sessions[user_id] = session
         return session
 
+    def _is_skill_focused_request(self, message: str) -> bool:
+        """True if the message is primarily asking for a skill we handle via SKILL_ACTION (calendar, contacts, email, notes, reminders, macos-mcp).
+        Such requests should use the normal path so SKILL_ACTION is parsed, executed, and stripped; the Agents SDK path does not do that."""
+        if not message or not isinstance(message, str):
+            return False
+        m = message.strip().lower()
+        if not m:
+            return False
+        # Never classify built-in scheduler requests as skill-focused — they must use SCHEDULE_TASK
+        if _is_scheduler_request_text(m):
+            return False
+        # Explicit macos-mcp or "use ... to check calendar/contacts/..." (skill-style request)
+        if "macos-mcp" in m:
+            return True
+        if "use " in m and (" to check " in m or " to get " in m or " to list " in m or " to read " in m):
+            if any(x in m for x in ("calendar", "contact", "email", "note", "reminder", "mail", "event")):
+                return True
+        # Calendar / events
+        if any(x in m for x in ("check calendar", "check my calendar", "calendar events", "upcoming events", "my calendar", "what's on my calendar")):
+            return True
+        # Contacts
+        if any(x in m for x in ("contact", "phone number", "look up ", "find ", "who is ")) and ("contact" in m or "phone" in m or "number" in m):
+            return True
+        # Email / mail
+        if any(x in m for x in ("check email", "check mail", "my email", "inbox", "unread", "list email")):
+            return True
+        # Notes
+        if any(x in m for x in ("note", "notes")) and ("read" in m or "list" in m or "show" in m or "check" in m or "get" in m):
+            return True
+        # Reminders
+        if any(x in m for x in ("reminder", "reminders", "todo list")) and ("read" in m or "list" in m or "show" in m or "check" in m or "get" in m):
+            return True
+        return False
+
     def _is_simple_task(self, message: str, images: Optional[List[str]] = None) -> bool:
         """Heuristic: True if the request looks like a simple task (list files, short Q&A) for model routing."""
         if not message or not isinstance(message, str):
@@ -1921,21 +3021,31 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
         approx_tokens = chars // 4
         return {"messages": n, "approx_tokens": approx_tokens}
 
-    async def _execute_browser_action(self, action: str, params: Dict[str, Any]) -> str:
-        """Execute a browser automation action"""
+    async def _execute_browser_action(
+        self,
+        action: str,
+        params: Dict[str, Any],
+        browser: Any = None,
+        *,
+        next_action_is_screenshot: bool = False,
+    ) -> str:
+        """Execute a browser automation action. If browser is provided (e.g. from multi-action loop), use it and do not close."""
         if not PLAYWRIGHT_AVAILABLE:
             return "❌ Browser automation unavailable. Run: pip install playwright && playwright install chromium"
-        browser = None
+        own_browser = browser is None
+        if own_browser:
+            browser = None
         try:
-            browser = await get_browser_instance()
+            if browser is None:
+                browser = await get_browser_instance()
             if browser is None:
                 return "❌ Browser automation unavailable. Run: playwright install chromium"
-            
+
             if action == "navigate":
                 url = params.get("url", "")
                 if not url:
                     return "❌ URL required for navigate action"
-                result = await browser.navigate(url)
+                result = await browser.navigate(url, for_screenshot=next_action_is_screenshot)
                 if result.success:
                     self._last_browser_url = getattr(result, "url", None) or url
                     self._last_browser_action = f"navigate at {_format_time_now()}"
@@ -2014,8 +3124,8 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
                 return "❌ Browser automation unavailable. Run: playwright install chromium"
             return f"❌ Browser error: {str(e)}"
         finally:
-            # Close browser to free resources and avoid event loop issues
-            if browser is not None:
+            # Only close if we created the browser (single-action path); shared_browser is closed by caller
+            if own_browser and browser is not None:
                 try:
                     await browser.close()
                 except Exception:
@@ -2043,19 +3153,15 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
             
             task_id = f"task_{uuid.uuid4().hex[:8]}"
 
-            # Handler reads message from scheduled_tasks_db so we can edit later
+            # Handler runs the agent on the task message (e.g. check email, check calendar) and delivers result to user
             def make_handler(tid):
                 async def task_handler():
                     data = self.scheduled_tasks_db.get(tid, {})
                     msg = data.get("message", "")
-                    nm = data.get("name", "Reminder")
+                    nm = data.get("name", "Scheduled task")
+                    uid = data.get("user_id", user_id)
                     logger.info(f"Scheduled task fired: {nm} - {msg}")
-                    await self.memory.add(
-                        user_id=data.get("user_id", user_id),
-                        content=f"⏰ SCHEDULED REMINDER: {msg}",
-                        category="reminders",
-                        source="scheduler",
-                    )
+                    await self._run_scheduled_task_action(uid, msg, task_name=nm)
                 return task_handler
 
             try:
@@ -2105,11 +3211,19 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
         
         elif action == "enable":
             task_id = schedule_cmd.get("task_id", "")
+            if not task_id:
+                return "❌ task_id required for enable"
+            if task_id not in self.scheduler.tasks:
+                return f"❌ Task `{task_id}` not found"
             self.scheduler.enable_task(task_id)
             return f"✅ Task `{task_id}` enabled"
         
         elif action == "disable":
             task_id = schedule_cmd.get("task_id", "")
+            if not task_id:
+                return "❌ task_id required for disable"
+            if task_id not in self.scheduler.tasks:
+                return f"❌ Task `{task_id}` not found"
             self.scheduler.disable_task(task_id)
             return f"✅ Task `{task_id}` disabled"
         
@@ -2139,6 +3253,106 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
         
         else:
             return f"❌ Unknown scheduler action: {action}. Use: create, list, delete, enable, disable, edit"
+
+    def _correct_calendar_email_skill_action(
+        self, skill_cmd: Dict[str, Any], user_message: str
+    ) -> Dict[str, Any]:
+        """If user clearly asked for calendar but model chose mail_messages (or vice versa), correct the action to avoid showing email as calendar."""
+        skill_id = (skill_cmd.get("skill") or skill_cmd.get("skill_id") or "").strip().lower()
+        action = (skill_cmd.get("action") or "").strip().lower()
+        if action not in ("calendar_events", "mail_messages"):
+            return skill_cmd
+        if skill_id != "macos-mcp" and "macos" not in skill_id and "mcp" not in skill_id:
+            return skill_cmd
+        msg_lower = (user_message or "").strip().lower()
+        wants_calendar = any(
+            x in msg_lower
+            for x in (
+                "calendar",
+                "my calendar",
+                "check calendar",
+                "calendar events",
+                "upcoming events",
+                "what's on my calendar",
+                "whats on my calendar",
+            )
+        ) and not any(x in msg_lower for x in ("email", "inbox", "mail", "gmail"))
+        wants_email = any(
+            x in msg_lower
+            for x in (
+                "email",
+                "inbox",
+                "check mail",
+                "my email",
+                "unread",
+                "gmail",
+            )
+        ) and not any(x in msg_lower for x in ("calendar", "events", "upcoming"))
+        if wants_calendar and action == "mail_messages":
+            skill_cmd = dict(skill_cmd)
+            skill_cmd["action"] = "calendar_events"
+            params = dict(skill_cmd.get("params") or {})
+            params["action"] = "read"
+            skill_cmd["params"] = params
+            logger.info("Corrected skill: user asked for calendar but model chose mail_messages -> calendar_events")
+        elif wants_email and action == "calendar_events":
+            skill_cmd = dict(skill_cmd)
+            skill_cmd["action"] = "mail_messages"
+            params = dict(skill_cmd.get("params") or {})
+            params["action"] = "read"
+            skill_cmd["params"] = params
+            logger.info("Corrected skill: user asked for email but model chose calendar_events -> mail_messages")
+        return skill_cmd
+
+    def _coerce_scheduler_skill_action(
+        self, skill_cmd: Dict[str, Any], user_message: str
+    ) -> Optional[Dict[str, Any]]:
+        """Convert misrouted reminder/calendar creation into SCHEDULE_TASK when intent is scheduler."""
+        skill_id = (skill_cmd.get("skill") or skill_cmd.get("skill_id") or "").strip().lower()
+        action = (skill_cmd.get("action") or "").strip().lower()
+        if action not in ("reminders_tasks", "calendar_events"):
+            return None
+        if skill_id != "macos-mcp" and "macos" not in skill_id:
+            return None
+        params = skill_cmd.get("params") or {}
+        if not isinstance(params, dict):
+            params = {}
+        cmd_action = str(params.get("action") or "").strip().lower()
+        if cmd_action != "create":
+            if _is_scheduler_list_request_text(user_message):
+                return {"action": "list"}
+            return None
+
+        schedule = _reminder_text_to_schedule_task(params)
+        if schedule:
+            cron, name, message = schedule
+            return {"action": "create", "task": {"name": name, "cron": cron, "message": message}}
+
+        if not _is_scheduler_request_text(user_message):
+            return None
+
+        title = (
+            str(params.get("title") or params.get("name") or params.get("summary") or "").strip()
+        )
+        body = (
+            str(
+                params.get("body")
+                or params.get("notes")
+                or params.get("description")
+                or params.get("message")
+                or ""
+            ).strip()
+        )
+        merged_text = " ".join(x for x in (user_message, title, body) if x).strip()
+        cron = _infer_schedule_cron_from_text(merged_text)
+        if not cron:
+            return None
+        task_name = (title or "Scheduled task")[:80]
+        task_message = (body or title or merged_text or "Scheduled agent task")[:500]
+        return {
+            "action": "create",
+            "task": {"name": task_name, "cron": cron, "message": task_message},
+        }
 
     async def _execute_skill_action_chained(
         self, skill_cmd: Dict[str, Any], max_depth: int = 3
@@ -2181,6 +3395,14 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
         chain_label = " → ".join(chain_ids) if len(chain_ids) > 1 else ""
         return (chain_label, "\n\n".join(parts))
 
+    def _maybe_sanitize_tool_result(self, text: str) -> str:
+        """Return sanitized tool/skill output for chat (strip IDs, Apple placeholders) unless verbose requested.
+        Use this for ALL tool/skill output before displaying to the user: MCP TOOL_CALL results,
+        SKILL_ACTION results (any server, e.g. macos-mcp), Gmail/Browser/Scheduler/Shell, and any new MCP servers."""
+        if getattr(self, "_verbose_tool_output", False):
+            return text or ""
+        return _sanitize_tool_result(text or "")
+
     async def _execute_skill_action(self, skill_cmd: Dict[str, Any]) -> str:
         """Execute built-in skill: calendar, gmail, github, mcp_marketplace."""
         skill_id = (skill_cmd.get("skill") or skill_cmd.get("skill_id") or "").strip().lower()
@@ -2192,14 +3414,25 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
             params = {}
         # For MCP, pass full params including "action" (macos-mcp expects params.action)
         mcp_params = {k: v for k, v in (raw_params if isinstance(raw_params, dict) else {}).items() if k not in ("skill", "skill_id")}
+        enabled = [s.lower().strip() for s in self._effective_enabled_skills()]
+        # Built-in skills (calendar, gmail, github, mcp_marketplace) only run when enabled in Settings → Skills
+        if skill_id in ("calendar", "gmail", "github", "mcp_marketplace") and skill_id not in enabled:
+            if skill_id == "calendar":
+                return "❌ The **calendar** skill (Google Calendar) is disabled. Enable it in Settings → Skills & MCP to use it, or use the macos-mcp server for macOS Calendar if you have it configured."
+            if skill_id == "gmail":
+                return "❌ The **gmail** skill is disabled. Enable it in Settings → Skills & MCP, or use macos-mcp for Mail.app."
+            if skill_id == "github":
+                return "❌ The **github** skill is disabled. Enable it in Settings → Skills & MCP."
+            return "❌ The **mcp_marketplace** skill is disabled. Enable it in Settings → Skills & MCP."
         loop = asyncio.get_event_loop()
         try:
             from grizzyclaw.skills.registry import get_skill
             skill_metadata = get_skill(skill_id)
             if skill_metadata and skill_metadata.executor:
-                return await loop.run_in_executor(
+                out = await loop.run_in_executor(
                     None, lambda: skill_metadata.executor(action, params, self.settings)
                 )
+                return self._maybe_sanitize_tool_result(str(out or ""))
 
             from grizzyclaw.skills.executors import (
                 execute_calendar,
@@ -2208,21 +3441,60 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
                 execute_mcp_marketplace,
             )
             if skill_id == "calendar":
-                return await loop.run_in_executor(
+                out = await loop.run_in_executor(
                     None, lambda: execute_calendar(action, params, self.settings)
                 )
+                return self._maybe_sanitize_tool_result(str(out or ""))
             if skill_id == "gmail":
-                return await loop.run_in_executor(
+                out = await loop.run_in_executor(
                     None, lambda: execute_gmail(action, params, self.settings)
                 )
+                return self._maybe_sanitize_tool_result(str(out or ""))
             if skill_id == "github":
-                return await loop.run_in_executor(
+                out = await loop.run_in_executor(
                     None, lambda: execute_github(action, params, self.settings)
                 )
+                return self._maybe_sanitize_tool_result(str(out or ""))
             if skill_id == "mcp_marketplace":
-                return await loop.run_in_executor(
+                out = await loop.run_in_executor(
                     None, lambda: execute_mcp_marketplace(action, params, self.settings)
                 )
+                return self._maybe_sanitize_tool_result(str(out or ""))
+            # Redirect: macos-mcp "create reminder" that looks like a recurring schedule -> use built-in Scheduler instead
+            if (skill_id == "macos-mcp" and action == "reminders_tasks" and
+                    (mcp_params.get("action") or params.get("action")) == "create"):
+                schedule_triple = _reminder_text_to_schedule_task(mcp_params)
+                if schedule_triple:
+                    cron, name, message = schedule_triple
+                    schedule_result = await self._execute_schedule_action(
+                        "gui_user",
+                        {"action": "create", "task": {"name": name, "cron": cron, "message": message}},
+                    )
+                    return self._maybe_sanitize_tool_result(
+                        schedule_result + "\n\n(Used the built-in Scheduler for recurring checks. Use Reminders only for one-off reminders.)"
+                    )
+            # Redirect: macos-mcp "create calendar event" that looks like a recurring schedule -> use built-in Scheduler instead
+            if (skill_id == "macos-mcp" and action == "calendar_events" and
+                    (mcp_params.get("action") or params.get("action")) == "create"):
+                schedule_triple = _reminder_text_to_schedule_task(mcp_params)
+                if schedule_triple:
+                    cron, name, message = schedule_triple
+                    schedule_result = await self._execute_schedule_action(
+                        "gui_user",
+                        {"action": "create", "task": {"name": name, "cron": cron, "message": message}},
+                    )
+                    return self._maybe_sanitize_tool_result(
+                        schedule_result + "\n\n(Used the built-in Scheduler for recurring checks. Use Calendar only for actual events.)"
+                    )
+            # Redirect: model chose macos-mcp for email but built-in gmail is enabled -> use Gmail
+            _enabled_skills = [s.lower().strip() for s in self._effective_enabled_skills()]
+            if skill_id == "macos-mcp" and action == "mail_messages" and "gmail" in _enabled_skills:
+                mail_action = "list_messages"
+                mail_params = {"q": params.get("q", "in:inbox"), "maxResults": params.get("maxResults", 10)}
+                out = await loop.run_in_executor(
+                    None, lambda: execute_gmail(mail_action, mail_params, self.settings)
+                )
+                return self._maybe_sanitize_tool_result(str(out or ""))
             # Route to MCP server if skill_id matches a configured server (e.g. macos-mcp or krmj22-macos-mcp)
             mcp_file = Path(self.settings.mcp_servers_file).expanduser().resolve()
             if not mcp_file.exists():
@@ -2238,8 +3510,9 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
                         and ("macos-mcp" in name_lower or "macos-mcp" in normalized or ("macos" in normalized and "mcp" in normalized))
                     )
                     if exact or macos_mcp_match:
-                        result = await call_mcp_tool(mcp_file, mcp_name, action, mcp_params)
-                        return result
+                        args = _normalize_macos_mcp_params(action, mcp_params)
+                        result = await call_mcp_tool(mcp_file, mcp_name, action, args)
+                        return self._maybe_sanitize_tool_result(result or "")
             return f"❌ Unknown skill: {skill_id}. Use calendar, gmail, github, mcp_marketplace, or install a plugin."
         except Exception as e:
             logger.exception("Skill execution error")
@@ -2297,7 +3570,7 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
         return self.scheduler.get_stats()
 
     def get_scheduler_task(self, task_id: str) -> Optional[Dict[str, Any]]:
-        """Get one task's details (name, cron, message) for GUI edit."""
+        """Get one task's details (name, cron, message, enabled) for GUI edit."""
         db = self.scheduled_tasks_db.get(task_id, {})
         task = self.scheduler.tasks.get(task_id)
         if not task:
@@ -2307,6 +3580,7 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
             "name": db.get("name") or task.name,
             "cron": db.get("cron") or task.cron_expression,
             "message": db.get("message", ""),
+            "enabled": task.enabled,
         }
 
     def edit_scheduler_task_sync(
@@ -2323,9 +3597,58 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
             cmd["task"]["name"] = name
         return run_async(self._execute_schedule_action("gui_user", cmd))
 
+    def enable_scheduler_task_sync(self, task_id: str) -> str:
+        """Enable a scheduled task from GUI (main-thread only, no async). Returns success/error message."""
+        if not task_id:
+            return "❌ task_id required for enable"
+        if task_id not in self.scheduler.tasks:
+            return f"❌ Task `{task_id}` not found"
+        self.scheduler.enable_task(task_id)
+        return f"✅ Task `{task_id}` enabled"
+
+    def disable_scheduler_task_sync(self, task_id: str) -> str:
+        """Disable a scheduled task from GUI (main-thread only, no async). Returns success/error message."""
+        if not task_id:
+            return "❌ task_id required for disable"
+        if task_id not in self.scheduler.tasks:
+            return f"❌ Task `{task_id}` not found"
+        self.scheduler.disable_task(task_id)
+        return f"✅ Task `{task_id}` disabled"
+
     def reload_scheduled_tasks_from_disk(self) -> None:
         """Reload scheduled tasks from disk (call when opening Scheduler so list is current)."""
         self._load_scheduled_tasks()
+
+    async def _run_scheduled_task_action(self, user_id: str, message: str, task_name: str = "Scheduled task") -> None:
+        """Run the agent on the task message (e.g. check email, check calendar) and deliver the result to the user."""
+        try:
+            chunks: List[str] = []
+            async for chunk in self.process_message(user_id, message, start_scheduler=False):
+                chunks.append(chunk)
+            full_response = "".join(chunks).strip()
+            if full_response and getattr(self, "on_proactive_message", None):
+                self.on_proactive_message(f"⏰ **{task_name}**\n\n{full_response}")
+            await self.memory.add(
+                user_id=user_id,
+                content=f"⏰ Scheduled task ran: {message}",
+                category="scheduler",
+                source="scheduler",
+            )
+        except Exception as e:
+            logger.exception("Scheduled task action failed: %s", e)
+            if getattr(self, "on_proactive_message", None):
+                self.on_proactive_message(f"⏰ **{task_name}** — Error: {str(e)}")
+
+    async def _ensure_scheduler_running(self) -> None:
+        """Start the scheduler loop if we have tasks and it is not already running.
+        Tasks loaded from disk never start the loop; only the 'create' action did. This fixes enabled tasks never running.
+        """
+        if not self.scheduler.tasks:
+            return
+        if self.scheduler.running:
+            return
+        logger.info("Starting scheduler loop (%s task(s) loaded); enabled tasks will now run on schedule.", len(self.scheduler.tasks))
+        await self.scheduler.start()
 
     def _load_scheduled_tasks(self) -> None:
         """Load persisted tasks from disk so they show in Scheduler and survive agent recreation."""
@@ -2344,17 +3667,21 @@ When the user provides a detailed plan, phased implementation, or step-by-step g
                 user_id = item.get("user_id", "gui_user")
                 if not task_id or not cron or not message:
                     continue
-                def make_handler(uid: str, msg: str):
+                # Preserve run_count and last_run so the Scheduler UI shows correct "Runs" after refresh
+                existing = self.scheduler.tasks.get(task_id)
+                saved_run_count = existing.run_count if existing else 0
+                saved_last_run = existing.last_run if existing else None
+                def make_handler(uid: str, msg: str, task_name: str):
                     async def h():
-                        await self.memory.add(
-                            user_id=uid,
-                            content=f"⏰ SCHEDULED REMINDER: {msg}",
-                            category="reminders",
-                            source="scheduler",
-                        )
+                        logger.info("Scheduled task fired (from disk): %s - %s", task_name, msg)
+                        await self._run_scheduled_task_action(uid, msg, task_name=task_name)
                     return h
-                handler = make_handler(user_id, message)
+                handler = make_handler(user_id, message, name)
                 self.scheduler.schedule(task_id, name, cron, handler)
+                if saved_run_count or saved_last_run:
+                    task = self.scheduler.tasks[task_id]
+                    task.run_count = saved_run_count
+                    task.last_run = saved_last_run
                 self.scheduled_tasks_db[task_id] = {
                     "user_id": user_id,
                     "name": name,

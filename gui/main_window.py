@@ -1,14 +1,111 @@
+import base64
 import asyncio
+import json
 import logging
 import os
+import platform
+import re
 import sys
+import tempfile
 import threading
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
 _file_handler: Optional[logging.FileHandler] = None
+
+# Control line agent yields so GUI shows screenshot in Visual Canvas (agent/core.py); strip from display
+_CANVAS_IMAGE_CONTROL_RE = re.compile(r"\[GRIZZYCLAW_CANVAS_IMAGE:([^\]]+)\]")
+_CANVAS_URL_CONTROL_RE = re.compile(r"\[GRIZZYCLAW_CANVAS_URL:([^\]]+)\]")
+# Pattern for agent output: "Screenshot saved: `path`" (see agent/core.py)
+_SCREENSHOT_PATH_RE = re.compile(r"Screenshot saved:\s*`([^`]+)`")
+# Fallback: path without backticks (e.g. after sanitization)
+_SCREENSHOT_PATH_FALLBACK_RE = re.compile(r"Screenshot saved:\s*([^\s\n]+\.png)")
+# Markdown code block with language a2ui: ```a2ui\n ... \n```
+_A2UI_BLOCK_RE = re.compile(r"```a2ui\s*\n([\s\S]*?)```", re.IGNORECASE)
+# Base64 image in code block: ```image/png\n base64 \n``` or ```image/jpeg\n base64 \n```
+_BASE64_IMAGE_RE = re.compile(r"```image/(png|jpeg|gif|webp)\s*\n([A-Za-z0-9+/=]+)\s*```", re.IGNORECASE)
+
+
+def _is_temp_screenshot_path(path: str) -> bool:
+    """True if path is under the temp screenshot dir (built-in browser); do not persist these."""
+    try:
+        p = Path(path).resolve()
+        tmp = Path(tempfile.gettempdir()).resolve()
+        return str(p).startswith(str(tmp)) and "grizzyclaw" in str(p).lower()
+    except Exception:
+        return False
+
+
+def _extract_canvas_image_control(text: str) -> Tuple[Optional[str], str]:
+    """Extract path from [GRIZZYCLAW_CANVAS_IMAGE:path] and return (path, text_with_control_stripped)."""
+    path, _, stripped = _extract_canvas_controls(text)
+    return (path, stripped)
+
+
+def _extract_canvas_controls(text: str) -> Tuple[Optional[str], Optional[str], str]:
+    """Extract path/URL from [GRIZZYCLAW_CANVAS_IMAGE:path] and [GRIZZYCLAW_CANVAS_URL:url]; return (path, url, stripped_text)."""
+    path = None
+    url = None
+    m = _CANVAS_IMAGE_CONTROL_RE.search(text)
+    if m:
+        path = m.group(1).strip()
+        try:
+            if not path.startswith(("http://", "https://")):
+                path = str(Path(path).expanduser().resolve())
+        except Exception:
+            pass
+    m = _CANVAS_URL_CONTROL_RE.search(text)
+    if m:
+        url = m.group(1).strip()
+    stripped = _CANVAS_IMAGE_CONTROL_RE.sub("", text)
+    stripped = _CANVAS_URL_CONTROL_RE.sub("", stripped)
+    stripped = re.sub(r"\n{3,}", "\n\n", stripped).strip()
+    return (path if path else None, url if url else None, stripped)
+
+
+def _extract_screenshot_path(text: str) -> Optional[str]:
+    """Extract first screenshot file path from assistant response for Visual Canvas."""
+    path, _ = _extract_canvas_image_control(text)
+    if path:
+        return path
+    m = _SCREENSHOT_PATH_RE.search(text)
+    if not m:
+        m = _SCREENSHOT_PATH_FALLBACK_RE.search(text)
+    if not m:
+        return None
+    path = m.group(1).strip()
+    if not path:
+        return None
+    # Resolve ~ and relative path; return resolved path (caller/slot will check exists)
+    try:
+        p = Path(path).expanduser().resolve()
+        return str(p)
+    except Exception:
+        return path
+
+
+def _extract_a2ui_payload(text: str) -> Optional[Any]:
+    """Extract first A2UI JSON block from assistant response for Visual Canvas."""
+    m = _A2UI_BLOCK_RE.search(text)
+    if not m:
+        return None
+    raw = m.group(1).strip()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+
+
+def _extract_base64_image(text: str) -> Optional[Tuple[str, str]]:
+    """Extract first base64 image from code block (image/png, image/jpeg, etc.) for Visual Canvas. Returns (format, base64_str) or None."""
+    m = _BASE64_IMAGE_RE.search(text)
+    if not m:
+        return None
+    fmt, b64 = m.group(1).lower(), m.group(2).strip()
+    return (fmt, b64)
+
 
 def setup_file_logging(level: str = "INFO", log_path: Optional[str] = None) -> None:
     """Configure file logging with specified level. Call with level='OFF' to disable."""
@@ -49,8 +146,9 @@ from PyQt6.QtWidgets import (
     QFrame, QScrollArea, QToolBar, QStatusBar, QSizePolicy,
     QFileDialog, QStackedWidget, QDialog,
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, pyqtSlot, QTimer, QSize, QMimeData
-from PyQt6.QtGui import QAction, QIcon, QFont, QPalette, QColor, QKeySequence, QShortcut, QDragEnterEvent, QDropEvent, QKeyEvent
+from PyQt6.QtCore import Qt, QThread, QProcess, pyqtSignal, pyqtSlot, QTimer, QSize, QMimeData, QByteArray, QUrl
+from PyQt6.QtGui import QAction, QIcon, QFont, QPalette, QColor, QKeySequence, QShortcut, QDragEnterEvent, QDropEvent, QKeyEvent, QPixmap
+from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply
 
 
 from grizzyclaw import __version__
@@ -60,6 +158,7 @@ from grizzyclaw.channels.telegram import TelegramChannel
 from grizzyclaw.gui.settings_dialog import SettingsDialog, _sanitize_telegram_token
 from .memory_dialog import MemoryDialog
 from .scheduler_dialog import SchedulerDialog
+from .scheduler_thread import start_scheduler_thread
 from .browser_dialog import BrowserDialog
 from .sessions_dialog import SessionsDialog
 from .workspace_dialog import WorkspaceDialog
@@ -333,6 +432,7 @@ class MessageWorker(QThread):
 
         async def stream_consumer():
             nonlocal response_text
+            kwargs["start_scheduler"] = False  # GUI uses dedicated scheduler thread
             async for chunk in self.agent.process_message(
                 self.user_id, message, **kwargs
             ):
@@ -565,7 +665,10 @@ class ChatWidget(QWidget):
     message_received = pyqtSignal(str, bool)
     message_added = pyqtSignal(str, bool, str)  # text, is_user, sender
     conversation_cleared = pyqtSignal()
-    image_attached = pyqtSignal(str)  # path to display in canvas
+    image_attached = pyqtSignal(str)  # path to display in canvas (e.g. user attachment)
+    agent_screenshot_for_canvas = pyqtSignal(str)  # path from agent screenshot: clear canvas then display
+    pixmap_for_canvas = pyqtSignal(object)  # QPixmap for canvas
+    a2ui_for_canvas = pyqtSignal(object)  # A2UI payload (str or dict) for canvas
 
     def __init__(self, agent, parent=None, settings=None, workspace_manager=None):
         super().__init__(parent)
@@ -1171,18 +1274,23 @@ class ChatWidget(QWidget):
         if hasattr(self, "empty_state") and self.empty_state:
             self.empty_state.show()
 
-    def restore_session_from_agent(self):
-        """Load persisted session from agent and show messages in chat (e.g. after workspace switch or startup)."""
+    def restore_session_from_agent(self) -> int:
+        """Load persisted session from agent and show messages in chat.
+
+        Returns:
+            Number of non-empty messages restored to the UI.
+        """
         if not self.agent:
-            return
+            return 0
         self._clear_chat_ui_only()
         session = getattr(self.agent, "get_persisted_session", lambda uid: [])(self.user_id)
         if not session:
-            return
+            return 0
         # Remove empty-state placeholder so we can add real messages
         if hasattr(self, "empty_state") and self.empty_state and self.chat_layout.indexOf(self.empty_state) >= 0:
             self.chat_layout.removeWidget(self.empty_state)
             self.empty_state.hide()
+        loaded = 0
         for msg in session:
             role = msg.get("role", "user")
             content = msg.get("content", "")
@@ -1191,10 +1299,12 @@ class ChatWidget(QWidget):
             is_user = role == "user"
             sender = "You" if is_user else self._workspace_display_name
             self.add_message(content, is_user=is_user, sender=sender)
+            loaded += 1
         QTimer.singleShot(0, self._scroll_to_bottom_if_near)
         mw = self.window()
         if mw and hasattr(mw, "_update_session_status"):
             mw._update_session_status()
+        return loaded
 
     def apply_compact_mode(self, compact: bool):
         """Apply compact UI density: smaller margins, spacing, and fonts."""
@@ -1346,12 +1456,38 @@ class ChatWidget(QWidget):
         self._user_near_bottom = sb.value() >= sb.maximum() - threshold
 
     def _on_speak_requested(self, text: str):
-        """Handle speak button - run TTS in background."""
-        if not text or not text.strip():
+        """Handle speak button - run TTS. On macOS use QProcess with 'say' to avoid thread crashes."""
+        if text is None:
+            return
+        t = (text if isinstance(text, str) else str(text)).strip()
+        if not t:
+            return
+        # Plain text for TTS: strip markdown to avoid issues
+        t = re.sub(r"\*\*([^*]+)\*\*", r"\1", t)
+        t = re.sub(r"`([^`]+)`", r"\1", t)
+        t = t.replace("\n", " ").strip()[:5000]
+        if not t:
+            return
+        if platform.system() == "Darwin":
+            self._speak_via_process(t)
             return
         settings = getattr(self, "_settings", None)
-        worker = TTSWorker(text, settings=settings)
-        worker.start()
+        try:
+            worker = TTSWorker(t, settings=settings)
+            worker.start()
+        except Exception as e:
+            logger.debug("TTS worker failed to start: %s", e)
+
+    def _speak_via_process(self, text: str) -> None:
+        """Run macOS 'say' in a QProcess (no thread) to avoid TTS crashes on Darwin."""
+        try:
+            # Keep reference so process is not GC'd; new click starts another process
+            proc = QProcess(self)
+            proc.setProcessChannelMode(QProcess.ProcessChannelMode.ForwardedChannels)
+            proc.start("say", ["-r", "200", text])
+            self._speak_process = proc
+        except Exception as e:
+            logger.debug("Say process failed to start: %s", e)
 
     def _on_stream_chunk(self, chunk: str):
         """Append a streamed chunk to the assistant bubble."""
@@ -1367,8 +1503,48 @@ class ChatWidget(QWidget):
             self._streaming_bubble.speak_requested.connect(self._on_speak_requested)
             self._connect_feedback(self._streaming_bubble)
             self.chat_layout.insertWidget(self.chat_layout.count() - 1, self._streaming_bubble)
+            self._streaming_screenshot_emitted = False
+            self._streaming_a2ui_emitted = False
+            self._streaming_pixmap_emitted = False
+        # Strip agent control lines [GRIZZYCLAW_CANVAS_IMAGE:path] / [GRIZZYCLAW_CANVAS_URL:url] and show in canvas
+        display_chunk = chunk
+        control_path, control_url, _ = _extract_canvas_controls(chunk)
+        if control_path or control_url:
+            display_chunk = _CANVAS_IMAGE_CONTROL_RE.sub("", _CANVAS_URL_CONTROL_RE.sub("", chunk))
+            display_chunk = re.sub(r"\n{3,}", "\n\n", display_chunk).strip()
+            if not getattr(self, "_streaming_screenshot_emitted", True):
+                target = control_path or control_url
+                if target:
+                    logger.info("Agent screenshot for canvas (control chunk): %s", target)
+                    self.agent_screenshot_for_canvas.emit(target)
+                    self._streaming_screenshot_emitted = True
         current = self._streaming_bubble.label.text()
-        self._streaming_bubble.label.setText(current + chunk)
+        self._streaming_bubble.label.setText(current + display_chunk)
+        accumulated = self._streaming_bubble.label.text()
+        # Show agent screenshot in Visual Canvas only from control chunk or "Screenshot saved" path (never from model-invented markdown URLs)
+        if not getattr(self, "_streaming_screenshot_emitted", True):
+            canvas_target = _extract_screenshot_path(accumulated)
+            if canvas_target:
+                logger.info("Agent screenshot for canvas (from stream): %s", canvas_target)
+                self.agent_screenshot_for_canvas.emit(canvas_target)
+                self._streaming_screenshot_emitted = True
+        if not getattr(self, "_streaming_a2ui_emitted", True):
+            a2ui_payload = _extract_a2ui_payload(accumulated)
+            if a2ui_payload is not None:
+                self.a2ui_for_canvas.emit(a2ui_payload)
+                self._streaming_a2ui_emitted = True
+        if not getattr(self, "_streaming_pixmap_emitted", True):
+            base64_img = _extract_base64_image(accumulated)
+            if base64_img:
+                fmt, b64 = base64_img
+                try:
+                    data = base64.b64decode(b64, validate=True)
+                    pixmap = QPixmap()
+                    if pixmap.loadFromData(QByteArray(data), fmt.upper().encode()):
+                        self.pixmap_for_canvas.emit(pixmap)
+                        self._streaming_pixmap_emitted = True
+                except Exception:
+                    pass
         QTimer.singleShot(0, self._scroll_to_bottom)
 
     def on_message_ready(self, response_text, was_stopped=False):
@@ -1385,13 +1561,36 @@ class ChatWidget(QWidget):
                     "• The request timed out — try a shorter message or check your network\n\n"
                     "Check that your chosen provider is running and the model is loaded, then try again."
                 )
+        # Strip [GRIZZYCLAW_CANVAS_IMAGE:path] / [GRIZZYCLAW_CANVAS_URL:url] from display and show screenshot in Visual Canvas
+        full_text = response_text or ""
+        control_path, control_url, text_without_control = _extract_canvas_controls(full_text)
+        has_control = control_path or control_url or _CANVAS_IMAGE_CONTROL_RE.search(full_text) or _CANVAS_URL_CONTROL_RE.search(full_text)
+        display_text = text_without_control if has_control else response_text
         if self._streaming_bubble is not None:
-            self._streaming_bubble.label.setText(response_text)
+            self._streaming_bubble.label.setText(display_text)
             self._streaming_bubble = None
-            self.message_added.emit(response_text, False, self._workspace_display_name)
+            self.message_added.emit(display_text, False, self._workspace_display_name)
         else:
-            self.message_received.emit(response_text, False)
+            self.message_received.emit(display_text, False)
         QTimer.singleShot(0, self._scroll_to_bottom)
+        # Push content to Visual Canvas: only control path/URL or "Screenshot saved" path (never model-invented markdown URLs)
+        canvas_target = control_path or control_url or _extract_screenshot_path(full_text)
+        if canvas_target:
+            logger.info("Agent screenshot for canvas: %s", canvas_target)
+            self.agent_screenshot_for_canvas.emit(canvas_target)
+        a2ui_payload = _extract_a2ui_payload(full_text)
+        if a2ui_payload is not None:
+            self.a2ui_for_canvas.emit(a2ui_payload)
+        base64_img = _extract_base64_image(full_text)
+        if base64_img:
+            fmt, b64 = base64_img
+            try:
+                data = base64.b64decode(b64, validate=True)
+                pixmap = QPixmap()
+                if pixmap.loadFromData(QByteArray(data), fmt.upper().encode()):
+                    self.pixmap_for_canvas.emit(pixmap)
+            except Exception:
+                pass
         mw = self.window()
         if mw and hasattr(mw, "_update_session_status"):
             mw._update_session_status()
@@ -1901,6 +2100,7 @@ class GrizzyClawApp(QMainWindow):
             self.agent.subagent_registry = self.workspace_manager.subagent_registry
         self._subagent_registry_for_ui = getattr(self.agent, "subagent_registry", None) or self.workspace_manager.subagent_registry
         self._wire_agent_proactive(self.agent)
+        start_scheduler_thread(get_agent=lambda: getattr(self, "agent", None))
 
         self.telegram_bot = None
         self._stop_worker = None
@@ -1981,14 +2181,20 @@ class GrizzyClawApp(QMainWindow):
         self.canvas_widget = CanvasWidget()
         self.main_splitter.addWidget(self.chat_widget)
         self.main_splitter.addWidget(self.canvas_widget)
+        self.canvas_widget.setMinimumWidth(220)  # So user can't collapse canvas to zero; screenshot always visible
         self.main_splitter.setSizes([700, 300])  # Chat gets more space by default
         self.main_splitter.setStretchFactor(0, 1)
         self.main_splitter.setStretchFactor(1, 0)
         self.chat_widget.image_attached.connect(self.canvas_widget.display_image)
+        self.chat_widget.agent_screenshot_for_canvas.connect(self._on_agent_screenshot_for_canvas)
+        self.chat_widget.pixmap_for_canvas.connect(self.canvas_widget.display_pixmap)
+        self.chat_widget.a2ui_for_canvas.connect(self.canvas_widget.display_a2ui)
         self.content_layout.addWidget(self.main_splitter)
 
         layout.addWidget(self.content_stack, 1)
-        
+        # Restore last screenshot into Visual Canvas on open (zero-confusion: appears instantly)
+        QTimer.singleShot(100, self._restore_last_canvas_screenshot)
+
         # Status bar with better styling
         self.status_bar = QStatusBar()
         self.status_bar.setStyleSheet("""
@@ -2008,6 +2214,122 @@ class GrizzyClawApp(QMainWindow):
         else:
             self.status_bar.showMessage("Ready")
         QTimer.singleShot(500, self._update_session_status)
+
+    def _on_agent_screenshot_for_canvas(self, path_or_url: str) -> None:
+        """When the agent takes a screenshot: load it into the Visual Canvas (user can then use Save to save to disk if desired)."""
+        if not path_or_url:
+            return
+        # Ensure canvas panel has enough width so the user actually sees it
+        sizes = self.main_splitter.sizes()
+        if sizes and len(sizes) >= 2 and sizes[1] < 220:
+            total = sum(sizes) or 800
+            self.main_splitter.setSizes([max(400, total - 280), 280])
+        # Do not load external URLs (e.g. imgur) into canvas — user wants screenshots only in Visual Canvas, not uploaded or fetched from elsewhere.
+        if path_or_url.startswith("http://") or path_or_url.startswith("https://"):
+            logger.debug("Skipping external URL for canvas (no uploads/fetches): %s", path_or_url[:60])
+            return
+        # File path only
+        try:
+            resolved = str(Path(path_or_url).expanduser().resolve())
+        except Exception as e:
+            logger.warning("Screenshot path invalid %r: %s", path_or_url, e)
+            return
+        to_try = [resolved]
+        if not Path(resolved).exists():
+            fallback = Path.home() / ".grizzyclaw" / "screenshots" / os.path.basename(resolved)
+            if fallback != Path(resolved) and fallback.exists():
+                to_try.insert(0, str(fallback))
+        for p in to_try:
+            if not Path(p).exists():
+                continue
+            self.canvas_widget.clear()
+            if self.canvas_widget.display_image(p):
+                logger.info("Screenshot displayed in Visual Canvas: %s", p)
+                if _is_temp_screenshot_path(p):
+                    try:
+                        Path(p).unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                else:
+                    self._save_last_canvas_screenshot(p)
+                return
+        logger.info("Screenshot for canvas not yet available (will retry): %s", resolved)
+        self.canvas_widget.clear()
+        QTimer.singleShot(500, lambda: self._show_screenshot_retry(resolved))
+
+    def _download_and_show_canvas_url(self, url: str) -> None:
+        """Download image from URL and show in Visual Canvas (keeps reply alive until finished)."""
+        nam = QNetworkAccessManager(self)
+        req = QNetworkRequest(QUrl(url))
+        reply = nam.get(req)
+        self._canvas_url_reply = reply  # keep reference so reply is not GC'd
+
+        def on_finish():
+            try:
+                if reply.error() == QNetworkReply.NetworkError.NoError:
+                    data = reply.readAll()
+                    pixmap = QPixmap()
+                    if pixmap.loadFromData(data):
+                        self.canvas_widget.clear()
+                        self.canvas_widget.display_pixmap(pixmap)
+                        logger.info("Screenshot from URL displayed in Visual Canvas: %s", url)
+            except Exception as e:
+                logger.warning("Failed to load canvas image from URL %s: %s", url, e)
+            finally:
+                reply.deleteLater()
+                if getattr(self, "_canvas_url_reply", None) == reply:
+                    del self._canvas_url_reply
+
+        reply.finished.connect(on_finish)
+
+    def _show_screenshot_retry(self, path: str) -> None:
+        """Single retry to load screenshot into canvas (in case file was still writing)."""
+        to_try = [path]
+        if not Path(path).exists():
+            fallback = Path.home() / ".grizzyclaw" / "screenshots" / os.path.basename(path)
+            if fallback.exists():
+                to_try = [str(fallback)]
+        for p in to_try:
+            if Path(p).exists():
+                self.canvas_widget.clear()
+                if self.canvas_widget.display_image(p):
+                    logger.info("Screenshot displayed in Visual Canvas (retry): %s", p)
+                    if _is_temp_screenshot_path(p):
+                        try:
+                            Path(p).unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                    else:
+                        self._save_last_canvas_screenshot(p)
+                break
+
+    def _save_last_canvas_screenshot(self, path: str) -> None:
+        """Persist path so Visual Canvas can restore it when the app reopens. Skip temp paths (canvas-only screenshots)."""
+        if _is_temp_screenshot_path(path):
+            return
+        try:
+            state_dir = Path.home() / ".grizzyclaw"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            state_file = state_dir / "last_canvas_screenshot.txt"
+            state_file.write_text(path.strip(), encoding="utf-8")
+        except Exception as e:
+            logger.debug("Could not save last canvas screenshot path: %s", e)
+
+    def _restore_last_canvas_screenshot(self) -> None:
+        """On open: show last screenshot in Visual Canvas so it appears instantly."""
+        try:
+            state_file = Path.home() / ".grizzyclaw" / "last_canvas_screenshot.txt"
+            if not state_file.exists():
+                return
+            path = state_file.read_text(encoding="utf-8").strip()
+            if not path:
+                return
+            resolved = str(Path(path).expanduser().resolve())
+            if Path(resolved).exists() and getattr(self, "canvas_widget", None):
+                self.canvas_widget.clear()
+                self.canvas_widget.display_image(resolved)
+        except Exception as e:
+            logger.debug("Could not restore last canvas screenshot: %s", e)
     
     def _update_session_status(self):
         """Update the permanent status bar label with session message/token estimate."""
@@ -2148,11 +2470,18 @@ class GrizzyClawApp(QMainWindow):
         """Called when Telegram bot fails to start (e.g. network, auth)."""
         self.telegram_bot = None
         self.status_bar.showMessage(f"Telegram failed: {err}")
+        hint = ""
+        if "ConnectError" in err or "connection" in err.lower() or "All connection attempts failed" in err:
+            hint = (
+                "\n\nIf you're behind a firewall or proxy, set Settings → Telegram → Proxy (or HTTPS_PROXY), "
+                "then try again."
+            )
         QMessageBox.warning(
             self,
             "Telegram Connection Failed",
             f"The Telegram bot could not start:\n\n{err}\n\n"
-            "Check that your token is correct and you have internet access.",
+            "Check that your token is correct and you have internet access."
+            f"{hint}",
         )
 
     def _check_telegram_started(self):
@@ -2269,7 +2598,11 @@ class GrizzyClawApp(QMainWindow):
             self.sidebar.refresh_workspace_buttons()
 
     def on_workspace_config_saved(self, workspace_id: str):
-        """When a workspace's config is saved, recreate agent if it's the active one so chat uses new provider/model."""
+        """When a workspace's config is saved, defer agent recreation so the save dialog can close and show the popup immediately."""
+        QTimer.singleShot(0, lambda: self._recreate_agent_after_config_saved(workspace_id))
+
+    def _recreate_agent_after_config_saved(self, workspace_id: str):
+        """Recreate agent for the saved workspace (runs after dialog has shown 'Saved' so UI stays responsive)."""
         active_ws = self.workspace_manager.get_active_workspace()
         if not active_ws or active_ws.id != workspace_id:
             return

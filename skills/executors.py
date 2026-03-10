@@ -117,8 +117,29 @@ def _get_google_creds(settings: Any):
     return data
 
 
+def _save_google_creds_after_refresh(creds: Any, creds_path: str, secret_key: Optional[str] = None) -> None:
+    """Persist updated OAuth credentials to the token file after a successful refresh."""
+    try:
+        from grizzyclaw.automation.gmail_creds import save_gmail_credentials
+        scopes = getattr(creds, "scopes", None) or []
+        data = {
+            "token": getattr(creds, "token", None),
+            "refresh_token": getattr(creds, "refresh_token", None),
+            "token_uri": getattr(creds, "token_uri", None) or _GOOGLE_TOKEN_URI,
+            "client_id": getattr(creds, "client_id", None),
+            "client_secret": getattr(creds, "client_secret", None),
+            "scopes": list(scopes) if scopes else [],
+        }
+        if data.get("refresh_token") and data.get("client_id"):
+            save_gmail_credentials(data, creds_path, secret_key)
+            logger.debug("Saved refreshed Google credentials to %s", creds_path)
+    except Exception as e:
+        logger.warning("Could not save refreshed Google credentials: %s", e)
+
+
 def execute_calendar(action: str, params: Dict[str, Any], settings: Any) -> str:
     """Google Calendar: list_events, create_event."""
+    creds_path = getattr(settings, "gmail_credentials_json", None)
     creds_data = _get_google_creds(settings)
     if not creds_data:
         return "❌ Calendar: Configure Gmail/Google credentials in Settings → Integrations (same OAuth; add Calendar scope if needed)."
@@ -135,6 +156,8 @@ def execute_calendar(action: str, params: Dict[str, Any], settings: Any) -> str:
         creds = Credentials.from_authorized_user_info(cal_creds)
         if creds.expired and creds.refresh_token:
             creds.refresh(Request())
+            if creds_path:
+                _save_google_creds_after_refresh(creds, str(Path(creds_path).expanduser()), getattr(settings, "secret_key", None))
         service = build("calendar", "v3", credentials=creds)
         calendar_id = params.get("calendarId", "primary")
 
@@ -179,8 +202,14 @@ def execute_calendar(action: str, params: Dict[str, Any], settings: Any) -> str:
         err_str = str(e).lower()
         if "invalid_grant" in err_str or "bad request" in err_str:
             return (
-                "❌ Calendar error: invalid_grant — refresh token doesn't match your OAuth client. "
-                "Use the same Client ID and secret in the Playground as in your token file, then do a fresh Authorize → Exchange and update the file."
+                "❌ Calendar error: invalid_grant — refresh token doesn't match your OAuth client.\n\n"
+                "**Fix:**\n"
+                "1. Open OAuth 2.0 Playground: https://developers.google.com/oauthplayground\n"
+                "2. Click the gear icon (⚙️), enter the **exact** Client ID and Client secret from your Google Cloud Console OAuth client (APIs & Services → Credentials).\n"
+                "3. In Step 1, add scope: https://www.googleapis.com/auth/calendar (and gmail scopes if you use Gmail). Click Authorize APIs and sign in.\n"
+                "4. In Step 2, click Exchange authorization code for tokens. Copy the **refresh_token** from the response.\n"
+                "5. In GrizzyClaw: Settings → Integrations → set Gmail OAuth token path to your token file. That file must contain the same client_id, client_secret, and the new refresh_token (from the same Playground flow).\n"
+                "6. Restart the app and try Calendar again."
             )
         if "403" in str(e) and ("insufficient" in err_str or "permission" in err_str or "scope" in err_str):
             return (
@@ -195,6 +224,7 @@ def execute_calendar(action: str, params: Dict[str, Any], settings: Any) -> str:
 
 def execute_gmail(action: str, params: Dict[str, Any], settings: Any) -> str:
     """Gmail: send_email, reply, list_messages (full send/reply)."""
+    creds_path = getattr(settings, "gmail_credentials_json", None)
     creds_data = _get_google_creds(settings)
     if not creds_data:
         return "❌ Gmail: Configure Gmail credentials in Settings → Integrations."
@@ -207,6 +237,8 @@ def execute_gmail(action: str, params: Dict[str, Any], settings: Any) -> str:
         creds = Credentials.from_authorized_user_info(creds_data)
         if creds.expired and creds.refresh_token:
             creds.refresh(Request())
+            if creds_path:
+                _save_google_creds_after_refresh(creds, str(Path(creds_path).expanduser()), getattr(settings, "secret_key", None))
         service = build("gmail", "v1", credentials=creds)
 
         if action == "send_email":
@@ -274,11 +306,10 @@ def execute_gmail(action: str, params: Dict[str, Any], settings: Any) -> str:
         if "invalid_grant" in err_str or "bad request" in err_str:
             logger.warning("Gmail invalid_grant: %s", e)
             return (
-                "❌ Gmail error: invalid_grant — refresh token doesn't match your client. "
-                "Fix: 1) In Google Cloud Console open the same OAuth client you use in the Playground. "
-                "2) Copy its Client ID and Client secret. 3) In OAuth 2.0 Playground (gear icon) enter those exact values. "
-                "4) Select Gmail scopes → Authorize APIs → sign in as your test user → Exchange authorization code for tokens (once). "
-                "5) In your token file put that client_id, that client_secret, and the refresh_token from the response. All three must be from the same flow."
+                "❌ Gmail error: invalid_grant — refresh token doesn't match your OAuth client.\n\n"
+                "**Fix:** Open https://developers.google.com/oauthplayground → gear icon: enter your Cloud Console Client ID and secret → "
+                "Step 1: add Gmail scopes → Authorize APIs → sign in → Step 2: Exchange authorization code for tokens. "
+                "Put that client_id, client_secret, and refresh_token in your token file (Settings → Integrations). All three must be from the same flow. Restart the app."
             )
         logger.exception("Gmail skill error")
         return f"❌ Gmail error: {e}"

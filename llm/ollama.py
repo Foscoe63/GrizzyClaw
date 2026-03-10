@@ -101,8 +101,27 @@ class OllamaProvider(LLMProvider):
                                 data = json.loads(line)
                             except json.JSONDecodeError:
                                 continue
-                            if "message" in data and "content" in data["message"]:
-                                yield data["message"]["content"]
+                            msg = data.get("message") if isinstance(data.get("message"), dict) else None
+                            if not msg:
+                                continue
+                            # Yield content so the agent sees intro text (e.g. "Checking your calendar...")
+                            if "content" in msg and msg["content"]:
+                                yield msg["content"]
+                            # When Ollama parses model output as tool calls (e.g. SKILL_ACTION), content can be empty.
+                            # Serialize tool_calls to text so the agent can parse SKILL_ACTION / TOOL_CALL and execute.
+                            for tc in msg.get("tool_calls") or []:
+                                fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                                name = (fn.get("name") or "").strip()
+                                args = fn.get("arguments")
+                                if not name:
+                                    continue
+                                if isinstance(args, dict):
+                                    args_str = json.dumps(args)
+                                elif args is not None:
+                                    args_str = str(args).strip()
+                                else:
+                                    args_str = "{}"
+                                yield f"\n{name} = {args_str}"
         except aiohttp.ClientError as e:
             raise LLMProviderNotAvailable(f"Cannot connect to Ollama: {e}")
 

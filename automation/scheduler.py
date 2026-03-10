@@ -158,20 +158,51 @@ class CronScheduler:
 
     async def _run_loop(self):
         """Main scheduler loop"""
-        logger.info("Entering scheduler loop...")
+        logger.info(
+            "Entering scheduler loop (enabled tasks: %s)",
+            [t.name for t in self.tasks.values() if t.enabled],
+        )
 
         try:
+            tick_count = 0
             while self.running:
                 now = datetime.now()
+                tick_count += 1
+                # Every 2 ticks (~1 min) log heartbeat at INFO so we can confirm loop is running
+                next_runs = [
+                    (t.name, t.next_run.isoformat() if t.next_run else None)
+                    for t in self.tasks.values()
+                    if t.enabled
+                ]
+                if tick_count % 2 == 1:
+                    logger.info(
+                        "Scheduler tick (now=%s); next runs: %s",
+                        now.isoformat(),
+                        next_runs,
+                    )
+                else:
+                    logger.debug(
+                        "Scheduler tick (now=%s); next runs: %s",
+                        now.isoformat(),
+                        next_runs,
+                    )
 
                 # Check each task
                 for task_id, task in list(self.tasks.items()):
                     if not task.enabled:
                         continue
 
+                    if task.next_run is None:
+                        task._calculate_next_run()
+
                     if task.next_run and now >= task.next_run:
                         # Time to run this task
-                        logger.info(f"Executing scheduled task: {task.name}")
+                        logger.info(
+                            "Executing scheduled task: %s (next_run=%s, now=%s)",
+                            task.name,
+                            task.next_run,
+                            now,
+                        )
 
                         try:
                             # Execute handler

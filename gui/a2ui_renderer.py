@@ -1,125 +1,202 @@
-"""A2UI (Agent-to-User Interface) renderer - declarative UI from agent payloads
+"""A2UI (Agent-to-User Interface) renderer for the Visual Canvas.
 
-Renders A2UI JSON format (https://a2ui.org) into Qt widgets for the Live Canvas.
-Supports: text, image, button, and basic layout components.
+Renders structured JSON payloads into Qt widgets: cards, text blocks,
+key-value lists, sections, and simple diagrams.
 """
 
-import base64
 import json
 import logging
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from PyQt6.QtWidgets import (
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QLabel,
+    QFrame,
+    QScrollArea,
+    QSizePolicy,
+    QGridLayout,
+)
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QPixmap
-from PyQt6.QtWidgets import QLabel, QPushButton, QVBoxLayout, QWidget
+from PyQt6.QtGui import QFont
 
 logger = logging.getLogger(__name__)
 
+# Default styling to match canvas
+_CARD_STYLE = """
+    QFrame {
+        background-color: #FFFFFF;
+        border: 1px solid #E5E5EA;
+        border-radius: 8px;
+        padding: 12px;
+    }
+"""
+_SECTION_TITLE_STYLE = "color: #1C1C1E; font-weight: bold; font-size: 14px; margin-bottom: 8px;"
+_LABEL_STYLE = "color: #3C3C43; font-size: 13px;"
+_KEY_STYLE = "color: #8E8E93; font-size: 12px;"
+_DIAGRAM_NODE_STYLE = """
+    QFrame {
+        background-color: #F2F2F7;
+        border: 1px solid #C6C6C8;
+        border-radius: 6px;
+        padding: 8px 12px;
+    }
+"""
 
-def render_a2ui(
-    payload: str | Dict[str, Any],
-    parent: QWidget,
-    layout: QVBoxLayout,
-    on_button_click: Optional[callable] = None,
-) -> bool:
-    """
-    Parse A2UI JSON and add widgets to the given layout.
 
-    Args:
-        payload: JSON string or dict with A2UI Response format
-        parent: Parent widget for created widgets
-        layout: Layout to add widgets to
-        on_button_click: Optional callback(component_id, label) for button clicks
+def _add_card(container: QWidget, layout: QVBoxLayout, spec: Dict[str, Any]) -> bool:
+    title = spec.get("title", "")
+    content = spec.get("content", "")
+    frame = QFrame()
+    frame.setStyleSheet(_CARD_STYLE)
+    frame.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+    card_layout = QVBoxLayout(frame)
+    card_layout.setContentsMargins(12, 12, 12, 12)
+    if title:
+        title_label = QLabel(title)
+        title_label.setStyleSheet(_SECTION_TITLE_STYLE)
+        title_label.setWordWrap(True)
+        card_layout.addWidget(title_label)
+    if content:
+        content_label = QLabel(content)
+        content_label.setStyleSheet(_LABEL_STYLE)
+        content_label.setWordWrap(True)
+        content_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        card_layout.addWidget(content_label)
+    layout.addWidget(frame)
+    return True
 
-    Returns:
-        True if at least one component was rendered
+
+def _add_text(container: QWidget, layout: QVBoxLayout, spec: Dict[str, Any]) -> bool:
+    content = spec.get("content", str(spec))
+    label = QLabel(content)
+    label.setStyleSheet(_LABEL_STYLE)
+    label.setWordWrap(True)
+    label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+    layout.addWidget(label)
+    return True
+
+
+def _add_key_value(container: QWidget, layout: QVBoxLayout, spec: Dict[str, Any]) -> bool:
+    items = spec.get("items", spec.get("entries", []))
+    if not items:
+        return False
+    frame = QFrame()
+    frame.setStyleSheet(_CARD_STYLE)
+    frame.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+    grid = QGridLayout(frame)
+    for i, entry in enumerate(items):
+        if isinstance(entry, dict):
+            k = entry.get("key", entry.get("name", ""))
+            v = entry.get("value", entry.get("val", ""))
+        else:
+            k, v = str(entry), ""
+        key_label = QLabel(f"{k}:")
+        key_label.setStyleSheet(_KEY_STYLE)
+        val_label = QLabel(str(v))
+        val_label.setStyleSheet(_LABEL_STYLE)
+        val_label.setWordWrap(True)
+        val_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        grid.addWidget(key_label, i, 0)
+        grid.addWidget(val_label, i, 1)
+    layout.addWidget(frame)
+    return True
+
+
+def _add_section(container: QWidget, layout: QVBoxLayout, spec: Dict[str, Any]) -> bool:
+    title = spec.get("title", "")
+    children = spec.get("children", spec.get("items", []))
+    if title:
+        title_label = QLabel(title)
+        title_label.setStyleSheet(_SECTION_TITLE_STYLE)
+        title_label.setWordWrap(True)
+        layout.addWidget(title_label)
+    inner = QVBoxLayout()
+    inner.setContentsMargins(0, 4, 0, 0)
+    for child in children:
+        if isinstance(child, dict):
+            render_a2ui(child, container, inner)
+    layout.addLayout(inner)
+    return True
+
+
+def _add_diagram(container: QWidget, layout: QVBoxLayout, spec: Dict[str, Any]) -> bool:
+    """Simple diagram: nodes and edges rendered as labeled boxes and arrows."""
+    nodes = spec.get("nodes", [])
+    edges = spec.get("edges", [])
+    node_map: Dict[str, str] = {}
+    for n in nodes:
+        if isinstance(n, dict):
+            node_map[str(n.get("id", ""))] = str(n.get("label", n.get("id", "")))
+        else:
+            node_map[str(n)] = str(n)
+    if not node_map and not edges:
+        return False
+    frame = QFrame()
+    frame.setStyleSheet("QFrame { background-color: #FAFAFA; border-radius: 8px; padding: 16px; }")
+    frame.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+    diag_layout = QVBoxLayout(frame)
+    for nid, label in node_map.items():
+        node_frame = QFrame()
+        node_frame.setStyleSheet(_DIAGRAM_NODE_STYLE)
+        node_frame.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Minimum)
+        lbl = QLabel(label)
+        lbl.setStyleSheet(_LABEL_STYLE)
+        node_inner = QVBoxLayout(node_frame)
+        node_inner.addWidget(lbl)
+        diag_layout.addWidget(node_frame)
+    if edges:
+        parts = []
+        for e in edges[:15]:
+            if isinstance(e, dict):
+                fr = node_map.get(str(e.get("from", "")), str(e.get("from", "")))
+                to = node_map.get(str(e.get("to", "")), str(e.get("to", "")))
+                parts.append(f"{fr} → {to}")
+            else:
+                parts.append(str(e))
+        if parts:
+            arrows_label = QLabel("  |  ".join(parts))
+            arrows_label.setStyleSheet(_KEY_STYLE)
+            arrows_label.setWordWrap(True)
+            diag_layout.addWidget(arrows_label)
+    layout.addWidget(frame)
+    return True
+
+
+def render_a2ui(payload: str | Dict[str, Any], container: QWidget, layout: QVBoxLayout) -> bool:
+    """Render an A2UI payload into the given container/layout.
+
+    Payload can be a JSON string or a dict. Supported types:
+    - card: { "type": "card", "title": "...", "content": "..." }
+    - text: { "type": "text", "content": "..." }
+    - key_value: { "type": "key_value", "items": [ {"key": "k", "value": "v"}, ... ] }
+    - section: { "type": "section", "title": "...", "children": [ ... ] }
+    - diagram: { "type": "diagram", "nodes": [ {"id": "a", "label": "A"}, ... ], "edges": [ {"from": "a", "to": "b"}, ... ] }
+
+    Returns True if something was rendered, False otherwise.
     """
     if isinstance(payload, str):
         try:
-            data = json.loads(payload)
+            payload = json.loads(payload)
         except json.JSONDecodeError as e:
-            logger.warning(f"A2UI parse error: {e}")
+            logger.warning("A2UI invalid JSON: %s", e)
             return False
-    else:
-        data = payload
-
-    # A2UI format: { "components": [...], "dataModel": {...} }
-    components = data.get("components", data.get("content", []))
-    if not components:
+    if not isinstance(payload, dict):
         return False
-
-    rendered = 0
-    for comp in components:
-        ctype = comp.get("type", comp.get("componentType", ""))
-        cid = comp.get("id", "")
-        props = comp.get("properties", comp.get("props", {}))
-
-        if ctype in ("text", "Text"):
-            text = props.get("text", props.get("content", ""))
-            if text:
-                lbl = QLabel(text)
-                lbl.setWordWrap(True)
-                lbl.setStyleSheet("color: #1C1C1E; font-size: 14px; padding: 8px;")
-                layout.addWidget(lbl)
-                rendered += 1
-
-        elif ctype in ("image", "Image"):
-            src = props.get("src", props.get("url", props.get("source", "")))
-            if src:
-                pixmap = _load_image(src)
-                if not pixmap.isNull():
-                    lbl = QLabel()
-                    lbl.setPixmap(pixmap.scaled(400, 300, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
-                    lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                    layout.addWidget(lbl)
-                    rendered += 1
-
-        elif ctype in ("button", "Button"):
-            label = props.get("label", props.get("text", "Click"))
-            btn = QPushButton(label)
-            btn.setProperty("a2ui_id", cid)
-            if on_button_click:
-                _cid, _label = cid, label
-                btn.clicked.connect(lambda: on_button_click(_cid, _label))
-            layout.addWidget(btn)
-            rendered += 1
-
-        elif ctype in ("card", "Card"):
-            # Recursive: render children
-            children = comp.get("children", comp.get("content", []))
-            if children:
-                sub = QWidget()
-                sub_layout = QVBoxLayout(sub)
-                sub_layout.setContentsMargins(12, 12, 12, 12)
-                render_a2ui({"components": children}, parent, sub_layout, on_button_click)
-                layout.addWidget(sub)
-                rendered += 1
-
-    return rendered > 0
-
-
-def _load_image(src: str) -> QPixmap:
-    """Load image from URL, file path, or base64 data URI."""
-    pix = QPixmap()
-    if src.startswith("data:"):
-        # data:image/png;base64,...
-        try:
-            header, b64 = src.split(",", 1)
-            data = base64.b64decode(b64)
-            pix.loadFromData(data)
-        except Exception:
-            pass
-    elif src.startswith(("http://", "https://")):
-        try:
-            import urllib.request
-            with urllib.request.urlopen(src, timeout=10) as r:
-                data = r.read()
-            pix.loadFromData(data)
-        except Exception:
-            pass
-    else:
-        p = Path(src).expanduser()
-        if p.exists():
-            pix.load(str(p))
-    return pix
+    kind = (payload.get("type") or payload.get("kind", "")).lower()
+    if kind == "card":
+        return _add_card(container, layout, payload)
+    if kind == "text":
+        return _add_text(container, layout, payload)
+    if kind == "key_value":
+        return _add_key_value(container, layout, payload)
+    if kind == "section":
+        return _add_section(container, layout, payload)
+    if kind == "diagram":
+        return _add_diagram(container, layout, payload)
+    # Default: treat as card with content = str(payload) or single text
+    if not kind:
+        return _add_text(container, layout, {"content": payload.get("content", json.dumps(payload))})
+    logger.warning("A2UI unknown type: %s", kind)
+    return False

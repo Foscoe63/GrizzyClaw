@@ -65,7 +65,20 @@ class ConversationHistoryDialog(QDialog):
         QMessageBox.information(self, "Cleared", "Conversation cleared. You can start a new chat.")
 
     def _do_load(self):
+        loaded = 0
         if self.on_load:
-            self.on_load()
+            try:
+                result = self.on_load()
+                loaded = int(result) if isinstance(result, int) else 0
+            except Exception:
+                loaded = 0
         self.refresh_summary()
-        QMessageBox.information(self, "Loaded", "Session restored from disk (if one was saved).")
+        if loaded > 0:
+            QMessageBox.information(self, "Loaded", f"Restored {loaded} message(s) from disk.")
+        else:
+            QMessageBox.information(
+                self,
+                "No saved session",
+                "No saved session was found for this workspace/user yet.\n"
+                "Sessions are auto-saved after each assistant reply.",
+            )

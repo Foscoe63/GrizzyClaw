@@ -65,7 +65,11 @@ class WorkspaceManager:
                 self._create_default_workspace()
         else:
             self._create_default_workspace()
-    
+
+    def reload_from_disk(self) -> None:
+        """Reload workspaces from disk (e.g. when opening Workspaces dialog so UI shows latest saved state)."""
+        self._load_workspaces()
+
     def _create_default_workspace(self):
         """Create a default workspace if none exists"""
         default = WORKSPACE_TEMPLATES["default"]
@@ -207,20 +211,25 @@ class WorkspaceManager:
             return True
         return False
     
-    def update_workspace(self, workspace_id: str, **kwargs) -> Optional[Workspace]:
-        """Update a workspace
-        
+    def update_workspace(
+        self, workspace_id: str, *, persist: bool = True, **kwargs: Any
+    ) -> Optional[Workspace]:
+        """Update a workspace.
+
         Args:
             workspace_id: Workspace ID
-            **kwargs: Attributes to update
-        
+            persist: If True, write to disk immediately. Set False when
+                     update_workspace_config will be called next (single atomic save).
+            **kwargs: Attributes to update (name, description, icon, color, avatar_path, etc.)
+
         Returns:
             Updated workspace or None
         """
         workspace = self.workspaces.get(workspace_id)
         if workspace:
             workspace.update(**kwargs)
-            self._save_workspaces()
+            if persist:
+                self._save_workspaces()
             return workspace
         return None
     
@@ -237,11 +246,19 @@ class WorkspaceManager:
         workspace = self.workspaces.get(workspace_id)
         if not workspace:
             return None
-        # Merge current config (as dict) with updates so no key is lost
-        full = workspace.config.to_dict()
+        # Current config as dict (handle both WorkspaceConfig and plain dict from legacy load)
+        if isinstance(workspace.config, dict):
+            full = dict(workspace.config)
+        else:
+            full = workspace.config.to_dict()
+        # Merge all updates so Swarm and every tab's fields persist (no hasattr filter)
         for key, value in config_updates.items():
-            if hasattr(workspace.config, key):
-                full[key] = value
+            full[key] = value
+        # Ensure LLM provider/model are never dropped (explicit persist)
+        if "llm_provider" in config_updates:
+            full["llm_provider"] = config_updates["llm_provider"]
+        if "llm_model" in config_updates:
+            full["llm_model"] = config_updates["llm_model"]
         workspace.config = WorkspaceConfig.from_dict(full)
         workspace.updated_at = datetime.now()
         self._save_workspaces()
@@ -361,6 +378,8 @@ class WorkspaceManager:
             settings.anthropic_model = config.llm_model
         elif config.llm_provider == "openrouter":
             settings.openrouter_model = config.llm_model
+        elif config.llm_provider == "cursor":
+            settings.cursor_model = config.llm_model
         settings.system_prompt = config.system_prompt
         settings.max_context_length = config.max_context_length
         settings.max_tokens = getattr(config, "max_tokens", 2000)
@@ -371,16 +390,30 @@ class WorkspaceManager:
         if config.custom_provider_url:
             settings.custom_provider_url = config.custom_provider_url
         
-        # Override API keys if specified
+        # Override API keys if specified (workspace API Keys tab)
         if config.openai_api_key:
             settings.openai_api_key = config.openai_api_key
         if config.anthropic_api_key:
             settings.anthropic_api_key = config.anthropic_api_key
         if config.openrouter_api_key:
             settings.openrouter_api_key = config.openrouter_api_key
+        if getattr(config, "cursor_api_key", None):
+            settings.cursor_api_key = config.cursor_api_key
+        elif config.llm_provider == "cursor" and getattr(base, "openai_api_key", None) and getattr(base, "cursor_api_key", None):
+            # Workspace uses Cursor but has no workspace key. Avoid using OpenAI key for Cursor
+            # when user may have pasted it in Preferences → Cursor by mistake.
+            if base.cursor_api_key == base.openai_api_key:
+                settings.cursor_api_key = None
+                logger.warning(
+                    "Cursor key not set for this workspace and global Cursor key matches OpenAI key. "
+                    "Set the Cursor API key in Preferences → LLM Providers → Cursor or in Workspace → API Keys → Cursor Key."
+                )
+        if getattr(config, "custom_provider_api_key", None):
+            settings.custom_provider_api_key = config.custom_provider_api_key
         
-        # Skills
-        settings.enabled_skills = config.enabled_skills
+        # Skills: only override if workspace has explicit list; empty means use global (ClawHub) list
+        if config.enabled_skills:
+            settings.enabled_skills = config.enabled_skills
         
         # Rules
         if config.rules_file:

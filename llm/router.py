@@ -11,6 +11,7 @@ from . import (
 )
 from .ollama import OllamaProvider
 from .lmstudio import LMStudioProvider
+from .lmstudio_v1 import LMStudioV1Provider
 from .openai import OpenAIProvider
 from .anthropic import AnthropicProvider
 from .openrouter import OpenRouterProvider
@@ -51,6 +52,28 @@ class LLMRouter:
             )
             self.provider_models["lmstudio"] = settings.lmstudio_model
 
+        if getattr(settings, "lmstudio_v1_enabled", False):
+            v1_url = (getattr(settings, "lmstudio_v1_url", None) or "").strip()
+            if not v1_url and settings.lmstudio_url:
+                base = settings.lmstudio_url.rstrip("/")
+                if base.endswith("/v1"):
+                    v1_url = base[:-3]
+                else:
+                    v1_url = base.split("/v1")[0] if "/v1" in base else base
+            if v1_url:
+                provider_v1 = LMStudioV1Provider(
+                    base_url=v1_url,
+                    api_key=getattr(settings, "lmstudio_v1_api_key", None),
+                )
+                self.add_provider(
+                    "lmstudio_v1",
+                    provider_v1,
+                    settings.default_llm_provider == "lmstudio_v1",
+                )
+                self.provider_models["lmstudio_v1"] = (
+                    getattr(settings, "lmstudio_v1_model", None) or ""
+                )
+
         if settings.openai_api_key:
             provider = OpenAIProvider(settings.openai_api_key)
             self.add_provider(
@@ -71,6 +94,25 @@ class LLMRouter:
                 "openrouter", provider, settings.default_llm_provider == "openrouter"
             )
             self.provider_models["openrouter"] = settings.openrouter_model
+
+        if settings.cursor_api_key and (settings.cursor_url or "").strip():
+            base_url = (settings.cursor_url or "").strip()
+            provider = OpenAIProvider(settings.cursor_api_key, base_url=base_url)
+            self.add_provider(
+                "cursor", provider, settings.default_llm_provider == "cursor"
+            )
+            self.provider_models["cursor"] = settings.cursor_model
+
+        custom_name = (getattr(settings, "custom_provider_name", None) or "custom").strip() or "custom"
+        if getattr(settings, "custom_provider_url", None):
+            provider = OpenAIProvider(
+                getattr(settings, "custom_provider_api_key", None) or "",
+                base_url=settings.custom_provider_url.strip(),
+            )
+            self.add_provider(
+                custom_name, provider, settings.default_llm_provider == custom_name
+            )
+            self.provider_models[custom_name] = getattr(settings, "custom_provider_model", "") or ""
 
         # Workspace override: workspace manager sets provider-specific model (ollama_model, etc.)
         # so we don't need default_model override. Provider-specific model always wins.

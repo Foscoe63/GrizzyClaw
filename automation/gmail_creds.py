@@ -45,6 +45,35 @@ def load_gmail_credentials(
         return None
 
 
+def save_gmail_credentials(
+    credentials: Dict[str, Any],
+    path: str,
+    secret_key: Optional[str] = None,
+) -> bool:
+    """
+    Save Gmail OAuth credentials to file. Uses encryption if secret_key is set and
+    the path looks like an encrypted file (e.g. .enc), otherwise plain JSON.
+
+    Args:
+        credentials: OAuth token dict (client_id, client_secret, refresh_token, etc.)
+        path: Output file path
+        secret_key: If set and file is .enc, save encrypted
+
+    Returns:
+        True on success
+    """
+    p = Path(path).expanduser()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    if secret_key and str(p).lower().endswith(".enc"):
+        return save_gmail_credentials_encrypted(credentials, path, secret_key)
+    try:
+        p.write_text(json.dumps(credentials, indent=2), encoding="utf-8")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to save Gmail credentials: {e}", exc_info=True)
+        return False
+
+
 def save_gmail_credentials_encrypted(
     credentials: Dict[str, Any],
     output_path: str,

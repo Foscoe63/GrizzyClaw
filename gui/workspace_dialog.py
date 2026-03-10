@@ -10,9 +10,58 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, pyqtSignal, QThread
 from PyQt6.QtGui import QFont, QColor
 import asyncio
+from typing import Any, Dict, Optional
 
 from grizzyclaw.workspaces import WorkspaceManager, Workspace, WorkspaceConfig, WORKSPACE_TEMPLATES
 from grizzyclaw.llm.lmstudio import _normalize_lmstudio_url
+from grizzyclaw.llm.lmstudio_v1 import LMStudioV1Provider
+
+
+class SaveWorkspaceWorker(QThread):
+    """Run workspace save (update_workspace + update_workspace_config) off the GUI thread."""
+    finished = pyqtSignal(str)  # workspace_id on success
+    error = pyqtSignal(str)
+
+    def __init__(
+        self,
+        manager: WorkspaceManager,
+        workspace_id: str,
+        name: str,
+        description: str,
+        icon: str,
+        color: str,
+        avatar_path: Optional[str],
+        config_updates: Dict[str, Any],
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.manager = manager
+        self.workspace_id = workspace_id
+        self.name = name
+        self.description = description
+        self.icon = icon
+        self.color = color
+        self.avatar_path = avatar_path
+        self.config_updates = config_updates
+
+    def run(self):
+        try:
+            self.manager.update_workspace(
+                self.workspace_id,
+                persist=False,
+                name=self.name,
+                description=self.description,
+                icon=self.icon,
+                color=self.color,
+                avatar_path=self.avatar_path,
+            )
+            updated = self.manager.update_workspace_config(self.workspace_id, self.config_updates)
+            if updated:
+                self.finished.emit(self.workspace_id)
+            else:
+                self.error.emit("Workspace not found.")
+        except Exception as e:
+            self.error.emit(str(e))
 
 
 class WorkspaceDialog(QDialog):
@@ -99,6 +148,7 @@ class WorkspaceDialog(QDialog):
             }}
         """)
         self.workspace_list.currentItemChanged.connect(self.on_workspace_selected)
+        self.workspace_list.itemClicked.connect(self._on_workspace_item_clicked)
         self.workspace_list.setDragDropMode(QListWidget.DragDropMode.InternalMove)
         left_layout.addWidget(self.workspace_list, 1)
         
@@ -228,7 +278,7 @@ class WorkspaceDialog(QDialog):
         llm_layout.setSpacing(12)
         
         self.provider_combo = QComboBox()
-        self.provider_combo.addItems(["ollama", "lmstudio", "openai", "anthropic", "openrouter"])
+        self._refresh_provider_combo()
         self.provider_combo.currentTextChanged.connect(self._on_provider_changed)
         llm_layout.addRow("Provider:", self.provider_combo)
         
@@ -301,27 +351,13 @@ class WorkspaceDialog(QDialog):
         
         self.tabs.addTab(prompt_tab, "Prompt")
         
-        # API Keys tab
+        # API Keys tab (built dynamically from Preferences → LLM Providers "Show in Workspace API Keys")
         api_tab = QWidget()
-        api_layout = QFormLayout(api_tab)
-        api_layout.setContentsMargins(16, 16, 16, 16)
-        api_layout.setSpacing(12)
-        
-        self.openai_key_input = QLineEdit()
-        self.openai_key_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self.openai_key_input.setPlaceholderText("Leave empty to use global setting")
-        api_layout.addRow("OpenAI Key:", self.openai_key_input)
-        
-        self.anthropic_key_input = QLineEdit()
-        self.anthropic_key_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self.anthropic_key_input.setPlaceholderText("Leave empty to use global setting")
-        api_layout.addRow("Anthropic Key:", self.anthropic_key_input)
-        
-        self.openrouter_key_input = QLineEdit()
-        self.openrouter_key_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self.openrouter_key_input.setPlaceholderText("Leave empty to use global setting")
-        api_layout.addRow("OpenRouter Key:", self.openrouter_key_input)
-        
+        self.api_keys_layout = QFormLayout(api_tab)
+        self.api_keys_layout.setContentsMargins(16, 16, 16, 16)
+        self.api_keys_layout.setSpacing(12)
+        self.api_key_inputs: Dict[str, QLineEdit] = {}  # provider_id -> QLineEdit
+        self._build_api_keys_tab()
         self.tabs.addTab(api_tab, "API Keys")
 
         # Swarm / Inter-agent tab
@@ -559,80 +595,78 @@ class WorkspaceDialog(QDialog):
         
         self.workspace_list.blockSignals(False)
         
-        # Now select the target workspace (triggers on_workspace_selected once)
+        # Select the target workspace and sync form (explicit sync in case currentItemChanged doesn't fire)
         if target_item:
             self.workspace_list.setCurrentItem(target_item)
+            workspace = self.manager.get_workspace(target_id)
+            if workspace:
+                self._set_form_from_workspace(workspace)
     
-    def on_workspace_selected(self, current, previous):
-        """Handle workspace selection"""
-        if not current:
+    def _on_workspace_item_clicked(self, item: QListWidgetItem):
+        """Sync form to the clicked workspace so the right panel always shows that workspace's config."""
+        if not item:
             return
-        
-        workspace_id = current.data(Qt.ItemDataRole.UserRole)
+        workspace_id = item.data(Qt.ItemDataRole.UserRole)
         workspace = self.manager.get_workspace(workspace_id)
-        if not workspace:
-            return
-        
+        if workspace:
+            self._set_form_from_workspace(workspace)
+    
+    def _set_form_from_workspace(self, workspace: Workspace) -> None:
+        """Populate all form fields from a workspace (used on selection and after save)."""
         # Update header
         self.name_label.setText(f"{workspace.icon} {workspace.name}")
-        
         # General tab
         self.name_input.setText(workspace.name)
         self.desc_input.setText(workspace.description)
         self.icon_input.setText(workspace.icon)
         self.color_input.setText(workspace.color)
         self.avatar_path_input.setText(workspace.avatar_path or "")
-        
-        # LLM tab — block provider_combo signals so _on_provider_changed
-        # does NOT fire during form population (it would clear model_combo
-        # and cause unnecessary side effects)
+        # LLM tab
         self.provider_combo.blockSignals(True)
         provider_idx = self.provider_combo.findText(workspace.config.llm_provider)
         if provider_idx >= 0:
             self.provider_combo.setCurrentIndex(provider_idx)
         self.provider_combo.blockSignals(False)
-        
-        # Manually refresh model defaults for the provider (since we blocked the signal)
         self._on_provider_changed(workspace.config.llm_provider)
-        
-        # Set model in combo box
-        model_text = workspace.config.llm_model
-        idx = self.model_combo.findText(model_text)
-        if idx >= 0:
-            self.model_combo.setCurrentIndex(idx)
-        else:
+        model_text = (workspace.config.llm_model or "").strip()
+        if model_text:
+            self.model_combo.blockSignals(True)
+            idx = self.model_combo.findText(model_text, Qt.MatchFlag.MatchExactly)
+            if idx >= 0:
+                self.model_combo.setCurrentIndex(idx)
+            else:
+                self.model_combo.insertItem(0, model_text)
+                self.model_combo.setCurrentIndex(0)
             self.model_combo.setCurrentText(model_text)
+            self.model_combo.blockSignals(False)
         self.temp_spin.setValue(workspace.config.temperature)
         self.max_tokens_spin.setValue(workspace.config.max_tokens)
         self.max_session_spin.setValue(getattr(workspace.config, "max_session_messages", 20))
         self.use_agents_sdk_cb.setChecked(getattr(workspace.config, "use_agents_sdk", False))
         self.max_turns_spin.setValue(getattr(workspace.config, "agents_sdk_max_turns", 25))
         self._update_max_tokens_from_model()
-
         # Prompt tab
         self.prompt_input.setText(workspace.config.system_prompt)
-        
-        # API Keys tab
-        self.openai_key_input.setText(workspace.config.openai_api_key or "")
-        self.anthropic_key_input.setText(workspace.config.anthropic_api_key or "")
-        self.openrouter_key_input.setText(workspace.config.openrouter_api_key or "")
-        
-        # Swarm tab
-        self.enable_inter_agent_cb.setChecked(getattr(workspace.config, "enable_inter_agent", False))
-        self.inter_agent_channel_input.setText((workspace.config.inter_agent_channel or "").strip())
-        self.use_shared_memory_cb.setChecked(getattr(workspace.config, "use_shared_memory", False))
-        self.swarm_auto_delegate_cb.setChecked(getattr(workspace.config, "swarm_auto_delegate", False))
-        self.swarm_consensus_cb.setChecked(getattr(workspace.config, "swarm_consensus", False))
-        self.subagents_enabled_cb.setChecked(getattr(workspace.config, "subagents_enabled", False))
-        self.subagents_max_depth_spin.setValue(max(1, min(5, getattr(workspace.config, "subagents_max_depth", 2))))
-        self.subagents_max_children_spin.setValue(max(1, min(20, getattr(workspace.config, "subagents_max_children", 5))))
-        self.subagents_timeout_spin.setValue(max(0, getattr(workspace.config, "subagents_run_timeout_seconds", 0) or 0))
-        self.proactive_habits_cb.setChecked(getattr(workspace.config, "proactive_habits", False))
-        self.proactive_screen_cb.setChecked(getattr(workspace.config, "proactive_screen", False))
-        self.proactive_autonomy_cb.setChecked(getattr(workspace.config, "proactive_autonomy", False))
-        self.proactive_autonomy_interval_spin.setValue(max(5, min(60, getattr(workspace.config, "proactive_autonomy_interval_minutes", 15) or 15)))
-        self.proactive_file_triggers_cb.setChecked(getattr(workspace.config, "proactive_file_triggers", False))
-        
+        # API Keys tab (dynamic rows)
+        for provider_id, le in self.api_key_inputs.items():
+            config_key = self._provider_id_to_config_key(provider_id)
+            le.setText((getattr(workspace.config, config_key, None) or ""))
+        # Swarm tab (each workspace has its own config; read from this workspace)
+        cfg = workspace.config
+        self.enable_inter_agent_cb.setChecked(getattr(cfg, "enable_inter_agent", False))
+        self.inter_agent_channel_input.setText((getattr(cfg, "inter_agent_channel", None) or "").strip())
+        self.use_shared_memory_cb.setChecked(getattr(cfg, "use_shared_memory", False))
+        self.swarm_auto_delegate_cb.setChecked(getattr(cfg, "swarm_auto_delegate", False))
+        self.swarm_consensus_cb.setChecked(getattr(cfg, "swarm_consensus", False))
+        self.subagents_enabled_cb.setChecked(getattr(cfg, "subagents_enabled", False))
+        self.subagents_max_depth_spin.setValue(max(1, min(5, getattr(cfg, "subagents_max_depth", 2))))
+        self.subagents_max_children_spin.setValue(max(1, min(20, getattr(cfg, "subagents_max_children", 5))))
+        self.subagents_timeout_spin.setValue(max(0, getattr(cfg, "subagents_run_timeout_seconds", 0) or 0))
+        self.proactive_habits_cb.setChecked(getattr(cfg, "proactive_habits", False))
+        self.proactive_screen_cb.setChecked(getattr(cfg, "proactive_screen", False))
+        self.proactive_autonomy_cb.setChecked(getattr(cfg, "proactive_autonomy", False))
+        self.proactive_autonomy_interval_spin.setValue(max(5, min(60, getattr(cfg, "proactive_autonomy_interval_minutes", 15) or 15)))
+        self.proactive_file_triggers_cb.setChecked(getattr(cfg, "proactive_file_triggers", False))
         # Metrics tab
         self.avg_time_lbl.setText(f"{workspace.avg_response_time_ms:.1f} ms")
         self.total_tokens_lbl.setText(f"{workspace.total_tokens:,}")
@@ -642,12 +676,21 @@ class WorkspaceDialog(QDialog):
         )
         self.messages_lbl.setText(str(workspace.message_count))
         self.session_lbl.setText(str(workspace.session_count))
-        
-        # Update button state
+        # Button state
         is_active = workspace.id == self.manager.active_workspace_id
         self.switch_btn.setEnabled(not is_active)
         self.switch_btn.setText("✓ Active Workspace" if is_active else "🔄 Switch to This Workspace")
         self.delete_btn.setEnabled(not workspace.is_default)
+
+    def on_workspace_selected(self, current, previous):
+        """Handle workspace selection"""
+        if not current:
+            return
+        workspace_id = current.data(Qt.ItemDataRole.UserRole)
+        workspace = self.manager.get_workspace(workspace_id)
+        if not workspace:
+            return
+        self._set_form_from_workspace(workspace)
 
     def _browse_avatar_path(self):
         """Open file dialog to pick an avatar image and set the Avatar path."""
@@ -689,38 +732,49 @@ class WorkspaceDialog(QDialog):
                     break
     
     def save_workspace(self):
-        """Save workspace changes"""
+        """Save workspace changes in a background thread so the UI stays responsive."""
+        if getattr(self, "_saving_workspace", False):
+            return
         workspace_id = self.get_selected_workspace_id()
         if not workspace_id:
+            QMessageBox.warning(
+                self,
+                "No workspace selected",
+                "Please select a workspace in the list, then click Save Changes.",
+            )
             return
-        
-        # Flush any pending UI events so that checkbox / widget states
-        # are fully up-to-date before we read them.  Without this,
-        # rapidly clicking a checkbox then Save can read stale isChecked()
-        # values because the checkbox click event hasn't propagated yet.
+
+        self._saving_workspace = True
+        self.save_btn.setText("Saving...")
+        self.save_btn.setEnabled(False)
         QApplication.processEvents()
-        
-        # Collect ALL values from the form FIRST, before any save calls
-        # that might trigger signals / refresh_list / on_workspace_selected
-        # and overwrite widget state.
+
         name = self.name_input.text()
         description = self.desc_input.toPlainText()
         icon = self.icon_input.text() or "🤖"
         color = self.color_input.text() or "#007AFF"
         avatar_path = self.avatar_path_input.text().strip() or None
-        
+
+        # Persist model: prefer current selection text so dropdown choice is never lost
+        idx = self.model_combo.currentIndex()
+        model_value = ""
+        if idx >= 0:
+            model_value = self.model_combo.itemText(idx).strip()
+        if not model_value:
+            model_value = self.model_combo.currentText().strip()
+        ws = self.manager.get_workspace(workspace_id)
+        if not model_value and ws and ws.config:
+            model_value = getattr(ws.config, "llm_model", "") or ""
         config_updates = {
             "llm_provider": self.provider_combo.currentText(),
-            "llm_model": self.model_combo.currentText(),
+            "llm_model": model_value,
             "temperature": self.temp_spin.value(),
             "max_tokens": self.max_tokens_spin.value(),
             "max_session_messages": self.max_session_spin.value(),
             "use_agents_sdk": self.use_agents_sdk_cb.isChecked(),
             "agents_sdk_max_turns": self.max_turns_spin.value(),
             "system_prompt": self.prompt_input.toPlainText(),
-            "openai_api_key": self.openai_key_input.text() or None,
-            "anthropic_api_key": self.anthropic_key_input.text() or None,
-            "openrouter_api_key": self.openrouter_key_input.text() or None,
+            **{self._provider_id_to_config_key(pid): (le.text() or None) for pid, le in self.api_key_inputs.items()},
             "enable_inter_agent": self.enable_inter_agent_cb.isChecked(),
             "inter_agent_channel": self.inter_agent_channel_input.text().strip() or None,
             "use_shared_memory": self.use_shared_memory_cb.isChecked(),
@@ -736,23 +790,45 @@ class WorkspaceDialog(QDialog):
             "proactive_autonomy_interval_minutes": self.proactive_autonomy_interval_spin.value(),
             "proactive_file_triggers": self.proactive_file_triggers_cb.isChecked(),
         }
-        
-        # Now perform the saves using the captured values
-        self.manager.update_workspace(
+
+        self._save_worker = SaveWorkspaceWorker(
+            self.manager,
             workspace_id,
-            name=name,
-            description=description,
-            icon=icon,
-            color=color,
-            avatar_path=avatar_path,
+            name,
+            description,
+            icon,
+            color,
+            avatar_path,
+            config_updates,
+            self,
         )
-        
-        self.manager.update_workspace_config(workspace_id, config_updates)
-        
-        # Re-select the same workspace (not just the active one)
+        self._save_worker.finished.connect(self._on_save_workspace_finished)
+        self._save_worker.error.connect(self._on_save_workspace_error)
+        self._save_worker.finished.connect(self._save_worker.deleteLater)
+        self._save_worker.error.connect(self._save_worker.deleteLater)
+        self._save_worker.start()
+
+    def _on_save_workspace_finished(self, workspace_id: str):
+        """Called on main thread when background save succeeded."""
+        self._saving_workspace = False
+        self.save_btn.setText("💾 Save Changes")
+        self.save_btn.setEnabled(True)
+        updated = self.manager.get_workspace(workspace_id)
+        if updated:
+            self._set_form_from_workspace(updated)
         self.refresh_list(select_workspace_id=workspace_id)
         self.workspace_config_saved.emit(workspace_id)
         QMessageBox.information(self, "Saved", "Workspace saved successfully.")
+
+    def _on_save_workspace_error(self, message: str):
+        """Called on main thread when background save failed."""
+        self._saving_workspace = False
+        self.save_btn.setText("💾 Save Changes")
+        self.save_btn.setEnabled(True)
+        if "not found" in message.lower():
+            QMessageBox.warning(self, "Save failed", "Workspace not found.")
+        else:
+            QMessageBox.critical(self, "Save failed", f"Could not save workspace:\n{message}")
     
     def switch_workspace(self):
         """Switch to the selected workspace"""
@@ -878,6 +954,77 @@ class WorkspaceDialog(QDialog):
         if new_workspace:
             self.refresh_list()
     
+    def _refresh_provider_combo(self):
+        """Populate provider combo from LLM router so cursor and custom providers appear."""
+        preferred = ["ollama", "lmstudio", "lmstudio_v1", "openai", "anthropic", "openrouter", "cursor"]
+        if self._llm_router and getattr(self._llm_router, "providers", None):
+            providers = list(self._llm_router.providers.keys())
+            ordered = [p for p in preferred if p in providers]
+            ordered += [p for p in providers if p not in preferred]
+        else:
+            ordered = preferred.copy()
+        current = self.provider_combo.currentText() if self.provider_combo.count() else None
+        self.provider_combo.clear()
+        self.provider_combo.addItems(ordered)
+        if current and self.provider_combo.findText(current) >= 0:
+            self.provider_combo.setCurrentText(current)
+
+    @staticmethod
+    def _provider_id_to_config_key(provider_id: str) -> str:
+        """Map provider id (from workspace_api_key_providers) to WorkspaceConfig attribute name."""
+        return {
+            "openai": "openai_api_key",
+            "anthropic": "anthropic_api_key",
+            "openrouter": "openrouter_api_key",
+            "cursor": "cursor_api_key",
+        }.get(provider_id, "custom_provider_api_key")
+
+    @staticmethod
+    def _provider_id_to_label(provider_id: str) -> str:
+        """Display label for API key row (e.g. 'OpenAI Key', 'Cursor Key')."""
+        labels = {
+            "openai": "OpenAI Key",
+            "anthropic": "Anthropic Key",
+            "openrouter": "OpenRouter Key",
+            "cursor": "Cursor Key",
+        }
+        if provider_id in labels:
+            return labels[provider_id] + ":"
+        return f"{provider_id} Key:"
+
+    def _build_api_keys_tab(self):
+        """(Re)build API Keys tab rows from Preferences → workspace_api_key_providers."""
+        # Clear existing rows (do not call deleteLater on widgets - layout releases them; avoid use-after-free)
+        while self.api_keys_layout.rowCount() > 0:
+            self.api_keys_layout.removeRow(0)
+        self.api_key_inputs.clear()
+        # Get list from settings (parent = main window)
+        providers: list[str] = []
+        parent = self.parent()
+        if parent and getattr(parent, "settings", None):
+            raw = getattr(parent.settings, "workspace_api_key_providers", "") or ""
+            providers = [p.strip() for p in raw.split(",") if p.strip()]
+        if not providers:
+            providers = ["openai", "anthropic", "openrouter", "cursor"]
+        for provider_id in providers:
+            le = QLineEdit()
+            le.setEchoMode(QLineEdit.EchoMode.Password)
+            le.setPlaceholderText("Leave empty to use global setting")
+            self.api_keys_layout.addRow(self._provider_id_to_label(provider_id), le)
+            self.api_key_inputs[provider_id] = le
+
+    def showEvent(self, event):
+        """Refresh provider list and reload workspaces from disk so saved model/options are shown."""
+        super().showEvent(event)
+        if hasattr(self, "manager") and self.manager is not None:
+            self.manager.reload_from_disk()
+        if hasattr(self, "provider_combo") and self.provider_combo is not None:
+            self._refresh_provider_combo()
+        if hasattr(self, "workspace_list") and self.workspace_list is not None:
+            self.refresh_list()
+        # Do not rebuild API Keys tab here: it runs after refresh_list() has filled the form,
+        # and modifying the layout during show can crash. Tab is built once in setup_ui.
+
     def _on_provider_changed(self, provider: str):
         """Handle provider change - refresh model list"""
         self.model_combo.clear()
@@ -885,12 +1032,20 @@ class WorkspaceDialog(QDialog):
         default_models = {
             "ollama": ["llama3.2", "llama3.1", "mistral", "codellama", "phi3"],
             "lmstudio": [],  # Will be populated by refresh
+            "lmstudio_v1": [],  # Will be populated by refresh
             "openai": ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo"],
             "anthropic": ["claude-sonnet-4-5-20250929", "claude-opus-4-6", "claude-haiku-4-5-20251001"],
             "openrouter": ["openai/gpt-4o", "anthropic/claude-3.5-sonnet", "google/gemini-pro"],
+            "cursor": ["cursor-default", "gpt-4o", "gpt-4o-mini", "claude-3.5-sonnet"],
         }
         if provider in default_models:
             self.model_combo.addItems(default_models[provider])
+        else:
+            # Custom or other named provider: use router default model if set
+            if self._llm_router and getattr(self._llm_router, "provider_models", None) and provider in self._llm_router.provider_models:
+                model = self._llm_router.provider_models[provider]
+                if model:
+                    self.model_combo.addItem(model)
         self._update_max_tokens_from_model()
     
     def _refresh_models(self):
@@ -904,6 +1059,8 @@ class WorkspaceDialog(QDialog):
                 self._fetch_ollama_models()
             elif provider == "lmstudio":
                 self._fetch_lmstudio_models()
+            elif provider == "lmstudio_v1":
+                self._fetch_lmstudio_v1_models()
             elif provider == "openai":
                 self._fetch_openai_models()
             else:
@@ -974,7 +1131,31 @@ class WorkspaceDialog(QDialog):
             self._update_max_tokens_from_model()
         except Exception as e:
             QMessageBox.warning(self, "LM Studio Error", f"Could not fetch models from LM Studio:\n{str(e)}\n\nUse Settings → LLM Providers to set the LM Studio URL, then try again.")
-    
+
+    def _fetch_lmstudio_v1_models(self):
+        """Fetch models from LM Studio v1 API using Settings → lmstudio_v1_url."""
+        try:
+            url = "http://localhost:1234"
+            parent = self.parent()
+            if parent and hasattr(parent, "settings"):
+                url = (getattr(parent.settings, "lmstudio_v1_url", "") or "").strip() or url
+            provider = LMStudioV1Provider(url)
+            from grizzyclaw.utils.async_runner import run_async
+            models_data = run_async(provider.list_models())
+            models = [m.get("id") or m.get("name", "") for m in models_data if isinstance(m, dict)]
+            models = [m for m in models if m]
+            current = self.model_combo.currentText()
+            self.model_combo.clear()
+            self.model_combo.addItems(models)
+            if current and current in models:
+                self.model_combo.setCurrentText(current)
+            elif current:
+                self.model_combo.setCurrentText(current)
+            self.model_combo.setFocus()
+            self._update_max_tokens_from_model()
+        except Exception as e:
+            QMessageBox.warning(self, "LM Studio v1 Error", f"Could not fetch models from LM Studio v1:\n{str(e)}\n\nEnable LM Studio v1 in Settings → Integrations and set the v1 URL.")
+
     def _on_model_changed(self):
         """When model changes, update max tokens spinbox ceiling from provider query (Ollama/LM Studio)."""
         self._update_max_tokens_from_model()

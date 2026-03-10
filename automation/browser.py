@@ -4,13 +4,29 @@ import asyncio
 import base64
 import logging
 import os
+import re
 import sys
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+# Default screenshot directory: temp only (no persistent save); user can Save from Visual Canvas if desired.
+DEFAULT_SCREENSHOTS_DIR = Path(tempfile.gettempdir()) / "grizzyclaw_screenshots"
+
 logger = logging.getLogger(__name__)
+
+
+def _slug_for_filename(title: str, max_len: int = 48) -> str:
+    """Turn a page title into a safe filename stem (e.g. 'Fox News' -> 'fox_news')."""
+    if not title or not title.strip():
+        return ""
+    s = re.sub(r"[^\w\s-]", "", title.strip())
+    s = re.sub(r"[-\s]+", "_", s).strip("_").lower()
+    if not s:
+        return ""
+    return s[:max_len] if len(s) > max_len else s
 
 # System Playwright driver path (found at runtime)
 _SYSTEM_PLAYWRIGHT_DRIVER = None
@@ -143,17 +159,16 @@ class BrowserAutomation:
     """
 
     def __init__(self, headless: bool = True, screenshots_dir: str = None):
-        """Initialize browser automation
-        
-        Args:
-            headless: Run browser in headless mode (no visible window)
-            screenshots_dir: Directory to save screenshots (default: ~/.grizzyclaw/screenshots)
+        """Initialize browser automation.
+
+        Screenshots go to a temp directory by default so nothing is saved to disk
+        except when the user saves from the Visual Canvas.
         """
         if not PLAYWRIGHT_AVAILABLE:
             raise RuntimeError("Playwright not installed. Run: pip install playwright && playwright install chromium")
         
         self.headless = headless
-        self.screenshots_dir = Path(screenshots_dir or Path.home() / ".grizzyclaw" / "screenshots")
+        self.screenshots_dir = Path(screenshots_dir) if screenshots_dir else DEFAULT_SCREENSHOTS_DIR
         self.screenshots_dir.mkdir(parents=True, exist_ok=True)
         
         self._playwright = None
@@ -171,7 +186,15 @@ class BrowserAutomation:
         self._playwright = await async_playwright().start()
         self._browser = await self._playwright.chromium.launch(
             headless=self.headless,
-            args=['--disable-blink-features=AutomationControlled']
+            args=[
+                '--disable-blink-features=AutomationControlled',
+                '--no-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-gpu',
+                '--disable-software-rasterizer',
+                '--disable-extensions',
+                '--window-size=1280,800',
+            ]
         )
         self._context = await self._browser.new_context(
             viewport={'width': 1280, 'height': 800},
@@ -208,30 +231,44 @@ class BrowserAutomation:
         if not self._started:
             await self.start()
 
-    async def navigate(self, url: str, wait_for: str = "load", timeout: int = 30000) -> BrowserResult:
-        """Navigate to a URL
-        
+    async def navigate(
+        self,
+        url: str,
+        wait_for: str = "load",
+        timeout: int = 30000,
+        for_screenshot: bool = False,
+    ) -> BrowserResult:
+        """Navigate to a URL.
+
         Args:
             url: URL to navigate to
             wait_for: Wait condition ('load', 'domcontentloaded', 'networkidle')
             timeout: Timeout in milliseconds
-            
-        Returns:
-            BrowserResult with page info
+            for_screenshot: If True, use networkidle and extra settle time so screenshot captures painted content
         """
         await self._ensure_started()
-        
+        if for_screenshot:
+            wait_for = "networkidle"
+            timeout = min(timeout, 20000)
         try:
-            await self._page.goto(url, wait_until=wait_for, timeout=timeout)
+            try:
+                await self._page.goto(url, wait_until=wait_for, timeout=timeout)
+            except Exception as nav_err:
+                if for_screenshot:
+                    logger.info("networkidle timed out, retrying with load: %s", nav_err)
+                    await self._page.goto(url, wait_until="load", timeout=15000)
+                else:
+                    raise
             title = await self._page.title()
             current_url = self._page.url
-            
+            if for_screenshot:
+                await asyncio.sleep(2.0)
             logger.info(f"Navigated to: {current_url} - {title}")
             return BrowserResult(
                 success=True,
                 action="navigate",
                 url=current_url,
-                title=title
+                title=title,
             )
         except Exception as e:
             logger.error(f"Navigation failed: {e}")
@@ -239,25 +276,53 @@ class BrowserAutomation:
                 success=False,
                 action="navigate",
                 url=url,
-                error=str(e)
+                error=str(e),
             )
 
     async def screenshot(self, full_page: bool = False, element_selector: str = None) -> BrowserResult:
-        """Take a screenshot
-        
-        Args:
-            full_page: Capture full scrollable page
-            element_selector: Optional CSS selector to screenshot specific element
-            
-        Returns:
-            BrowserResult with screenshot path and base64
+        """Take a screenshot.
+
+        Refuses to capture about:blank so the Visual Canvas never shows a blank image.
+        Waits for page load state and repaint to reduce blank headless captures.
         """
         await self._ensure_started()
-        
+
         try:
+            current_url = (self._page.url or "").strip()
+            if not current_url or current_url in ("about:blank", "about:blank/"):
+                return BrowserResult(
+                    success=False,
+                    action="screenshot",
+                    error="No page loaded. Navigate to a URL first (e.g. navigate then screenshot in the same request), then take a screenshot."
+                )
+
+            # Wait for page to settle (OpenClaw-style: screenshot only after page has loaded)
+            try:
+                await self._page.wait_for_load_state("networkidle", timeout=10000)
+            except Exception:
+                try:
+                    await self._page.wait_for_load_state("load", timeout=5000)
+                except Exception:
+                    pass
+
+            # Wait for body visible and force repaint to avoid blank screenshots in headless
+            try:
+                await self._page.wait_for_selector("body", state="visible", timeout=5000)
+            except Exception:
+                pass
+            await self._page.evaluate("() => { document.body.offsetHeight; requestAnimationFrame(() => {}); }")
+            await asyncio.sleep(1.2)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"screenshot_{timestamp}.png"
+            try:
+                page_title = await self._page.title()
+                slug = _slug_for_filename(page_title or "")
+                filename = f"{slug}.png" if slug else f"screenshot_{timestamp}.png"
+            except Exception:
+                filename = f"screenshot_{timestamp}.png"
+            # Avoid overwriting: if file exists, append timestamp
             filepath = self.screenshots_dir / filename
+            if filepath.exists():
+                filepath = self.screenshots_dir / f"{filepath.stem}_{timestamp}.png"
             
             if element_selector:
                 element = await self._page.query_selector(element_selector)

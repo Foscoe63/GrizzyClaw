@@ -6,10 +6,13 @@ from typing import Any, Dict, Optional
 from PyQt6.QtWidgets import (
     QWidget,
     QVBoxLayout,
+    QHBoxLayout,
     QLabel,
     QFrame,
+    QPushButton,
     QScrollArea,
     QSizePolicy,
+    QFileDialog,
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QFont, QPixmap
@@ -27,10 +30,37 @@ class CanvasWidget(QWidget):
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
 
+        header_row = QHBoxLayout()
+        header_row.setContentsMargins(0, 0, 0, 0)
         header = QLabel("Visual Canvas")
         header.setFont(QFont("-apple-system", 16, QFont.Weight.Bold))
         header.setStyleSheet("color: #1C1C1E;")
-        layout.addWidget(header)
+        header_row.addWidget(header)
+        header_row.addStretch()
+        _btn_style = (
+            "QPushButton { background-color: #E5E5EA; color: #1C1C1E; border: none; "
+            "border-radius: 6px; padding: 6px 12px; font-size: 13px; }"
+            "QPushButton:hover { background-color: #D1D1D6; }"
+            "QPushButton:pressed { background-color: #C6C6C8; }"
+        )
+        self.load_btn = QPushButton("Load")
+        self.load_btn.setStyleSheet(_btn_style)
+        self.load_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.load_btn.setToolTip("Load an image from file")
+        self.load_btn.clicked.connect(self._load_canvas)
+        header_row.addWidget(self.load_btn)
+        self.save_btn = QPushButton("Save")
+        self.save_btn.setStyleSheet(_btn_style)
+        self.save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.save_btn.setToolTip("Save canvas content as PNG")
+        self.save_btn.clicked.connect(self._save_canvas)
+        header_row.addWidget(self.save_btn)
+        self.clear_btn = QPushButton("Clear")
+        self.clear_btn.setStyleSheet(_btn_style)
+        self.clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.clear_btn.clicked.connect(self.clear)
+        header_row.addWidget(self.clear_btn)
+        layout.addLayout(header_row)
 
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
@@ -47,13 +77,13 @@ class CanvasWidget(QWidget):
         self.content = QWidget()
         self.content.setMinimumHeight(320)
         self.content_layout = QVBoxLayout(self.content)
-        self.content_layout.setContentsMargins(24, 24, 24, 24)
+        self.content_layout.setContentsMargins(24, 32, 24, 32)
         self.content_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.content_layout.setSpacing(12)
 
         self.placeholder = QLabel(
-            "Images from browser screenshots,\n"
-            "attachments, or generated content\n"
+            "Images (screenshots, attachments),\n"
+            "A2UI cards/diagrams, and inline images\n"
             "will appear here."
         )
         self.placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -63,7 +93,7 @@ class CanvasWidget(QWidget):
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum
         )
         self.placeholder.setStyleSheet(
-            "color: #8E8E93; padding: 80px 48px;"
+            "color: #8E8E93; padding: 48px 48px 48px 48px; margin: 12px 0;"
         )
         self.placeholder.setWordWrap(True)
         self.content_layout.addWidget(self.placeholder)
@@ -84,6 +114,8 @@ class CanvasWidget(QWidget):
         label.setPixmap(pixmap.scaled(600, 400, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.content_layout.insertWidget(0, label)
+        self.content.update()
+        self.scroll.viewport().update()
         return True
 
     def display_pixmap(self, pixmap: QPixmap) -> None:
@@ -116,3 +148,37 @@ class CanvasWidget(QWidget):
             if item.widget():
                 item.widget().deleteLater()
         self.placeholder.show()
+
+    def _save_canvas(self) -> None:
+        """Save current canvas content as a PNG image."""
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Canvas",
+            "",
+            "PNG (*.png);;All Files (*)",
+        )
+        if not path:
+            return
+        pixmap = self.content.grab()
+        if pixmap.isNull():
+            return
+        if not pixmap.save(path):
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self,
+                "Save Canvas",
+                "Could not save the image to the selected path.",
+            )
+
+    def _load_canvas(self) -> None:
+        """Load an image from file and display it on the canvas."""
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load Image",
+            "",
+            "Images (*.png *.jpg *.jpeg *.gif *.webp);;All Files (*)",
+        )
+        if not path:
+            return
+        self.clear()
+        self.display_image(path)

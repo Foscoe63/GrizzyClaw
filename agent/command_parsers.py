@@ -59,9 +59,59 @@ def extract_balanced_brace_dumb(s: str, start: int) -> Optional[tuple[int, int]]
             depth += 1
         elif s[i] == "}":
             depth -= 1
+        if depth == 0:
+            return (start, i + 1)
+    return None
+
+
+def extract_balanced_bracket(s: str, start: int) -> Optional[tuple[int, int]]:
+    """From index of '[', return (start, end) of matching ']' (handles nesting)."""
+    if start < 0 or start >= len(s) or s[start] != "[":
+        return None
+    depth = 0
+    i = start
+    in_string = None
+    escape = False
+    while i < len(s):
+        c = s[i]
+        if escape:
+            escape = False
+            i += 1
+            continue
+        if in_string:
+            if c == in_string:
+                in_string = None
+            elif c == "\\":
+                escape = True
+            i += 1
+            continue
+        if c in ('"', "'"):
+            in_string = c
+            i += 1
+            continue
+        if c == "[":
+            depth += 1
+        elif c == "]":
+            depth -= 1
             if depth == 0:
                 return (start, i + 1)
+        i += 1
     return None
+
+
+def find_json_array_blocks(text: str, prefix: str) -> list[str]:
+    """Find all PREFIX = [ ... ] with balanced brackets (for BROWSER_ACTION = [ {...}, {...} ])."""
+    pattern = re.compile(
+        re.escape(prefix) + r"\s*=\s*(?:```(?:json)?\s*)?\[",
+        re.IGNORECASE,
+    )
+    blocks: list[str] = []
+    for m in pattern.finditer(text):
+        bracket_start = m.end() - 1
+        pair = extract_balanced_bracket(text, bracket_start)
+        if pair:
+            blocks.append(text[pair[0] : pair[1]])
+    return blocks
 
 
 def find_json_blocks(text: str, prefix: str) -> list[str]:
@@ -377,13 +427,60 @@ def strip_code_fence(s: str) -> str:
     return s.strip()
 
 
+def _fix_literal_control_chars_in_json_strings(s: str) -> str:
+    """Replace literal (unescaped) newlines, tabs, and carriage returns inside JSON string
+    values with their proper JSON escape sequences. This prevents JSONDecodeError when the LLM
+    embeds multi-line file content directly in a JSON string without escaping it.
+
+    We use a state machine rather than a simple regex so we handle nested quotes correctly."""
+    out: list[str] = []
+    i = 0
+    n = len(s)
+    in_string = False
+    escape_next = False
+    while i < n:
+        c = s[i]
+        if escape_next:
+            escape_next = False
+            out.append(c)
+            i += 1
+            continue
+        if c == '\\' and in_string:
+            escape_next = True
+            out.append(c)
+            i += 1
+            continue
+        if c == '"':
+            in_string = not in_string
+            out.append(c)
+            i += 1
+            continue
+        if in_string:
+            if c == '\n':
+                out.append('\\n')
+            elif c == '\r':
+                out.append('\\r')
+            elif c == '\t':
+                out.append('\\t')
+            else:
+                out.append(c)
+        else:
+            out.append(c)
+        i += 1
+    return ''.join(out)
+
+
 def normalize_llm_json(s: str) -> str:
     """Fix common LLM JSON: backslashes before quotes, smart quotes, code fences, double braces."""
     s = strip_code_fence(s)
     s = strip_json_comments(s)
-    # Fix double braces {{ }} -> { } (LLMs copy from escaped prompt templates)
+    # Fix literal unescaped newlines/tabs/carriage-returns inside JSON strings.
+    # This is the most common reason write_file TOOL_CALLs fail to parse: the LLM
+    # puts multi-line file content in the JSON value without escaping newlines as \\n.
+    s = _fix_literal_control_chars_in_json_strings(s)
+    # Fix double opening braces '{{' -> '{' (LLMs copy from escaped prompt templates).
+    # Do NOT collapse '}}' because adjacent closing braces are valid JSON when closing nested objects.
     s = re.sub(r'\{\{', '{', s)
-    s = re.sub(r'\}\}', '}', s)
     # Normalize all Unicode quote chars to ASCII (models often emit „ " " etc.)
     for _o, _r in [
         ("\u201c", '"'), ("\u201d", '"'), ("\u201e", '"'), ("\u201f", '"'),
@@ -465,3 +562,90 @@ def repair_json_single_quotes(s: str) -> str:
         out.append(c)
         i += 1
     return "".join(out)
+
+
+def _find_balanced_brace_in_text(s: str, brace_start: int) -> tuple[int, int] | None:
+    """Wrapper around extract_balanced_brace that tolerates minor issues.
+
+    Returns (start, end) indices for the JSON object starting at brace_start.
+    """
+    try:
+        pair = extract_balanced_brace(s, brace_start)
+        if pair is None:
+            pair = extract_balanced_brace_dumb(s, brace_start)
+        return pair
+    except Exception:
+        return None
+
+
+def _last_unescaped_quote_before(s: str, start: int, end: int) -> int | None:
+    """Find the last unescaped double-quote in s between [start, end)."""
+    i = end - 1
+    while i > start:
+        if s[i] == '"':
+            # count preceding backslashes
+            bs = 0
+            j = i - 1
+            while j >= start and s[j] == '\\':
+                bs += 1
+                j -= 1
+            if bs % 2 == 0:  # not escaped
+                return i
+        i -= 1
+    return None
+
+
+def repair_tool_call_content_string(s: str) -> str:
+    """Attempt to repair common invalid TOOL_CALL JSON where arguments.content contains
+    raw newlines and/or unescaped double quotes.
+
+    Strategy:
+    - Locate the arguments object using a balanced-brace scan.
+    - Within it, locate the content key and its starting quote.
+    - Determine the end of the content value as the last unescaped quote before the next key
+      (",\s*"key":) or before the end of the arguments object.
+    - JSON-escape the raw substring and splice it back.
+
+    This is a best-effort fix used only after a strict parse fails.
+    """
+    try:
+        m_args = re.search(r'"arguments"\s*:\s*\{', s)
+        if not m_args:
+            return s
+        brace_start = m_args.end() - 1  # points at '{'
+        pair = _find_balanced_brace_in_text(s, brace_start)
+        if not pair:
+            return s
+        arg_s, arg_e = pair
+        args_block = s[arg_s:arg_e]
+
+        m_content = re.search(r'"content"\s*:\s*', args_block)
+        if not m_content:
+            return s
+        vs = m_content.end()
+        # Skip whitespace
+        while vs < len(args_block) and args_block[vs] in ' \t\r\n':
+            vs += 1
+        if vs >= len(args_block) or args_block[vs] != '"':
+            return s
+        v_start = vs  # index of opening quote within args_block
+
+        # Find next key after content in the arguments object
+        next_key_m = re.search(r',\s*"[A-Za-z0-9_]+"\s*:', args_block[v_start + 1 :])
+        boundary_in_args = (v_start + 1 + next_key_m.start()) if next_key_m else (len(args_block) - 1)
+
+        v_end_rel = _last_unescaped_quote_before(args_block, v_start + 1, boundary_in_args)
+        if v_end_rel is None:
+            # As a fallback, also allow the quote right before the closing brace
+            v_end_rel = _last_unescaped_quote_before(args_block, v_start + 1, len(args_block) - 0)
+            if v_end_rel is None:
+                return s
+
+        raw_content = args_block[v_start + 1 : v_end_rel]
+        # JSON-escape using json.dumps and strip surrounding quotes
+        escaped_content = json.dumps(raw_content)[1:-1]
+        # Splice back
+        repaired_args = args_block[:v_start] + '"' + escaped_content + '"' + args_block[v_end_rel + 1 :]
+        return s[:arg_s] + repaired_args + s[arg_e:]
+    except Exception:
+        return s

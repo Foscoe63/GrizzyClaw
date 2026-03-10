@@ -51,6 +51,12 @@ class Settings(BaseSettings):
     lmstudio_url: str = Field(default="http://localhost:1234/v1", alias="LMSTUDIO_URL")
     lmstudio_model: str = Field(default="local-model", alias="LMSTUDIO_MODEL")
 
+    # LM Studio native v1 REST API (optional): /api/v1/chat, stateful chat, MCP via integrations
+    lmstudio_v1_enabled: bool = Field(default=False, alias="LMSTUDIO_V1_ENABLED")
+    lmstudio_v1_url: str = Field(default="http://localhost:1234", alias="LMSTUDIO_V1_URL")
+    lmstudio_v1_model: str = Field(default="", alias="LMSTUDIO_V1_MODEL")
+    lmstudio_v1_api_key: Optional[str] = Field(default=None, alias="LMSTUDIO_V1_API_KEY")
+
     openai_api_key: Optional[str] = Field(default=None, alias="OPENAI_API_KEY")
     openai_model: str = Field(default="gpt-4o", alias="OPENAI_MODEL")
 
@@ -60,9 +66,19 @@ class Settings(BaseSettings):
     openrouter_api_key: Optional[str] = Field(default=None, alias="OPENROUTER_API_KEY")
     openrouter_model: str = Field(default="openai/gpt-4o", alias="OPENROUTER_MODEL")
 
+    cursor_api_key: Optional[str] = Field(default=None, alias="CURSOR_API_KEY")
+    # Base URL for Cursor: must be an OpenAI-compatible API. api.cursor.com/v1 does NOT provide chat completions (returns 404).
+    # Use e.g. https://api.openai.com/v1 with an OpenAI key, or your proxy's base URL.
+    cursor_url: str = Field(default="", alias="CURSOR_URL")
+    cursor_model: str = Field(default="gpt-4o", alias="CURSOR_MODEL")
+
+    custom_provider_name: str = Field(default="custom", alias="CUSTOM_PROVIDER_NAME")
     custom_provider_url: Optional[str] = Field(default=None, alias="CUSTOM_PROVIDER_URL")
     custom_provider_api_key: Optional[str] = Field(default=None, alias="CUSTOM_PROVIDER_API_KEY")
     custom_provider_model: str = Field(default="", alias="CUSTOM_PROVIDER_MODEL")
+
+    # Which LLM providers get an API key field in Workspace API Keys tab (comma-separated; e.g. openai,anthropic,openrouter,cursor,custom)
+    workspace_api_key_providers: str = Field(default="openai,anthropic,openrouter,cursor", alias="WORKSPACE_API_KEY_PROVIDERS")
 
     # Default LLM settings
     default_llm_provider: str = Field(default="ollama", alias="DEFAULT_LLM_PROVIDER")
@@ -76,6 +92,10 @@ class Settings(BaseSettings):
     telegram_bot_token: Optional[str] = Field(default=None, alias="TELEGRAM_BOT_TOKEN")
     telegram_webhook_url: Optional[str] = Field(
         default=None, alias="TELEGRAM_WEBHOOK_URL"
+    )
+    telegram_proxy: Optional[str] = Field(
+        default=None, alias="TELEGRAM_PROXY",
+        description="Optional HTTP(S) or SOCKS proxy for Telegram (e.g. http://proxy:8080 or socks5://host:1080). Falls back to HTTPS_PROXY/HTTP_PROXY if unset.",
     )
     whatsapp_session_path: Optional[str] = Field(default="~/.grizzyclaw/whatsapp_session", alias="WHATSAPP_SESSION_PATH")
 
@@ -102,6 +122,16 @@ class Settings(BaseSettings):
     enabled_skills: list[str] = Field(default_factory=list, alias="ENABLED_SKILLS")
     mcp_servers_file: str = Field(default="~/.grizzyclaw/grizzyclaw.json", alias="MCP_SERVERS_FILE")
     mcp_marketplace_url: Optional[str] = Field(default=None, alias="MCP_MARKETPLACE_URL")
+    # MCP feature flags (safe defaults)
+    mcp_hot_reload_enabled: bool = Field(
+        default=True, alias="MCP_HOT_RELOAD_ENABLED"
+    )  # Watch mcp_servers_file and refresh tool cache in background
+    mcp_prompt_schemas_enabled: bool = Field(
+        default=True, alias="MCP_PROMPT_SCHEMAS_ENABLED"
+    )  # Include compact param schemas/examples for tools in the prompt when available
+    mcp_args_fail_fast: bool = Field(
+        default=False, alias="MCP_ARGS_FAIL_FAST"
+    )  # If True, fail early with a friendly message when required args are missing (otherwise let server error)
 
     # Security
     jwt_secret: str = Field(default="your-jwt-secret", alias="JWT_SECRET")

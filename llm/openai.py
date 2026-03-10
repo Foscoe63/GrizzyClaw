@@ -14,6 +14,25 @@ from . import (
 logger = logging.getLogger(__name__)
 
 
+def _extract_delta_content(data: Dict[str, Any]) -> Optional[str]:
+    """Return streamed content token from OpenAI chunk, if present."""
+    if not isinstance(data, dict):
+        return None
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return None
+    first = choices[0]
+    if not isinstance(first, dict):
+        return None
+    delta = first.get("delta")
+    if not isinstance(delta, dict):
+        return None
+    content = delta.get("content")
+    if isinstance(content, str):
+        return content
+    return None
+
+
 class OpenAIProvider(LLMProvider):
     def __init__(self, api_key: str, base_url: str = "https://api.openai.com/v1"):
         super().__init__("openai", base_url, api_key)
@@ -45,7 +64,8 @@ class OpenAIProvider(LLMProvider):
             payload["max_tokens"] = max_tokens
 
         try:
-            async with aiohttp.ClientSession() as session:
+            timeout = aiohttp.ClientTimeout(total=120)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(url, json=payload, headers=headers) as response:
                     if response.status == 401:
                         raise LLMAuthenticationError("Invalid OpenAI API key")
@@ -63,9 +83,9 @@ class OpenAIProvider(LLMProvider):
                             import json
 
                             data = json.loads(data_str)
-                            delta = data.get("choices", [{}])[0].get("delta", {})
-                            if "content" in delta:
-                                yield delta["content"]
+                            content = _extract_delta_content(data)
+                            if content is not None:
+                                yield content
         except aiohttp.ClientError as e:
             raise LLMProviderNotAvailable(f"Cannot connect to OpenAI: {e}")
 

@@ -32,6 +32,8 @@ except ImportError:
 
 # Cache for discovered tools: (mcp_file_path, mtime) -> {server_name: [(tool_name, description), ...]}
 _tools_cache: Dict[Tuple[str, float], Dict[str, List[Tuple[str, str]]]] = {}
+# Schema-aware cache (full tool objects): (mcp_file_path, mtime) -> {server_name: [{name, description, input_schema}]}
+_tools_cache_full: Dict[Tuple[str, float], Dict[str, List[Dict[str, Any]]]] = {}
 
 # Default timeout for a single tool call (seconds)
 DEFAULT_TOOL_CALL_TIMEOUT = 60
@@ -122,13 +124,20 @@ def _load_server_config(mcp_file: Path, mcp_name: str) -> Optional[Dict[str, Any
 
 
 def _load_all_servers(mcp_file: Path) -> Dict[str, Dict[str, Any]]:
-    """Load all server configs from mcpServers JSON."""
+    """Load all server configs from mcpServers JSON. Only returns servers that are enabled
+    (enabled != False). Disabled servers are excluded so they are not used by any model provider.
+    """
     if not mcp_file.exists():
         return {}
     try:
         with open(mcp_file, "r") as f:
             data = json.load(f)
-        return data.get("mcpServers", {})
+        servers = data.get("mcpServers", {})
+        return {
+            name: cfg
+            for name, cfg in servers.items()
+            if isinstance(cfg, dict) and cfg.get("enabled", True) is not False
+        }
     except Exception as e:
         logger.warning(f"Failed to load MCP config: {e}")
         return {}
@@ -161,9 +170,164 @@ async def _list_tools_stdio(config: Dict[str, Any]) -> List[Tuple[str, str]]:
         return []
 
 
+def _serialize_schema(obj: Any) -> Optional[Dict[str, Any]]:
+    """Best-effort conversion of an inputSchema object to a plain dict.
+    Returns None if schema is unavailable or cannot be serialized.
+    """
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return obj
+    # pydantic v2 model_dump/model_dump_json support
+    try:
+        if hasattr(obj, "model_dump") and callable(getattr(obj, "model_dump")):
+            return dict(obj.model_dump())  # type: ignore[arg-type]
+    except Exception:
+        pass
+    try:
+        if hasattr(obj, "model_dump_json") and callable(getattr(obj, "model_dump_json")):
+            import json as _json
+            return _json.loads(obj.model_dump_json())  # type: ignore[call-arg]
+    except Exception:
+        pass
+    # generic to_dict
+    try:
+        if hasattr(obj, "to_dict") and callable(getattr(obj, "to_dict")):
+            return dict(obj.to_dict())  # type: ignore[arg-type]
+    except Exception:
+        pass
+    # last resort: JSON round-trip via __dict__
+    try:
+        import json as _json
+        return _json.loads(_json.dumps(obj, default=lambda o: getattr(o, "__dict__", None)))
+    except Exception:
+        return None
+
+
+async def _list_tools_stdio_full(config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Connect via stdio, list tools with schemas, return [{name, description, input_schema}, ...]."""
+    cmd = config.get("command", "")
+    args_list = normalize_mcp_args(config.get("args", []))
+    if not cmd:
+        return []
+    server_params = StdioServerParameters(
+        command=cmd,
+        args=[str(a) for a in args_list],
+        env=_env_for_server(config),
+    )
+    try:
+        async with stdio_client(server_params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                tools_result = await session.list_tools()
+                out: List[Dict[str, Any]] = []
+                for t in getattr(tools_result, "tools", []):
+                    name = getattr(t, "name", str(t))
+                    desc = getattr(t, "description", "") or ""
+                    schema = _serialize_schema(getattr(t, "inputSchema", None))
+                    out.append({"name": name, "description": desc, "input_schema": schema})
+                return out
+    except Exception as e:
+        logger.debug(f"Tool discovery (full) failed (stdio): {e}")
+        return []
+    server_params = StdioServerParameters(
+        command=cmd,
+        args=[str(a) for a in args_list],
+        env=_env_for_server(config),
+    )
+    try:
+        async with stdio_client(server_params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                tools_result = await session.list_tools()
+                out = []
+                for t in getattr(tools_result, "tools", []):
+                    name = getattr(t, "name", str(t))
+                    desc = getattr(t, "description", "") or ""
+                    out.append((name, desc))
+                return out
+    except Exception as e:
+        logger.debug(f"Tool discovery failed (stdio): {e}")
+        return []
+
+
 async def _list_tools_http(config: Dict[str, Any]) -> List[Tuple[str, str]]:
     """Connect via streamable HTTP, list tools, return [(name, description), ...]."""
     if not STREAMABLE_HTTP_AVAILABLE:
+        return []
+    mcp_url = _get_mcp_url(config)
+    if not mcp_url:
+        return []
+    headers = config.get("headers") or {}
+    if isinstance(headers, str):
+        try:
+            headers = json.loads(headers) if headers else {}
+        except json.JSONDecodeError:
+            headers = {}
+    try:
+        import httpx
+
+        # Allow moderate connection pooling for repeated calls
+        async with httpx.AsyncClient(
+            headers=headers,
+            timeout=httpx.Timeout(15.0),
+        ) as http_client:
+            async with streamable_http_client(mcp_url, http_client=http_client) as (
+                read,
+                write,
+                _,
+            ):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    tools_result = await session.list_tools()
+                    out = []
+                    for t in getattr(tools_result, "tools", []):
+                        name = getattr(t, "name", str(t))
+                        desc = getattr(t, "description", "") or ""
+                        out.append((name, desc))
+                    return out
+    except Exception as e:
+        logger.debug(f"Tool discovery failed (http): {e}")
+        return []
+
+
+async def _list_tools_http_full(config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Connect via streamable HTTP, list tools with schemas."""
+    if not STREAMABLE_HTTP_AVAILABLE:
+        return []
+    mcp_url = _get_mcp_url(config)
+    if not mcp_url:
+        return []
+    headers = config.get("headers") or {}
+    if isinstance(headers, str):
+        try:
+            headers = json.loads(headers) if headers else {}
+        except json.JSONDecodeError:
+            headers = {}
+    try:
+        import httpx
+
+        async with httpx.AsyncClient(
+            headers=headers,
+            timeout=httpx.Timeout(15.0),
+        ) as http_client:
+            async with streamable_http_client(mcp_url, http_client=http_client) as (
+                read,
+                write,
+                _,
+            ):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    tools_result = await session.list_tools()
+                    out: List[Dict[str, Any]] = []
+                    for t in getattr(tools_result, "tools", []):
+                        name = getattr(t, "name", str(t))
+                        desc = getattr(t, "description", "") or ""
+                        schema = _serialize_schema(getattr(t, "inputSchema", None))
+                        out.append({"name": name, "description": desc, "input_schema": schema})
+                    return out
+    except Exception as e:
+        logger.debug(f"Tool discovery (full) failed (http): {e}")
         return []
     mcp_url = _get_mcp_url(config)
     if not mcp_url:
@@ -294,6 +458,17 @@ async def _discover_one(
     return (name, tools)
 
 
+async def _discover_one_full(
+    name: str, config: Dict[str, Any]
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """Discover tools (with schemas) for one server."""
+    if "url" in config:
+        tools = await _list_tools_http_full(config)
+    else:
+        tools = await _list_tools_stdio_full(config)
+    return (name, tools)
+
+
 async def discover_tools(
     mcp_file: Path, force_refresh: bool = False
 ) -> Dict[str, List[Tuple[str, str]]]:
@@ -338,6 +513,155 @@ async def discover_tools(
             result[name] = tools
     _tools_cache[cache_key] = result
     return result
+
+
+async def discover_tools_full(
+    mcp_file: Path, force_refresh: bool = False
+) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Discover tools with input schemas from all configured MCP servers.
+    Returns {server_name: [{name, description, input_schema}], ...}.
+    Cached by mcp_file path and mtime unless force_refresh is True.
+    """
+    if not MCP_AVAILABLE:
+        return {}
+    path_str = str(mcp_file.resolve())
+    try:
+        mtime = mcp_file.stat().st_mtime
+    except OSError:
+        mtime = 0
+    cache_key = (path_str, mtime)
+    if not force_refresh and cache_key in _tools_cache_full:
+        return _tools_cache_full[cache_key]
+    servers = _load_all_servers(mcp_file)
+    if not servers:
+        _tools_cache_full[cache_key] = {}
+        return {}
+
+    async def one_with_timeout(name: str, config: Dict[str, Any]) -> Tuple[str, List[Dict[str, Any]]]:
+        try:
+            return await asyncio.wait_for(
+                _discover_one_full(name, config), timeout=DISCOVERY_SERVER_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            logger.warning("MCP discovery (full) timed out for server: %s", name)
+            return (name, [])
+        except Exception as e:
+            logger.debug("MCP discovery (full) failed for %s: %s", name, e)
+            return (name, [])
+
+    tasks = [one_with_timeout(name, config) for name, config in servers.items()]
+    results = await asyncio.gather(*tasks, return_exceptions=False)
+    result: Dict[str, List[Dict[str, Any]]] = {}
+    for name, tools in results:
+        if tools:
+            result[name] = tools
+    _tools_cache_full[cache_key] = result
+    return result
+
+
+def refresh_tools_cache_background(mcp_file: Path) -> None:
+    """Warm both discovery caches in a background thread (non-blocking).
+    Safe to call after editing the MCP servers file (GUI save or watcher event).
+    """
+    def _runner():
+        try:
+            import asyncio as _asyncio
+            async def _go():
+                try:
+                    await discover_tools(mcp_file, force_refresh=True)
+                except Exception:
+                    pass
+                try:
+                    await discover_tools_full(mcp_file, force_refresh=True)
+                except Exception:
+                    pass
+            _asyncio.run(_go())
+        except Exception:
+            pass
+
+    try:
+        import threading as _threading
+        t = _threading.Thread(target=_runner, name="mcp-refresh-cache", daemon=True)
+        t.start()
+    except Exception:
+        pass
+
+
+def _coerce_value_to_type(value: Any, typ: str) -> Any:
+    """Best-effort coercion based on a simple JSON Schema type string."""
+    try:
+        if typ == "integer":
+            if isinstance(value, bool):
+                return int(value)
+            if isinstance(value, (int,)):
+                return value
+            if isinstance(value, str) and value.strip().isdigit():
+                return int(value.strip())
+        elif typ == "number":
+            if isinstance(value, (int, float)):
+                return value
+            if isinstance(value, str):
+                return float(value.strip())
+        elif typ == "boolean":
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, str):
+                s = value.strip().lower()
+                if s in ("true", "1", "yes", "y"): return True
+                if s in ("false", "0", "no", "n"): return False
+        elif typ == "array":
+            if isinstance(value, list):
+                return value
+            return [value]
+        elif typ == "string":
+            return str(value)
+    except Exception:
+        return value
+    return value
+
+
+def coerce_arguments_by_schema(arguments: Dict[str, Any], schema: Optional[Dict[str, Any]]) -> Tuple[Dict[str, Any], List[str]]:
+    """Coerce simple types in arguments based on JSON Schema. Returns (coerced_args, missing_required)."""
+    if not schema or not isinstance(schema, dict):
+        return arguments, []
+    props = schema.get("properties") or {}
+    req = schema.get("required") or []
+    out: Dict[str, Any] = dict(arguments or {})
+    # Type coercion
+    if isinstance(props, dict):
+        for key, prop in props.items():
+            try:
+                if key in out and isinstance(prop, dict):
+                    t = prop.get("type")
+                    if isinstance(t, list) and t:
+                        # choose first type as hint
+                        t = t[0]
+                    if isinstance(t, str):
+                        out[key] = _coerce_value_to_type(out[key], t)
+            except Exception:
+                pass
+    # Missing required detection (do not fail here; caller decides)
+    missing: List[str] = []
+    try:
+        for k in req:
+            if k not in out or out.get(k) in (None, ""):
+                missing.append(str(k))
+    except Exception:
+        missing = []
+    return out, missing
+
+
+async def _get_tool_schema_for_server(config: Dict[str, Any], tool_name: str) -> Optional[Dict[str, Any]]:
+    """List tools (full) for a single server config and return the schema for tool_name."""
+    try:
+        full = await (_list_tools_http_full(config) if "url" in config else _list_tools_stdio_full(config))
+        for t in full:
+            if t.get("name") == tool_name:
+                return t.get("input_schema")
+    except Exception:
+        return None
+    return None
 
 
 async def discover_one_server(
@@ -469,6 +793,27 @@ async def call_mcp_tool(
             f"**❌ MCP server '{mcp_name}' not found.** "
             "Add it in Settings → Skills & MCP, or check the server name."
         )
+    if config.get("enabled", True) is False:
+        return f"**❌ MCP server '{mcp_name}' is disabled in Settings.** Enable it in Settings → Skills & MCP to use its tools."
+
+    # Schema-based argument coercion (best-effort, non-fatal)
+    try:
+        schema = await asyncio.wait_for(_get_tool_schema_for_server(config, tool_name), timeout=5.0)
+    except Exception:
+        schema = None
+    if schema:
+        coerced, missing = coerce_arguments_by_schema(arguments or {}, schema)
+        arguments = coerced
+        # Optional fail-fast via env var to avoid importing Settings here
+        try:
+            ff = os.getenv("MCP_ARGS_FAIL_FAST", "false").strip().lower() in ("1", "true", "yes")
+        except Exception:
+            ff = False
+        if ff and missing:
+            return (
+                "**❌ Missing required arguments for tool call.** "
+                f"Required: {', '.join(missing)}. Please provide these in TOOL_CALL.arguments."
+            )
 
     if "url" in config:
         return await _call_tool_http(config, tool_name, arguments)

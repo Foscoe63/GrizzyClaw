@@ -22,6 +22,23 @@ def speak_text(
     if not text or not text.strip():
         return False
 
+    import platform
+    # On macOS, prefer "say" first: pyttsx3 often crashes when run from a background thread (e.g. TTSWorker).
+    if platform.system() == "Darwin" and provider in ("auto", "say"):
+        try:
+            import subprocess
+            subprocess.run(
+                ["say", "-r", "200", text[:5000]],
+                check=True,
+                capture_output=True,
+                timeout=60,
+            )
+            return True
+        except Exception as e:
+            logger.debug("macOS say failed: %s", e)
+        if provider == "say":
+            return False
+
     # ElevenLabs (real-time, high quality)
     if provider in ("elevenlabs", "auto") and elevenlabs_api_key:
         try:
@@ -33,21 +50,24 @@ def speak_text(
             if provider == "elevenlabs":
                 return False
 
+    # pyttsx3: skip on macOS when auto (we already tried say); can crash from background thread on Darwin
     if provider == "auto" or provider == "pyttsx3":
-        try:
-            import pyttsx3
-            engine = pyttsx3.init()
-            engine.say(text)
-            engine.runAndWait()
-            return True
-        except ImportError:
-            pass
-        except Exception as e:
-            logger.debug(f"pyttsx3 TTS failed: {e}")
-    # Fallback: macOS say command
+        if provider == "auto" and platform.system() == "Darwin":
+            pass  # already tried say above
+        else:
+            try:
+                import pyttsx3
+                engine = pyttsx3.init()
+                engine.say(text)
+                engine.runAndWait()
+                return True
+            except ImportError:
+                pass
+            except Exception as e:
+                logger.debug("pyttsx3 TTS failed: %s", e)
+    # Fallback: say on macOS (if not already tried), or other platforms
     try:
         import subprocess
-        import platform
         if platform.system() == "Darwin":
             subprocess.run(
                 ["say", "-r", "200", text[:5000]],
@@ -57,7 +77,7 @@ def speak_text(
             )
             return True
     except Exception as e:
-        logger.debug(f"say fallback failed: {e}")
+        logger.debug("say fallback failed: %s", e)
     return False
 
 

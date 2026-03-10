@@ -37,6 +37,43 @@ class MemoryDialog(QDialog):
         self.setup_ui()
         self.refresh()
 
+    def _refresh_category_options(self, summary: dict):
+        """Populate category dropdown from categories currently in memory store."""
+        current = self.category_combo.currentData()
+        categories = summary.get("categories", []) if isinstance(summary, dict) else []
+        total = summary.get("total_items", 0) if isinstance(summary, dict) else 0
+        try:
+            total_int = int(total)
+        except (TypeError, ValueError):
+            total_int = 0
+        seen = set()
+
+        self.category_combo.blockSignals(True)
+        self.category_combo.clear()
+        self.category_combo.addItem(f"All ({total_int})", None)
+
+        for item in categories:
+            if not isinstance(item, dict):
+                continue
+            cat = str(item.get("id") or item.get("name") or "").strip()
+            if not cat:
+                continue
+            if cat in seen:
+                continue
+            seen.add(cat)
+            count = item.get("item_count", 0)
+            try:
+                count_int = int(count)
+            except (TypeError, ValueError):
+                count_int = 0
+            self.category_combo.addItem(f"{cat} ({count_int})", cat)
+
+        if isinstance(current, str) and current in seen:
+            idx = self.category_combo.findData(current)
+            if idx >= 0:
+                self.category_combo.setCurrentIndex(idx)
+        self.category_combo.blockSignals(False)
+
     def setup_ui(self):
         c = self._colors
         self.setStyleSheet(f"QDialog {{ background-color: {c['bg']}; }}")
@@ -58,8 +95,6 @@ class MemoryDialog(QDialog):
         filter_layout.addWidget(QLabel("Category:"))
         self.category_combo = QComboBox()
         self.category_combo.addItem("All", None)
-        for cat in ("conversation", "preferences", "facts", "tasks", "reminders", "general"):
-            self.category_combo.addItem(cat, cat)
         self.category_combo.currentIndexChanged.connect(self.refresh)
         filter_layout.addWidget(self.category_combo)
         filter_layout.addStretch()
@@ -101,6 +136,7 @@ class MemoryDialog(QDialog):
             total = summary.get('total_items', 0)
             recent_count = len(summary.get('recent_items', []))
             self.summary_label.setText(f"Total Memories: {total} | Recent: {recent_count} | User: {self.user_id}")
+            self._refresh_category_options(summary)
 
             category = self.category_combo.currentData()
             self.memories = self.agent.list_memories_sync(self.user_id, 50, category=category)
@@ -112,7 +148,7 @@ class MemoryDialog(QDialog):
                 else:
                     created_str = str(created)[:16]
                 content = mem.get('content', '')[:120] + '...' if len(mem.get('content', '')) > 120 else mem.get('content', '')
-                cat = mem.get('category', 'conversation')
+                cat = mem.get('category') or 'general'
                 item_text = f"{created_str} | {cat} | {content}"
                 item = QListWidgetItem(item_text)
                 item.setData(Qt.ItemDataRole.UserRole, mem.get('id'))

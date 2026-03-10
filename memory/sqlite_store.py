@@ -187,7 +187,7 @@ class SQLiteMemoryStore(MemoryStore):
             rows = conn.execute(
                 """
                 SELECT * FROM memory_items
-                WHERE user_id = ? AND category = ?
+                WHERE user_id = ? AND COALESCE(category, 'general') = ?
                 ORDER BY created_at DESC
                 LIMIT ?
                 """,
@@ -283,7 +283,7 @@ class SQLiteMemoryStore(MemoryStore):
                 id=row["id"],
                 user_id=row["user_id"],
                 content=row["content"],
-                category=row["category"],
+                category=row["category"] or "general",
                 source=row["source"],
                 metadata=json.loads(row["metadata"]) if row["metadata"] else None,
                 created_at=datetime.fromisoformat(row["created_at"]),

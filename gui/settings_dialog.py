@@ -51,6 +51,7 @@ def _is_system_dark() -> bool:
 
 from grizzyclaw.llm.ollama import OllamaProvider
 from grizzyclaw.llm.lmstudio import LMStudioProvider, _normalize_lmstudio_url
+from grizzyclaw.llm.lmstudio_v1 import LMStudioV1Provider
 from grizzyclaw.llm.openai import OpenAIProvider
 
 
@@ -157,8 +158,13 @@ class GeneralTab(SettingsTab):
         form.addRow("", self.debug_mode)
         self.provider_combo = QComboBox()
         self.provider_combo.setEditable(False)
-        self.provider_combo.addItems(["ollama", "lmstudio", "openai", "anthropic", "openrouter", "custom"])
-        self.provider_combo.setCurrentText(self.settings.default_llm_provider)
+        self._refresh_default_provider_combo()
+        # Show "lmstudio-v1" when saved value is lmstudio_v1
+        default_provider = self.settings.default_llm_provider
+        if default_provider == "lmstudio_v1":
+            self.provider_combo.setCurrentText("lmstudio-v1")
+        else:
+            self.provider_combo.setCurrentText(default_provider)
         self.provider_combo.setFixedHeight(32)
         form.addRow("Default Provider:", self.provider_combo)
         model_hint = QLabel("Configure models in the 'LLM Providers' tab")
@@ -211,6 +217,15 @@ class GeneralTab(SettingsTab):
         scroll.setWidget(container)
         layout.addWidget(scroll)
 
+    def _refresh_default_provider_combo(self):
+        base = ["ollama", "lmstudio", "openai", "anthropic", "openrouter", "cursor"]
+        if getattr(self.settings, "lmstudio_v1_enabled", False):
+            base.append("lmstudio-v1")
+        if getattr(self.settings, "custom_provider_url", None):
+            base.append(getattr(self.settings, "custom_provider_name", None) or "custom")
+        self.provider_combo.clear()
+        self.provider_combo.addItems(base)
+
     def get_group_style(self):
         dialog = self.window()
         if isinstance(dialog, SettingsDialog) and getattr(dialog, "is_dark", False):
@@ -218,10 +233,12 @@ class GeneralTab(SettingsTab):
         return "QGroupBox { font-weight: 600; font-size: 13px; border: 1px solid #E5E5EA; border-radius: 6px; margin-top: 8px; margin-bottom: 8px; padding: 8px 16px 16px 16px; background: #FAFAFA; } QGroupBox::title { subcontrol-origin: padding; left: 0; top: 0; padding-bottom: 4px; color: #1C1C1E; }"
 
     def get_settings(self):
+        raw_provider = self.provider_combo.currentText()
+        default_provider = "lmstudio_v1" if raw_provider == "lmstudio-v1" else raw_provider
         return {
             "app_name": self.app_name.text(),
             "debug": self.debug_mode.isChecked(),
-            "default_llm_provider": self.provider_combo.currentText(),
+            "default_llm_provider": default_provider,
             "max_context_length": self.context_spin.value(),
             "log_level": self.log_combo.currentText(),
             "max_agentic_iterations": self.max_agentic_iterations.value(),
@@ -232,6 +249,26 @@ class GeneralTab(SettingsTab):
             "agent_retry_on_tool_failure": self.agent_retry_failure.isChecked(),
             "max_session_messages": self.max_session_messages_spin.value(),
         }
+
+
+def _workspace_api_key_providers_from_checkboxes(tab) -> str:
+    """Build comma-separated list of provider names that should show in Workspace API Keys."""
+    names = []
+    if tab.ollama_workspace_api_key_cb.isChecked():
+        names.append("ollama")
+    if tab.lmstudio_workspace_api_key_cb.isChecked():
+        names.append("lmstudio")
+    if tab.openai_workspace_api_key_cb.isChecked():
+        names.append("openai")
+    if tab.anthropic_workspace_api_key_cb.isChecked():
+        names.append("anthropic")
+    if tab.openrouter_workspace_api_key_cb.isChecked():
+        names.append("openrouter")
+    if tab.cursor_workspace_api_key_cb.isChecked():
+        names.append("cursor")
+    if tab.custom_workspace_api_key_cb.isChecked():
+        names.append((tab.custom_name.text() or "").strip() or "custom")
+    return ",".join(names)
 
 
 class LLMTab(SettingsTab):
@@ -288,6 +325,11 @@ class LLMTab(SettingsTab):
 
         ollama_form.addRow("Model:", model_layout)
 
+        self.ollama_workspace_api_key_cb = QCheckBox("Show in Workspace API Keys")
+        self.ollama_workspace_api_key_cb.setToolTip("If checked, workspaces can override the API key for this provider (Ollama usually does not need one).")
+        self.ollama_workspace_api_key_cb.setChecked("ollama" in (getattr(self.settings, "workspace_api_key_providers", "") or "").split(","))
+        ollama_form.addRow("", self.ollama_workspace_api_key_cb)
+
         container_layout.addWidget(ollama_group)
         
         # LM Studio
@@ -328,6 +370,38 @@ class LLMTab(SettingsTab):
         lm_save_hint.setWordWrap(True)
         lm_form.addRow("", lm_save_hint)
 
+        self.lmstudio_workspace_api_key_cb = QCheckBox("Show in Workspace API Keys")
+        self.lmstudio_workspace_api_key_cb.setToolTip("If checked, workspaces can override the API key for this provider (LM Studio usually does not need one).")
+        self.lmstudio_workspace_api_key_cb.setChecked("lmstudio" in (getattr(self.settings, "workspace_api_key_providers", "") or "").split(","))
+        lm_form.addRow("", self.lmstudio_workspace_api_key_cb)
+
+        # LM Studio v1 (native /api/v1/chat) — separate provider "lmstudio-v1"
+        lm_v1_hint = QLabel("LM Studio v1 uses the native API (stateful chat, MCP via integrations). Enable to show \"lmstudio-v1\" in Default Provider.")
+        lm_v1_hint.setStyleSheet("font-size: 11px; color: #8E8E93;")
+        lm_v1_hint.setWordWrap(True)
+        lm_form.addRow("", lm_v1_hint)
+        self.lmstudio_v1_enabled_cb = QCheckBox("Enable LM Studio v1 API (provider: lmstudio-v1)")
+        self.lmstudio_v1_enabled_cb.setChecked(getattr(self.settings, "lmstudio_v1_enabled", False))
+        self.lmstudio_v1_enabled_cb.setToolTip("When enabled, \"lmstudio-v1\" appears in Default Provider and uses POST /api/v1/chat.")
+        lm_form.addRow("", self.lmstudio_v1_enabled_cb)
+        self.lmstudio_v1_url = QLineEdit(getattr(self.settings, "lmstudio_v1_url", "") or "http://localhost:1234")
+        self.lmstudio_v1_url.setPlaceholderText("http://localhost:1234")
+        self.lmstudio_v1_url.setFixedHeight(32)
+        lm_form.addRow("v1 URL:", self.lmstudio_v1_url)
+        lm_v1_model_layout = QHBoxLayout()
+        self.lmstudio_v1_model = QComboBox()
+        self.lmstudio_v1_model.setEditable(True)
+        self.lmstudio_v1_model.addItems(["", "openai/gpt-oss-20b", "ibm/granite-4-micro", "qwen/qwen3-vl-4b"])
+        self.lmstudio_v1_model.setCurrentText(getattr(self.settings, "lmstudio_v1_model", "") or "")
+        self.lmstudio_v1_model.setFixedHeight(32)
+        lm_v1_model_layout.addWidget(self.lmstudio_v1_model)
+        lm_v1_refresh_btn = QPushButton("↻")
+        lm_v1_refresh_btn.setFixedSize(32, 32)
+        lm_v1_refresh_btn.setToolTip("Refresh v1 models")
+        lm_v1_refresh_btn.clicked.connect(lambda: self.refresh_lmstudio_v1_models())
+        lm_v1_model_layout.addWidget(lm_v1_refresh_btn)
+        lm_form.addRow("v1 Model:", lm_v1_model_layout)
+
         container_layout.addWidget(lm_group)
         
         # OpenAI
@@ -364,6 +438,11 @@ class LLMTab(SettingsTab):
 
         openai_form.addRow("Model:", openai_model_layout)
 
+        self.openai_workspace_api_key_cb = QCheckBox("Show in Workspace API Keys")
+        self.openai_workspace_api_key_cb.setToolTip("If checked, workspaces get a field to override the API key for this provider.")
+        self.openai_workspace_api_key_cb.setChecked("openai" in (getattr(self.settings, "workspace_api_key_providers", "") or "").split(","))
+        openai_form.addRow("", self.openai_workspace_api_key_cb)
+
         container_layout.addWidget(openai_group)
         
         # Anthropic
@@ -394,6 +473,11 @@ class LLMTab(SettingsTab):
         self.anthropic_model.setFixedHeight(32)
         anthropic_form.addRow("Model:", self.anthropic_model)
 
+        self.anthropic_workspace_api_key_cb = QCheckBox("Show in Workspace API Keys")
+        self.anthropic_workspace_api_key_cb.setToolTip("If checked, workspaces get a field to override the API key for this provider.")
+        self.anthropic_workspace_api_key_cb.setChecked("anthropic" in (getattr(self.settings, "workspace_api_key_providers", "") or "").split(","))
+        anthropic_form.addRow("", self.anthropic_workspace_api_key_cb)
+
         container_layout.addWidget(anthropic_group)
         
         # OpenRouter
@@ -421,12 +505,61 @@ class LLMTab(SettingsTab):
         self.openrouter_model.setFixedHeight(32)
         or_form.addRow("Model:", self.openrouter_model)
 
+        self.openrouter_workspace_api_key_cb = QCheckBox("Show in Workspace API Keys")
+        self.openrouter_workspace_api_key_cb.setToolTip("If checked, workspaces get a field to override the API key for this provider.")
+        self.openrouter_workspace_api_key_cb.setChecked("openrouter" in (getattr(self.settings, "workspace_api_key_providers", "") or "").split(","))
+        or_form.addRow("", self.openrouter_workspace_api_key_cb)
+
         container_layout.addWidget(or_group)
+
+        # Cursor
+        cursor_group = self.create_group("Cursor")
+        cursor_form = QFormLayout(cursor_group)
+        cursor_form.setSpacing(12)
+
+        self.cursor_key = QLineEdit(getattr(self.settings, 'cursor_api_key', '') or "")
+        self.cursor_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.cursor_key.setPlaceholderText("API key (OpenAI-compatible endpoint)")
+        self.cursor_key.setFixedHeight(32)
+        cursor_form.addRow("API Key:", self.cursor_key)
+
+        self.cursor_url = QLineEdit(getattr(self.settings, 'cursor_url', '') or "")
+        self.cursor_url.setPlaceholderText("e.g. https://api.openai.com/v1")
+        self.cursor_url.setFixedHeight(32)
+        cursor_form.addRow("URL:", self.cursor_url)
+
+        self.cursor_model = QComboBox()
+        self.cursor_model.setEditable(True)
+        self.cursor_model.addItems(["gpt-4o", "gpt-4o-mini", "cursor-default", "claude-3.5-sonnet"])
+        self.cursor_model.setCurrentText(getattr(self.settings, 'cursor_model', 'gpt-4o'))
+        self.cursor_model.setFixedHeight(32)
+        cursor_form.addRow("Model:", self.cursor_model)
+
+        cursor_url_hint = QLabel("api.cursor.com/v1 does not provide chat (returns 404). Use an OpenAI-compatible base URL, e.g. https://api.openai.com/v1 with an OpenAI key.")
+        cursor_url_hint.setStyleSheet("font-size: 11px; color: #8E8E93;")
+        cursor_url_hint.setWordWrap(True)
+        cursor_form.addRow("", cursor_url_hint)
+
+        self.cursor_workspace_api_key_cb = QCheckBox("Show in Workspace API Keys")
+        self.cursor_workspace_api_key_cb.setToolTip("If checked, workspaces get a field to override the API key for this provider.")
+        self.cursor_workspace_api_key_cb.setChecked("cursor" in (getattr(self.settings, "workspace_api_key_providers", "") or "").split(","))
+        cursor_form.addRow("", self.cursor_workspace_api_key_cb)
+
+        container_layout.addWidget(cursor_group)
 
         # Custom Provider
         custom_group = self.create_group("Custom Provider")
         custom_form = QFormLayout(custom_group)
         custom_form.setSpacing(12)
+
+        self.custom_name = QLineEdit(getattr(self.settings, 'custom_provider_name', '') or "custom")
+        self.custom_name.setPlaceholderText("e.g. My API")
+        self.custom_name.setFixedHeight(32)
+        custom_form.addRow("Name:", self.custom_name)
+
+        custom_name_hint = QLabel("This name will appear in the workspace LLM provider list.")
+        custom_name_hint.setStyleSheet("font-size: 12px;")
+        custom_form.addRow("", custom_name_hint)
 
         self.custom_url = QLineEdit(getattr(self.settings, 'custom_provider_url', '') or "")
         self.custom_url.setPlaceholderText("https://api.example.com/v1")
@@ -449,6 +582,12 @@ class LLMTab(SettingsTab):
         self.custom_model.setPlaceholderText("model-name")
         self.custom_model.setFixedHeight(32)
         custom_form.addRow("Model:", self.custom_model)
+
+        self.custom_workspace_api_key_cb = QCheckBox("Show in Workspace API Keys")
+        self.custom_workspace_api_key_cb.setToolTip("If checked, workspaces get a field to override the API key for this provider.")
+        _wap = (getattr(self.settings, "workspace_api_key_providers", "") or "").split(",")
+        self.custom_workspace_api_key_cb.setChecked("custom" in _wap or (getattr(self.settings, "custom_provider_name", "") or "custom").strip() in _wap)
+        custom_form.addRow("", self.custom_workspace_api_key_cb)
 
         container_layout.addWidget(custom_group)
         container_layout.addStretch()
@@ -552,6 +691,24 @@ class LLMTab(SettingsTab):
         )
         self.lmstudio_worker.start()
 
+    def refresh_lmstudio_v1_models(self):
+        """Fetch available models from LM Studio v1 API."""
+        url = (self.lmstudio_v1_url.text() or "").strip() or "http://localhost:1234"
+        provider = LMStudioV1Provider(url)
+        current_model = self.lmstudio_v1_model.currentText()
+        sender = self.sender()
+        if sender:
+            sender.setEnabled(False)
+            sender.setText("...")
+        self._lmstudio_v1_worker = ModelFetchWorker(provider)
+        self._lmstudio_v1_worker.finished.connect(
+            lambda models: self.on_models_fetched(models, self.lmstudio_v1_model, current_model, sender)
+        )
+        self._lmstudio_v1_worker.error.connect(
+            lambda error: self.on_models_fetch_error(error, "LM Studio v1", sender)
+        )
+        self._lmstudio_v1_worker.start()
+
     def refresh_openai_models(self):
         """Fetch available models from OpenAI"""
         api_key = self.openai_key.text()
@@ -590,12 +747,24 @@ class LLMTab(SettingsTab):
         # Clear and populate combo box
         combo.clear()
         if models:
-            model_names = [m.get('name', m.get('id', 'Unknown')) for m in models]
-            combo.addItems(model_names)
-
-            # Restore previous selection if it exists
-            if current_model and current_model in model_names:
-                combo.setCurrentText(current_model)
+            # LM Studio v1 API requires model key (id), not display name — store id as itemData
+            if combo is self.lmstudio_v1_model:
+                for m in models:
+                    name = m.get("name", m.get("id", "Unknown"))
+                    model_id = m.get("id", "")
+                    combo.addItem(name, model_id)
+                if current_model:
+                    for i in range(combo.count()):
+                        if combo.itemData(i) == current_model or combo.itemText(i) == current_model:
+                            combo.setCurrentIndex(i)
+                            break
+                    else:
+                        combo.setCurrentText(current_model)
+            else:
+                model_names = [m.get("name", m.get("id", "Unknown")) for m in models]
+                combo.addItems(model_names)
+                if current_model and current_model in model_names:
+                    combo.setCurrentText(current_model)
         else:
             QMessageBox.information(self, "No Models", "No models found for this provider")
 
@@ -618,12 +787,20 @@ class LLMTab(SettingsTab):
             "ollama_model": self.ollama_model.currentText(),
             "lmstudio_url": _normalize_lmstudio_url(self.lmstudio_url.text()),
             "lmstudio_model": self.lmstudio_model.currentText(),
+            "lmstudio_v1_enabled": self.lmstudio_v1_enabled_cb.isChecked(),
+            "lmstudio_v1_url": (self.lmstudio_v1_url.text() or "").strip() or "http://localhost:1234",
+            "lmstudio_v1_model": (self.lmstudio_v1_model.currentData() or self.lmstudio_v1_model.currentText() or "").strip(),
             "openai_api_key": self.openai_key.text() or None,
             "openai_model": self.openai_model.currentText(),
             "anthropic_api_key": self.anthropic_key.text() or None,
             "anthropic_model": self.anthropic_model.currentText(),
             "openrouter_api_key": self.openrouter_key.text() or None,
             "openrouter_model": self.openrouter_model.currentText(),
+            "cursor_api_key": self.cursor_key.text() or None,
+            "cursor_url": self.cursor_url.text().strip() or "",
+            "cursor_model": self.cursor_model.currentText() or "gpt-4o",
+            "workspace_api_key_providers": _workspace_api_key_providers_from_checkboxes(self),
+            "custom_provider_name": (self.custom_name.text() or "").strip() or "custom",
             "custom_provider_url": self.custom_url.text() or None,
             "custom_provider_api_key": self.custom_key.text() or None,
             "custom_provider_model": self.custom_model.currentText(),
@@ -663,6 +840,15 @@ class TelegramTab(SettingsTab):
         webhook_hint = QLabel("Leave empty for polling mode")
         webhook_hint.setStyleSheet("font-size: 12px;")
         form.addRow("", webhook_hint)
+
+        # Proxy (optional, for firewall/VPN)
+        self.telegram_proxy = QLineEdit(getattr(self.settings, "telegram_proxy", None) or "")
+        self.telegram_proxy.setPlaceholderText("e.g. http://proxy:8080 or leave empty")
+        self.telegram_proxy.setFixedHeight(32)
+        form.addRow("Proxy (optional):", self.telegram_proxy)
+        proxy_hint = QLabel("Use if you get \"connection attempts failed\"; or set HTTPS_PROXY env.")
+        proxy_hint.setStyleSheet("font-size: 11px; color: #666;")
+        form.addRow("", proxy_hint)
         
         llm_hint = QLabel("Note: Your LLM (LM Studio, Ollama, etc.) must be running for the bot to reply to messages.")
         llm_hint.setStyleSheet("font-size: 11px; color: #666;")
@@ -717,6 +903,7 @@ class TelegramTab(SettingsTab):
         return {
             "telegram_bot_token": _sanitize_telegram_token(self.bot_token.text()),
             "telegram_webhook_url": self.webhook_url.text().strip() or None,
+            "telegram_proxy": self.telegram_proxy.text().strip() or None,
         }
 
 class WhatsAppTab(SettingsTab):
@@ -1961,7 +2148,12 @@ class SettingsDialog(QDialog):
         self.is_dark = False
         self.setWindowTitle("Preferences")
         self.setMinimumSize(700, 550)
-        self.resize(780, 600)
+        # When parent (main window) is provided, open at same width so tab content is not overly wide; stay resizable
+        if parent and hasattr(parent, "width"):
+            w = min(780, max(700, parent.width()))
+            self.resize(w, 600)
+        else:
+            self.resize(780, 600)
         self.setup_ui()
         # Apply theme to match main window
         if theme_colors:

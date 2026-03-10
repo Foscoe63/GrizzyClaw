@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import os
 import tempfile
 from pathlib import Path
 from typing import Optional
@@ -22,6 +23,10 @@ from grizzyclaw.agent.core import AgentCore
 from .base import Channel, ChannelMessage, ChannelUser, MessageType, ChannelStatus
 
 logger = logging.getLogger(__name__)
+
+# Number of connection attempts and delay between them (flaky networks / slow DNS)
+TELEGRAM_CONNECT_ATTEMPTS = 3
+TELEGRAM_CONNECT_RETRY_DELAY = 3.0
 
 
 class TelegramChannel(Channel):
@@ -55,7 +60,22 @@ class TelegramChannel(Channel):
 
         try:
             # Use longer timeouts so slow/flaky networks don't fail with "Timed out" on startup
-            request = HTTPXRequest(connect_timeout=15.0, read_timeout=30.0)
+            # Optional proxy: settings first, then HTTPS_PROXY / HTTP_PROXY (for VPN/corporate proxy)
+            proxy = (
+                getattr(self.settings, "telegram_proxy", None)
+                or os.environ.get("HTTPS_PROXY")
+                or os.environ.get("HTTP_PROXY")
+            )
+            if proxy:
+                proxy = (proxy or "").strip() or None
+            request_kw: dict = {
+                "connect_timeout": 15.0,
+                "read_timeout": 30.0,
+            }
+            if proxy:
+                request_kw["proxy"] = proxy
+                logger.info("Telegram using proxy: %s", proxy.split("@")[-1] if "@" in proxy else proxy)
+            request = HTTPXRequest(**request_kw)
             self.application = (
                 Application.builder()
                 .token(self.config["bot_token"])
@@ -79,8 +99,9 @@ class TelegramChannel(Channel):
                 )
             )
 
-            # Start bot (with one retry on connection failure for flaky networks)
-            for attempt in range(2):
+            # Start bot (with retries on connection failure for flaky networks / DNS)
+            last_error: Optional[Exception] = None
+            for attempt in range(TELEGRAM_CONNECT_ATTEMPTS):
                 try:
                     if self.config.get("webhook_url"):
                         await self.application.initialize()
@@ -94,11 +115,19 @@ class TelegramChannel(Channel):
                         await self.application.initialize()
                         await self.application.start()
                         await self.application.updater.start_polling()
+                    last_error = None
                     break
                 except httpx.ConnectError as e:
-                    if attempt == 0:
-                        logger.warning("Telegram first connection attempt failed, retrying in 2s: %s", e)
-                        await asyncio.sleep(2)
+                    last_error = e
+                    if attempt < TELEGRAM_CONNECT_ATTEMPTS - 1:
+                        logger.warning(
+                            "Telegram connection attempt %s/%s failed, retrying in %.0fs: %s",
+                            attempt + 1,
+                            TELEGRAM_CONNECT_ATTEMPTS,
+                            TELEGRAM_CONNECT_RETRY_DELAY,
+                            e,
+                        )
+                        await asyncio.sleep(TELEGRAM_CONNECT_RETRY_DELAY)
                     else:
                         raise
 
@@ -122,7 +151,8 @@ class TelegramChannel(Channel):
             self.status = ChannelStatus.ERROR
             msg = (
                 "Cannot reach Telegram servers (api.telegram.org). "
-                "Check firewall, VPN, or proxy; ensure this app can make outbound HTTPS connections. "
+                "Check: (1) Internet connection, (2) Firewall allows outbound HTTPS, "
+                "(3) If behind a proxy, set Telegram proxy in Settings or HTTPS_PROXY. "
                 "Original error: " + str(e)
             )
             await self.emit("error", error=msg)

@@ -22,6 +22,8 @@ class WorkspaceConfig:
     openai_api_key: Optional[str] = None
     anthropic_api_key: Optional[str] = None
     openrouter_api_key: Optional[str] = None
+    cursor_api_key: Optional[str] = None
+    custom_provider_api_key: Optional[str] = None  # Override for the custom (named) provider
     
     # Custom URLs
     ollama_url: str = "http://localhost:11434"
@@ -155,9 +157,12 @@ class Workspace:
     
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "Workspace":
-        """Create from dictionary"""
+        """Create from dictionary (e.g. JSON load). Ensures config is a WorkspaceConfig instance."""
         data = dict(data)
         data.setdefault("avatar_path", None)
+        # Normalize config so it's always WorkspaceConfig (persisted JSON has config as dict)
+        if "config" in data and isinstance(data["config"], dict):
+            data["config"] = WorkspaceConfig.from_dict(data["config"])
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
     
     def get_memory_db_path(self) -> str:

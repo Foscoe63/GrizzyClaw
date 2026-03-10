@@ -85,6 +85,9 @@ class DaemonService:
             self.agent = AgentCore(self.settings)
             logger.info("Agent core initialized")
 
+            # Start scheduler loop if there are tasks (e.g. loaded from disk); otherwise they never run
+            await self.agent._ensure_scheduler_running()
+
             # Test LLM connections in background (don't block startup; Anthropic etc. can timeout)
             asyncio.create_task(self._test_connections_background())
 

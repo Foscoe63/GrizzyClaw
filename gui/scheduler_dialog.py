@@ -77,6 +77,7 @@ class SchedulerDialog(QDialog):
                 color: white;
             }}
         """)
+        self.task_list.currentItemChanged.connect(self._on_task_selection_changed)
         layout.addWidget(self.task_list)
 
         # Create new task section
@@ -137,6 +138,62 @@ class SchedulerDialog(QDialog):
         """)
         btn_layout.addWidget(create_btn)
 
+        self.save_btn = QPushButton("💾 Save")
+        self.save_btn.setToolTip("Save name, schedule, and message for the selected task.")
+        self.save_btn.clicked.connect(self.save_selected_task)
+        self.save_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {c['accent']};
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 8px 16px;
+                font-weight: bold;
+            }}
+            QPushButton:hover {{
+                opacity: 0.9;
+            }}
+            QPushButton:disabled {{
+                background-color: {c['border']};
+                color: {c['fg']};
+            }}
+        """)
+        btn_layout.addWidget(self.save_btn)
+
+        self.start_btn = QPushButton("▶ Start")
+        self.start_btn.setToolTip("Enable this task so it runs on schedule.")
+        self.start_btn.clicked.connect(self.start_selected_task)
+        self.start_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: #34C759;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 8px 16px;
+                font-weight: bold;
+            }}
+            QPushButton:hover {{ opacity: 0.9; }}
+            QPushButton:disabled {{ background-color: {c['border']}; color: {c['fg']}; }}
+        """)
+        btn_layout.addWidget(self.start_btn)
+
+        self.stop_btn = QPushButton("⏸ Stop")
+        self.stop_btn.setToolTip("Pause this task so it does not run on schedule.")
+        self.stop_btn.clicked.connect(self.stop_selected_task)
+        self.stop_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: #FF9500;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 8px 16px;
+                font-weight: bold;
+            }}
+            QPushButton:hover {{ opacity: 0.9; }}
+            QPushButton:disabled {{ background-color: {c['border']}; color: {c['fg']}; }}
+        """)
+        btn_layout.addWidget(self.stop_btn)
+
         refresh_btn = QPushButton("🔄 Refresh")
         refresh_btn.clicked.connect(self.refresh)
         btn_layout.addWidget(refresh_btn)
@@ -163,6 +220,133 @@ class SchedulerDialog(QDialog):
 
         btn_layout.addStretch()
         layout.addLayout(btn_layout)
+        self.save_btn.setEnabled(False)
+        self.start_btn.setEnabled(False)
+        self.stop_btn.setEnabled(False)
+        self._last_selected_task_id = None
+
+    def _on_task_selection_changed(self, current, previous):
+        """When a task is selected, load its name/cron/message into the form and update Start/Stop buttons."""
+        if not current:
+            self.save_btn.setEnabled(False)
+            self.start_btn.setEnabled(False)
+            self.stop_btn.setEnabled(False)
+            self._last_selected_task_id = None
+            return
+        task_id = current.data(Qt.ItemDataRole.UserRole)
+        if not task_id:
+            self.save_btn.setEnabled(False)
+            self.start_btn.setEnabled(False)
+            self.stop_btn.setEnabled(False)
+            self._last_selected_task_id = None
+            return
+        self._last_selected_task_id = task_id
+        task = getattr(self.agent, "get_scheduler_task", lambda _: None)(task_id)
+        if not task:
+            self.save_btn.setEnabled(False)
+            self.start_btn.setEnabled(False)
+            self.stop_btn.setEnabled(False)
+            return
+        self.save_btn.setEnabled(True)
+        enabled = task.get("enabled", True)
+        # Keep both Start and Stop enabled when a task is selected so either click always works
+        # (selection can be cleared when the button gets focus, so we rely on _last_selected_task_id in handlers)
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(True)
+        self.name_input.setText(task.get("name", ""))
+        self.cron_input.setText(task.get("cron", ""))
+        self.message_input.setText(task.get("message", ""))
+        # Try to match cron to preset
+        cron = (task.get("cron") or "").strip()
+        presets = ["", "*/1 * * * *", "*/5 * * * *", "*/30 * * * *", "0 * * * *", "0 */2 * * *",
+                   "0 9 * * *", "0 12 * * *", "0 18 * * *", "0 9 * * 1", "0 0 1 * *"]
+        idx = presets.index(cron) if cron in presets else 0
+        self.cron_preset.setCurrentIndex(idx)
+
+    def save_selected_task(self):
+        """Save the current form (name, cron, message) to the selected task."""
+        current = self.task_list.currentItem()
+        if not current:
+            QMessageBox.warning(self, "No Selection", "Select a task to save.")
+            return
+        task_id = current.data(Qt.ItemDataRole.UserRole)
+        if not task_id:
+            return
+        name = self.name_input.text().strip()
+        cron = self.cron_input.text().strip()
+        message = self.message_input.text().strip()
+        if not name:
+            QMessageBox.warning(self, "Missing Name", "Enter a task name.")
+            return
+        if not cron:
+            QMessageBox.warning(self, "Missing Schedule", "Enter a cron expression.")
+            return
+        if not message:
+            QMessageBox.warning(self, "Missing Message", "Enter a task message.")
+            return
+        try:
+            result = self.agent.edit_scheduler_task_sync(
+                task_id,
+                name=name,
+                cron=cron,
+                message=message,
+            )
+            if result and "✅" in result:
+                QMessageBox.information(self, "Saved", result)
+                self.refresh()
+            else:
+                QMessageBox.warning(self, "Error", result or "Save failed.")
+        except Exception as e:
+            QMessageBox.warning(self, "Error", str(e))
+
+    def start_selected_task(self):
+        """Enable the selected task so it runs on schedule."""
+        # Use currentItem() first; fall back to last selected (clicking the button can clear list selection)
+        current = self.task_list.currentItem()
+        task_id = current.data(Qt.ItemDataRole.UserRole) if current else None
+        if not task_id:
+            task_id = getattr(self, "_last_selected_task_id", None)
+        if not task_id:
+            QMessageBox.warning(self, "No Selection", "Select a task first, then click Start.")
+            return
+        try:
+            result = self.agent.enable_scheduler_task_sync(task_id)
+            if result and "✅" in result:
+                QMessageBox.information(self, "Started", result)
+                self.refresh()
+                self._reselect_task(task_id)
+            else:
+                QMessageBox.warning(self, "Error", result or "Could not start task.")
+        except Exception as e:
+            QMessageBox.warning(self, "Error", str(e))
+
+    def stop_selected_task(self):
+        """Disable the selected task so it does not run on schedule."""
+        current = self.task_list.currentItem()
+        task_id = current.data(Qt.ItemDataRole.UserRole) if current else None
+        if not task_id:
+            task_id = getattr(self, "_last_selected_task_id", None)
+        if not task_id:
+            QMessageBox.warning(self, "No Selection", "Select a task first, then click Stop.")
+            return
+        try:
+            result = self.agent.disable_scheduler_task_sync(task_id)
+            if result and "✅" in result:
+                QMessageBox.information(self, "Stopped", result)
+                self.refresh()
+                self._reselect_task(task_id)
+            else:
+                QMessageBox.warning(self, "Error", result or "Could not stop task.")
+        except Exception as e:
+            QMessageBox.warning(self, "Error", str(e))
+
+    def _reselect_task(self, task_id: str):
+        """After refresh, re-select the item with the given task_id so Start/Stop buttons stay correct."""
+        for i in range(self.task_list.count()):
+            item = self.task_list.item(i)
+            if item and item.data(Qt.ItemDataRole.UserRole) == task_id:
+                self.task_list.setCurrentItem(item)
+                break
 
     def on_cron_preset_changed(self, index):
         """Update cron input when preset is selected"""
@@ -186,6 +370,7 @@ class SchedulerDialog(QDialog):
         """Refresh the task list (reload from disk so tasks created in chat are shown)."""
         try:
             self.agent.reload_scheduled_tasks_from_disk()
+            # Scheduler loop is run by the dedicated GUI scheduler thread; no need to start it here
             stats = self.agent.get_scheduler_status()
             total = stats.get("total_tasks", 0)
             enabled = stats.get("enabled", 0)
@@ -318,7 +503,7 @@ class SchedulerDialog(QDialog):
         form.addRow("Cron:", cron_edit)
         msg_edit = QLineEdit()
         msg_edit.setText(task.get("message", ""))
-        msg_edit.setPlaceholderText("Reminder message")
+        msg_edit.setPlaceholderText("Task message")
         form.addRow("Message:", msg_edit)
         layout.addLayout(form)
         btn_layout = QHBoxLayout()

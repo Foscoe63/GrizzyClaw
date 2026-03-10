@@ -124,3 +124,67 @@ class LMStudioProvider(LLMProvider):
         except Exception as e:
             logger.debug("LM Studio get_model_context_length failed: %s", e)
             return None
+
+    async def generate_completion(
+        self,
+        messages: List[Dict[str, Any]],
+        model: Optional[str] = None,
+        temperature: float = 0.7,
+        max_tokens: Optional[int] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """
+        Non-streaming completion (OpenAI-compat). When tools are provided, the model may return tool_calls.
+        Returns {"content": str, "tool_calls": [{"id": str, "function": {"name": str, "arguments": str}}]}.
+        """
+        url = f"{self.base_url}/chat/completions"
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        payload: Dict[str, Any] = {
+            "messages": messages,
+            "temperature": temperature,
+            "stream": False,
+        }
+        if model:
+            payload["model"] = model
+        if max_tokens:
+            payload["max_tokens"] = max_tokens
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+        timeout = aiohttp.ClientTimeout(total=300, connect=30)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, json=payload, headers=headers) as response:
+                    if response.status != 200:
+                        body = await response.text()
+                        raise LLMError(
+                            f"LM Studio error: {response.status}"
+                            + (f" — {body[:200]}" if body else "")
+                        )
+                    data = await response.json()
+        except aiohttp.ClientError as e:
+            raise LLMProviderNotAvailable(f"Cannot connect to LM Studio: {e}")
+        choices = data.get("choices") or []
+        if not choices:
+            return {"content": "", "tool_calls": []}
+        msg = choices[0].get("message") or {}
+        content = (msg.get("content") or "").strip()
+        raw_tool_calls = msg.get("tool_calls") or []
+        tool_calls: List[Dict[str, Any]] = []
+        for tc in raw_tool_calls:
+            if not isinstance(tc, dict):
+                continue
+            tid = tc.get("id") or ""
+            fn = tc.get("function") or {}
+            if isinstance(fn, dict) and fn.get("name"):
+                tool_calls.append({
+                    "id": tid,
+                    "function": {
+                        "name": fn.get("name", ""),
+                        "arguments": fn.get("arguments") or "{}",
+                    },
+                })
+        return {"content": content, "tool_calls": tool_calls}
